@@ -1,16 +1,16 @@
 # pigeon
 
-pigeon is an MIT-licensed email triage kit driven by Claude Code, Codex or another AI assistant through [Executor](https://executor.sh). Executor is a hosted service that connects mail accounts to an AI assistant as callable tools. pigeon’s Python planner matches rules against an Inbox listing and produces an action plan and report without accessing mail.
+pigeon is an MIT-licensed email triage kit run by a capable AI assistant through an MCP mail gateway such as [Executor](https://executor.sh). Executor is a hosted service that connects mail accounts to an AI assistant as callable tools. pigeon’s Python planner matches rules against an Inbox listing and produces an action plan and report without accessing mail.
 
 It works on Inbox messages only and never sends. A plan is the proposed list of actions, produced without changing mail. Fixed limits stop the whole plan when exceeded. Read the policy in [guardrails](config/guardrails.example.md) before using a real account.
 
 ## Requirements
 
-An Executor account with your mail apps connected, an AI assistant with Executor access, Python 3.11+, git, and a POSIX system with Bash. No Python packages are needed.
+See the four [host requirements](docs/setup.md#host-requirements). The scripts need Python 3.11+, git and a POSIX system with Bash; no Python packages are needed.
 
 ## Quick start
 
-Clone https://github.com/ricardo-alternova/pigeon and enter that folder, or use your existing checkout. Run the following in Bash. This runs on sample mail in private/demo and overwrites its sample settings. No mail is touched. A private store is the folder holding your local settings and reports.
+Clone https://github.com/ricardo-alternova/pigeon and enter that folder, or use your existing checkout. Run the following in Bash. This runs on sample mail in private/demo and overwrites its sample settings. No mail is touched. This also enables the repository’s commit hooks. A private store is the folder holding your local settings and reports.
 
 <!-- quick-start -->
 ```bash
@@ -38,15 +38,17 @@ The printed report should match tests/fixtures/expected-report.md; the final com
 
 ## Private data and contributions
 
-The private store is `~/.config/pigeon/` (create it first) or an existing folder named by `PIGEON_HOME`, such as the ignored `private/` folder. Keep account handles, app slugs, rules, listings, state, reports and logs there, never in public files.
+Your real private store is `~/.config/pigeon/` (create it first) or another folder outside the checkout named by `PIGEON_HOME`. The quick start uses the ignored `private/demo` folder for sample data only. Keep account handles, app slugs, rules, listings, state, reports and logs there, never in public files.
 
 The allowlist in [.gitignore](.gitignore) ignores everything except reviewed kit paths. Git can force-add ignored files, so the [commit hook](hooks/pre-commit) refuses unapproved paths and private-looking text. Hooks protect only after the quick start enables them. A public-fork push is public before CI runs. CI runs the same leak checker. These checks reduce leaks; they cannot identify every private value. Never force private content into an allowed file.
 
-Before contributing, enable the hooks as above, use invented examples on example.com, example.org, example.net or .invalid, inspect the staged diff, and run `python3 scripts/leak_check.py` and `python3 scripts/leak_check.py --history`. If you maintain a private deny-list outside git, add `--deny PATH` to each scan and set `PIGEON_DENY` to its folder for hooks. Do not attach real mail or reports to issues. Run `python3 -m unittest discover -s tests` and `bash tests/e2e.sh` before submitting.
+Before contributing, enable the hooks as above, use invented examples on example.com, example.org, example.net or .invalid, inspect the staged diff, and run `python3 scripts/leak_check.py` and `python3 scripts/leak_check.py --history`. For private deny-list checks, see [maintainer checks](docs/setup.md#maintainer-publication-checks). Do not attach real mail or reports to issues. Run `python3 -m unittest discover -s tests` and `bash tests/e2e.sh` before submitting.
 
 ## Known limits
 
-The tested matcher covers deterministic rules. The assistant still executes the plan through Executor. Prompt injection risk is reduced, not removed. A run must finish within 45 minutes; the lock does not refresh. User subject regular expressions can be slow. Sender addresses can be forged. Unsubscribe is planned only from user-written rules, and its link is shown in the report. See [setup](docs/setup.md) for unverified integrations.
+While the assistant carries the calls, the scripts cannot physically stop a call they did not issue. They log every issued call and result; the report flags any unplanned call disclosed by the assistant. See the [lock policy](docs/setup.md#private-store) for the run deadline. User subject regular expressions can be slow. Sender addresses can be forged. See the [local unsubscribe policy](docs/setup.md#local-unsubscribe-client). See [setup](docs/setup.md) for unverified integrations.
+
+See [CHANGELOG](CHANGELOG.md) for upgrade instructions.
 
 ## License
 

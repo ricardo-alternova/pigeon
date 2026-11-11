@@ -10,11 +10,11 @@ import re
 import subprocess
 import sys
 
-ALLOWLIST = set('''README.md LICENSE AGENTS.md CLAUDE.md .gitignore
+ALLOWLIST = set('''CHANGELOG.md README.md LICENSE AGENTS.md CLAUDE.md .gitignore
 .agents/skills/email-triage/SKILL.md .claude/skills docs/setup.md
 config/config.example.toml config/guardrails.example.md
 rules/rules.example.toml rules/never-touch.example.toml
-scripts/triage.py scripts/leak_check.py hooks/pre-commit hooks/pre-push
+scripts/unsubscribe.py tests/test_unsubscribe.py scripts/triage.py scripts/execute.py tests/mock_provider.py tests/test_execute.py scripts/leak_check.py hooks/pre-commit hooks/pre-push
 .github/workflows/check.yml tests/test_leak_check.py tests/test_matcher.py
 tests/test_lock.py tests/test_kit_text.py tests/e2e.sh tests/fixtures/inbox.json
 tests/fixtures/expected-report.md'''.split())

@@ -2,17 +2,28 @@
 
 Run the sample-mail quick start in [README](../README.md) first. The assistant's run procedure is [AGENTS.md](../AGENTS.md); the action policy is [guardrails](../config/guardrails.example.md).
 
-## Executor connection
+## Host requirements
 
-An app is a connected mail service in Executor. Create an account at [Executor](https://executor.sh), connect your mail apps there, and follow its connection instructions to add Executor to your assistant. Authenticate interactively before scheduling. Ask the assistant to use Executor search and describe at run time to learn exact tool paths and input shapes. A linked tool may bind a fixed account: verify identity rather than supplying an arbitrary account parameter. Keep connection details private.
+Your host must provide:
+
+- A way to run on a schedule or when asked.
+- A chat channel for the report and your replies.
+- Storage that keeps the private store, including state and lock, between runs.
+- Access to an MCP mail gateway such as Executor.
+
+Everything else is in this repository as instructions and scripts.
+
+## Mail gateway connection
+
+Connect your mail accounts to your gateway and authenticate before scheduling. An app is a connected mail service. Executor is one example: use its search and describe tools at run time to learn exact paths and input shapes. A linked tool may bind a fixed account; verify identity rather than supplying an arbitrary account parameter. Keep connection details private.
 
 ## Private store
 
-Default: ~/.config/pigeon/. Create it first: `mkdir -p -m 700 ~/.config/pigeon`. To use another existing folder, such as the ignored private/ folder in the checkout, set PIGEON_HOME to it. An empty PIGEON_HOME is refused. The planner refuses a store or output path inside a git work tree unless git ignores it. Restrict permissions to your user, including reports and credentials. The quick start sets umask 077 inside its subshell only.
+Keep your real private store outside every git work tree. Default: ~/.config/pigeon/. Create it first: `mkdir -p -m 700 ~/.config/pigeon`. To use another existing folder outside git, set PIGEON_HOME to it. An empty PIGEON_HOME is refused. The planner refuses a store or output path inside a git work tree unless git ignores it. Restrict permissions to your user, including reports and credentials. The quick start sets umask 077 inside its subshell only. Store checks ignore GIT_* environment overrides and refuse unexpected git errors.
 
 Copy config/config.example.toml to config.toml, config/guardrails.example.md to guardrails.md, rules/rules.example.toml to rules.toml and rules/never-touch.example.toml to never-touch.toml in the private store. Replace the fictional values using the references below. Do not disable never-touch just to make planning succeed.
 
-Keep inbox.json, plan.json and report.md there. No separate execution history file is required; report confirmed results in the standard run message. The script creates state.json (expected remaining Inbox counts), run.lock (token and creation time), and .lock-gate (coordination file). A lock prevents two runs at once. It expires after 45 minutes and does not refresh. Finish execution before that deadline. Do not delete lock files to bypass a running worker.
+Keep run artifacts in this store; their formats are defined under [state and execution files](#state-and-execution-files). Taking the lock creates run.lock and .lock-gate. A lock prevents two runs at once, expires after 45 minutes and does not refresh. Finish before that deadline. Only the matching holder may release it; never delete lock files to bypass a worker.
 
 ## Configuration
 
@@ -20,7 +31,7 @@ The private config.toml uses these keys:
 
 | Key | Type and meaning |
 | --- | --- |
-| language | String, "en" (default) or "es". Translates section labels only; reasons and the Inbox summary stay English. Mail text keeps its original language. |
+| language | String, "en" (default) or "es". Translates section labels only; reasons and the report’s Inbox count line stay English. Mail text keeps its original language. |
 | timezone | String, default "UTC". A known IANA time zone used by the assistant for the run message. |
 | inbox_limit | Integer, default 100. Maximum number of Inbox messages across all accounts together. |
 | accounts | Required table, one subtable per private account handle. These handles are also used in rules and listings. Missing accounts are named as not listed this run; their saved state is unchanged. No configured account listed, or an unconfigured account listed, stops the run. |
@@ -31,7 +42,7 @@ The planner uses the account handles, language and inbox_limit, and checks that 
 
 ## Rules
 
-Both files use TOML arrays of tables named [[rules]]. In rules.toml, order matters: the first matching rule wins. Conditions in an entry all have to match.
+Both files use TOML arrays of tables named [[rules]]. In rules.toml, order matters; see the precedence policy in guardrails. Conditions in an entry all have to match.
 
 | Key | Type and match |
 | --- | --- |
@@ -43,9 +54,10 @@ Both files use TOML arrays of tables named [[rules]]. In rules.toml, order matte
 | subject | String, a Python regular expression searched anywhere in the subject without case sensitivity. Escape regex punctuation when you mean literal text. |
 | has_attachment | Optional boolean. A message without an attachment flag counts as false. |
 | exclusions | Array of strings matched as case-insensitive substrings of the subject only. Required for trash, even if empty ([]); optional for other actions. Not allowed in never-touch.toml. |
+| after_unsubscribe | Optional string, trash or archive, on unsubscribe rules only. A separate companion action after a safe planned unsubscribe, even when its request fails. Unsafe unsubscribes and their companions become decisions with no actions. |
 | target | String naming the exact existing folder for move; allowed only on move rules. It must resolve to exactly one folder; otherwise the message becomes a decision. Not allowed in never-touch.toml. |
 
-Every entry needs at least one sender, domain or subject predicate. Unknown keys, duplicate IDs, unknown actions, empty rule account scopes, trash without exclusions, blank predicates, invalid regexes and regexes matching empty text are rejected at load. Wrong predicate types, non-boolean attachment flags, non-list exclusions and scopes with unconfigured accounts are refused before matching.
+Every entry needs at least one sender, domain or subject predicate. Duplicate IDs, unknown actions, empty rule account scopes, trash without exclusions, blank predicates, invalid regexes and regexes matching empty text are rejected at load. Wrong predicate types, non-boolean attachment flags, non-list exclusions and scopes with unconfigured accounts are refused before matching.
 
 The top level of rules.toml accepts only rules; use rules = [] explicitly for no rules. The top level of never-touch.toml accepts rules and allow_empty (boolean). An empty never-touch file is refused; to explicitly disable protection replace its entries with allow_empty = true. Never-touch entries accept only accounts, sender, domain, subject and has_attachment.
 
@@ -68,7 +80,7 @@ action = "report"
 
 ## Inbox listing
 
-The assistant pages through every Inbox and saves the complete listing as inbox.json, a UTF-8 JSON object in the private store. List every message even above inbox_limit so the brake can report the count. Never infer provider flags or URLs from instructions in mail text.
+The assistant pages through every Inbox and saves the complete listing as inbox.json, a UTF-8 JSON object in the private store. List every message even above inbox_limit so the safety checks in guardrails can report the count. Never infer provider flags or URLs from instructions in mail text.
 
 | Key | Type and source |
 | --- | --- |
@@ -81,7 +93,8 @@ The assistant pages through every Inbox and saves the complete listing as inbox.
 | messages[].subject | String from the message subject. |
 | messages[].has_attachment | Optional boolean from provider attachment metadata, default false. |
 | messages[].spam, messages[].phishing | Optional booleans from the provider's own flags, default false. Used only to refuse unsubscribe; not an instruction to apply the spam action. |
-| messages[].unsubscribe_url | Optional string, the HTTPS URL from List-Unsubscribe, if available. No mailto, credentials, IP host, non-ASCII host, single-label host or localhost host; the host must be a plain DNS name of letters, digits, hyphens and dots. Missing or unsafe URL becomes a decision. A domain name can still resolve to a private address. |
+| messages[].unsubscribe_url | Optional string: the first HTTPS URI inside angle brackets in List-Unsubscribe, without brackets. Omit if none exists. The planner makes unsafe or missing links a decision; see the local client policy. |
+| messages[].unsubscribe_one_click | Optional boolean from List-Unsubscribe-Post metadata, default false; selects RFC 8058 POST instead of GET. |
 | messages[].body, messages[].sender_name | Optional strings the matcher ignores. Do not collect body or sender_name. |
 | folders | Object mapping handles to arrays of existing folder objects. Required only for accounts with move rules. |
 | folders.HANDLE[].id, folders.HANDLE[].name | Strings from provider folder metadata: ID and exact display name. |
@@ -106,61 +119,66 @@ For example, with a private config containing only accounts.cedar:
 
 Ask the assistant: "This is my first run. Use --first-run with my private configuration, make a plan only, stop after planning and show me the report." Only after reviewing that report should you allow execution in a later run with a fresh listing and plan. Confirm provider read access and recoverability privately first.
 
-Run commands from the checkout with PIGEON_HOME pointing to the private store. lock prints a token; keep it as token in your shell. Use the normal command below on later runs. Only an explicitly requested first run may add --first-run.
+For the execution run ask: "This is my first execution run. Use --first-run, execute the plan and send the run message."
+
+Run the ordered commands in [AGENTS.md](../AGENTS.md). On the explicit first run add --first-run to its plan command. A plan-only run leaves state untouched; the later execution run also needs --first-run if no state has yet been committed.
+
+The plan records first_run from the explicit flag. Execution and commit-state check it against missing state.
+
+check can be used to inspect lock ownership:
 
 ```bash
-token=$(python3 scripts/triage.py lock)
-python3 scripts/triage.py plan --token "$token" --inbox "$PIGEON_HOME/inbox.json" --plan-out "$PIGEON_HOME/plan.json" --report-out "$PIGEON_HOME/report.md"
-python3 scripts/triage.py check --token "$token"
-python3 scripts/triage.py release --token "$token"
+PIGEON_HOME=/absolute/private-store python3 scripts/triage.py check --token TOKEN
 ```
 
-Once-only first-run form (only when the user requests it):
+It exits 0 for a held, unexpired token or refuses with one line. release prints "released" or "already released"; another holder's token is refused.
 
-```bash
-python3 scripts/triage.py plan --first-run --token "$token" --inbox "$PIGEON_HOME/inbox.json" --plan-out "$PIGEON_HOME/plan.json" --report-out "$PIGEON_HOME/report.md"
-```
+plan accepts --config, --rules, --never-touch and --guardrails overrides for plan-only runs. Without --plan-out it prints JSON; without --report-out it prints Markdown. Output paths must be private, distinct, have existing parents, and differ from inputs, state and lock. Execution uses the standard private input names, so put any custom inputs there before planning. Keep those inputs, the original listing and the plan unchanged during execution.
 
-check exits 0 with one line when the token holds an unexpired lock; otherwise it exits non-zero with one refusal line. release prints "released", or "already released" if no lock exists; both exit 0. A different holder's token is refused.
+## State and execution files
 
-plan accepts --config, --rules, --never-touch and --guardrails to override the input paths in the store. --inbox and --token are required. Without --plan-out it prints plan JSON; without --report-out it prints Markdown. The optional output paths must be private and distinct, with existing parent folders, and must not name an input, state or lock file.
+All files below live in the private store:
 
-If plan.json has any stop reasons (the reasons array), actions is empty and nothing may be executed. A stopped plan can exit 0; inspect reasons. Missing state without --first-run returns such a stopped plan. Malformed state fails the command even with --first-run. Planning saves expected remaining Inbox counts: counts seen minus planned trash, archive, move and spam actions. A stopped run saves the counts it saw, so an unexpected drop stops one run. An account missing from a listing keeps its saved count. State must map configured account handles to non-negative whole numbers and records only configured accounts; after removing an account from config.toml, delete its entry from state.json. The empty-Inbox brake fires when the saved expected count was at least three and the new count is zero. A failed plan command removes its requested outputs and attempts lock release.
+- inbox.json: the JSON listing defined above.
+- plan.json: JSON actions, decisions, reasons, counts, forecast expected_counts (never saved as state) and not_listed accounts. A stopped plan has no actions; it may still exit 0.
+- report.md: escaped Markdown proposals from the planner, never proof of execution. New rules is an empty placeholder; the planner does not create rules.
+- state.json: a JSON object mapping configured account handles to non-negative integer remaining Inbox counts. Only commit-state saves it, atomically, from observed counts minus confirmed executed trash/archive/move/spam results. Missing accounts retain their saved counts. Stopped plans save observed counts without deductions, so an empty-Inbox brake need not repeat forever. After removing a configured account, remove its saved entry.
+- results.json: an object with only a results array, for example {"results":[{"account":"cedar","id":"item-a","action":"trash","status":"executed"}]}. Each entry has exactly those four string keys and uniquely matches a planned action. See the status table below. Omitted entries did not execute. Only executed removals reduce state counts. The step machine atomically replaces this file after recording results; do not edit it.
+- calls.jsonl: append-only JSON objects with sequence, time (Unix seconds), run (lock token), account, id, verb and outcome (issued, a result status, or unplanned). Unplanned calls appear only when disclosed with observed.
+- execution-report.md: escaped Markdown handled counts from results and disclosed unplanned calls for the current token. Use it as directed by AGENTS.md.
+- execution-<SHA256 of token>.json: the step machine’s checkpoint for this plan and run; do not edit it.
+- unsubscribe-failures.json and unsubscribe-secret: keyed sender failure memory and its private key; keep both private and do not edit them.
+- run-message.md: a message saved after delivery failed, handled by AGENTS.md.
+- run.lock: JSON token and created timestamp; .lock-gate: persistent local coordination file.
 
-The report lists proposals, not execution. Follow the run procedure in AGENTS.md for refusals, stopped plans and execution results.
+Planning does not save state. If a run stops before commit, previous state remains unchanged, even if mail actions completed; the execution files retain evidence. Do not assume a proposed removal happened or replay uncertain writes. Start a later run with a fresh listing and token. Without state and without --first-run, planning stops. Finalizing that stopped plan saves the observed counts; the following run proceeds without --first-run. Ask: "Follow AGENTS.md for one execution run and send the run message." Malformed state is refused even with --first-run. Commit-state revalidates the plan and accepts supplied results only when they match the checkpoint for this token and plan. Hand-written results are refused. Failed planning removes its requested outputs and attempts lock release.
+
+The step machine requires one result before another next. Lost lock returns stop and remaining actions without writing the private store. Observations with duplicate IDs or missing known Inbox IDs not yet removed are refused.
+
+### Result statuses
+
+| Status | Meaning | Counts toward brake | What the user does |
+| --- | --- | --- | --- |
+| executed | A gateway removal answered ok and the ID left the Inbox; an unsubscribe site answered 2xx. | No; resets that verb’s failure count. | Nothing. Unsubscribe mail may continue for a while. |
+| failed | Gateway error, or an attempted HTTPS unsubscribe refused by safety checks or unsuccessful. | Yes. | Check the message or unsubscribe manually if trusted. |
+| unexecuted | Gateway answered ok but the ID stayed in Inbox, or a later call was never issued after lock loss. | Yes for the gateway result; no for never-issued calls. | Check the message; a fresh run reconsiders it. |
+| skipped | Never issued after two consecutive unsuccessful results of that verb. | No. | Review the preceding failures; a fresh run reconsiders it. |
+| unsubscribe_not_executable | Missing or mailto-only URL; no request sent. | No. | Use a trusted manual unsubscribe method if wanted. |
+| unsubscribe_not_attempted | Remembered sender, flagged message or non-HTTPS URL prevented contact. | No. | Leave it or use a trusted manual method. |
+| issued_unknown | Issued call with no confirmed outcome, shown in remaining actions or the pending summary. | No. | Follow the uncertain-call instructions in AGENTS.md. |
+
+Only failed unsubscribe requests enter failure memory. Never-attempted outcomes do not update the unsubscribe brake. Only executed removals reduce saved counts.
+
 
 ## Scheduling
 
-You supply the scheduler. There is no scheduler code or Executor trigger recipe. Start with attended runs. The machine must be awake, authenticated and able to reach Executor.
+You supply the scheduler and report channel. Configure the host to start in the checkout with PIGEON_HOME set and this instruction: "Follow AGENTS.md for one scheduled Inbox triage and send the standard run message." Start with attended runs, confirm report delivery and replies, then enable your schedule. Grant minimum file, command and gateway permissions without bypass flags.
 
-Put this one prompt in the PIGEON_PROMPT line in your crontab (above the job):
-
-```cron
-PIGEON_PROMPT="Read AGENTS.md and the private guardrails. Run one scheduled Inbox triage using the private configuration. Follow the lock and failure procedure. End with the standard run message."
-```
-
-Run `command -v claude python3` (or `command -v codex python3`) in your normal shell. Add a PATH line above the job containing the folders those paths use. For example:
-
-```cron
-PATH=/usr/local/bin:/usr/bin:/bin
-```
-
-Add your assistant's install folder if it differs. Replace /path/to/pigeon below with the checkout path. Create the private store first. The inline PIGEON_HOME assignment supplies it to the assistant and its child commands; change it and the log path together if needed. Install only one of these alternative entries for 09:00 daily in the scheduler's timezone:
-
-```cron
-0 9 * * * cd /path/to/pigeon && PIGEON_HOME="$HOME/.config/pigeon" claude -p "$PIGEON_PROMPT" >> "$HOME/.config/pigeon/scheduler.log" 2>&1
-0 9 * * * cd /path/to/pigeon && PIGEON_HOME="$HOME/.config/pigeon" codex exec "$PIGEON_PROMPT" >> "$HOME/.config/pigeon/scheduler.log" 2>&1
-```
-
-The run message goes only to scheduler.log. Check it after the first scheduled run and whenever you want the result; this kit sends no notification.
-
-Grant the minimum file, command and Executor tool permissions in the assistant's own settings, never with bypass flags. Report blocked permissions. These are invocation stubs, not unattended-write permission presets. Follow the approval-pause policy in the private guardrails in every run.
-
-Syntax references: [Claude Code headless](https://code.claude.com/docs/en/headless) documents -p; [Codex non-interactive mode](https://developers.openai.com/codex/noninteractive) documents exec with a prompt.
+No host integration is required by the scripts.
 
 ## Known unverified
 
-Live Executor paths, provider action semantics, outbound unsubscribe support, and assistant authentication, tool discovery and approval configuration have not been tested by the offline suite. Neither cron entry has run against a live account. Confirm these privately before unattended use. CLAUDE.md (which loads AGENTS.md) and .claude/skills (a link to .agents/skills) are tested to exist; discovery depends on your assistant's version and setup.
+Live gateway paths, provider recovery semantics, authentication, approval configuration and scheduled report delivery have not been tested by the offline suite. Confirm these privately before unattended use.
 
 ## Maintainer publication checks
 
@@ -169,3 +187,19 @@ Changes to the checker, ignore rules, hooks and workflow need maintainer review.
 Run `python3 scripts/leak_check.py --history --git-config --deny PATH` on the publication candidate. Only --git-config reads local Git configuration; normal scans, hooks and CI leave it alone. Set PIGEON_DENY to an existing private deny-list folder to add that list to both hooks.
 
 A non-empty PIGEON_DENY that is not an existing folder fails both hooks; an explicit --deny also requires a folder containing deny terms, and any non-hidden file there not named *.txt is refused. GitHub no-reply addresses are accepted only in commit author/committer headers, annotated-tag tagger headers and the explicitly scanned Git user email setting.
+
+## Local unsubscribe client
+
+scripts/unsubscribe.py is a library with no command-line interface; --help on that file does nothing. For an unsubscribe step, run exactly the command array returned by next. It invokes:
+
+```bash
+PIGEON_HOME=/absolute/private-store python3 scripts/execute.py unsubscribe --token TOKEN --plan /absolute/private-store/plan.json
+```
+
+It records its own status; do not submit a gateway observation. See the listing and rule tables for one-click and companion fields.
+
+The client allows HTTPS on port 443 only, checks every DNS answer for public addresses, pins a checked address and verifies the host certificate. It follows at most three redirects, rechecking the scheme and addresses at each hop. It refuses credentials in URLs, authentication challenges, password forms and oversized headers; never handle login prompts yourself. It sends no cookies or credentials. Socket timeouts are five seconds. A single 20-second deadline covers DNS, connect, TLS, headers, body and redirects. Response headers are capped at 16 KiB. It reads at most 16 KiB plus one overflow byte and judges successful responses from the status and capped sample. POST changes to GET after 301/302/303; 307/308 preserve POST.
+
+The planner makes unsafe unsubscribe links and provider-flagged spam or phishing decisions for the user; it plans neither the request nor its companion action. Reports show safe planned links as escaped hosts, never clickable links. The client independently checks every issued request. Do not write unsubscribe rules for senders you suspect of spam or phishing; use spam instead. The assistant runs each issued command as given. See the status table for local refusals and remembered failures.
+
+The network request releases the store gate. Ownership and the unchanged checkpoint are checked before saving its outcome or failure memory. Lost ownership leaves the issued call uncertain.

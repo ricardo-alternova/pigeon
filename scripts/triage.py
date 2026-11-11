@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Offline Inbox planner. No mail or network operations."""
+"""Offline Inbox planner. No mail or network operations.
+
+commit-state saves Inbox counts after a run. Pass results.json written by
+execute.py; hand-written files are refused. expected_counts is a forecast,
+never saved state. See docs/setup.md for result formats and statuses.
+"""
 import argparse
+import ipaddress
+from urllib.parse import urlsplit
 from contextlib import contextmanager
 from email.utils import getaddresses
 import fcntl
-import ipaddress
 import unicodedata
 import math
 import tempfile
@@ -17,7 +23,6 @@ import subprocess
 import sys
 import time
 import tomllib
-from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Known limits: POSIX only; spam/phishing flags use exact keys; locks do not
@@ -36,11 +41,14 @@ def private_store(path=None, *, output=False):
     parent = store.parent if output else store
     while not parent.exists():
         parent = parent.parent
-    probe = subprocess.run(['git', '-C', str(parent), 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
+    git_env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    probe = subprocess.run(['git', '-C', str(parent), 'rev-parse', '--show-toplevel'], capture_output=True, text=True, env=git_env)
     if probe.returncode == 0:
-        ignored = subprocess.run(['git', '-C', probe.stdout.strip(), 'check-ignore', '-q', str(store) + ('' if output else os.sep)])
+        ignored = subprocess.run(['git', '-C', probe.stdout.strip(), 'check-ignore', '-q', str(store) + ('' if output else os.sep)], env=git_env)
         if ignored.returncode:
             raise ValueError('Private store ' + str(store) + ': expected a git-ignored folder inside a work tree; ignore it or set PIGEON_HOME to an existing folder outside the work tree')
+    elif 'not a git repository' not in probe.stderr:
+        raise ValueError('Private store ' + str(store) + ': git work-tree check failed')
     if not output:
         store.mkdir(parents=True, exist_ok=True, mode=0o700)
     return store
@@ -51,7 +59,7 @@ def lock_gate(store):
     # This inode is never removed: every acquire, check and release uses it.
     with (store / '.lock-gate').open('a', encoding='utf-8') as gate:
         fcntl.flock(gate, fcntl.LOCK_EX)
-        yield
+        yield gate
 
 
 def read_lock(store):
@@ -83,6 +91,7 @@ def acquire(store):
         token = secrets.token_hex(24)
         with (store / 'run.lock').open('x', encoding='utf-8') as out:
             json.dump({'token': token, 'created': time.time()}, out)
+        (store / 'execution-report.md').unlink(missing_ok=True)
         return token
 
 
@@ -178,8 +187,10 @@ def validate_rules(rules):
                 raise ValueError('Rule id and action must be non-empty strings')
             if 'target' in rule and (rule['action'] != 'move' or not isinstance(rule['target'], str)):
                 raise ValueError('rule.target: expected a folder name string on move rules only')
-            if set(rule) - {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target'}:
-                known_keys(rule, {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target'}, 'rule')
+            if set(rule) - {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe'}:
+                known_keys(rule, {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe'}, 'rule')
+            if 'after_unsubscribe' in rule and (rule['action'] != 'unsubscribe' or rule['after_unsubscribe'] not in ('trash', 'archive')):
+                raise ValueError('after_unsubscribe: expected trash or archive on unsubscribe rules')
             if rule['id'] in ids:
                 raise ValueError('Duplicate rule id; expected a unique id')
             ids.add(rule['id'])
@@ -261,7 +272,7 @@ def validate_inputs(listing, config, previous):
     for i, message in enumerate(listing['messages']):
         label = 'Inbox.messages.' + str(i)
         required = {'account', 'id', 'folder', 'sender', 'subject'}
-        flags = {'has_attachment', 'spam', 'phishing'}
+        flags = {'has_attachment', 'spam', 'phishing', 'unsubscribe_one_click'}
         strings = required | {'body', 'sender_name', 'unsubscribe_url'}
         known_keys(message, strings | flags, label)
         for key in required | set(message):
@@ -333,24 +344,17 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                         break
                     action['target'] = folders[0]['id']
                 if verb == 'unsubscribe':
-                    url = message.get('unsubscribe_url', '')
-                    parsed = urlsplit(url)
-                    host = (parsed.hostname or '').rstrip('.')
-                    try:
-                        ipaddress.ip_address(host)
-                        unsafe_host = True
-                    except ValueError:
-                        # Plain DNS names only: no percent-encoding, backslash or other host syntax.
-                        unsafe_host = (not re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)+', host) or host.endswith('.localhost')
-                                       or bool(re.fullmatch(r'(?:[0-9]+|0x[0-9a-f]+)', host.rsplit('.', 1)[-1], re.I)))
-                    if unsafe_host or parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or message.get('spam') or message.get('phishing'):
+                    action['url'] = message.get('unsubscribe_url', '')
+                    if not safe_unsubscribe_host(action['url']) or message.get('spam') or message.get('phishing'):
                         reason = 'Unsafe unsubscribe'
                         break
-                    action['url'] = url
                 if verb == 'report':
                     reason = 'Rule requests a decision'
                     break
                 actions.append(action)
+                if verb == 'unsubscribe' and 'after_unsubscribe' in rule:
+                    actions.append(dict(account=action['account'], id=action['id'],
+                                        action=rule['after_unsubscribe'], rule=rule['id']))
                 reason = None
                 break
         if reason:
@@ -384,7 +388,32 @@ STRINGS = {
 def safe_text(value):
     # Mail text remains a single escaped Markdown text line, never raw HTML.
     value = ''.join('[control]' if unicodedata.category(c) in {'Cc', 'Cf', 'Cs'} else c for c in str(value))
+    # Linear-time link breaking, Unicode-aware: any dot before a letter, including full-width dots.
+    value = re.sub(r'(?<=[^\W_])[.。．｡](?=[^\W\d_])', '[dot]', value)
+    value = value.replace('://', '[colon]//').replace('@', '[at]')
     return re.sub(r'([\\`*_{}\[\]()<>!|#])', r'\\\1', ' '.join(value.split()))
+
+
+def safe_unsubscribe_host(url):
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or '').rstrip('.')
+        valid = (parsed.scheme == 'https' and parsed.port in (None, 443)
+                 and parsed.username is None and parsed.password is None
+                 and re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)+', host)
+                 and not host.endswith('.localhost')
+                 and not re.fullmatch(r'(?:[0-9]+|0x[0-9a-f]+)', host.rsplit('.', 1)[-1], re.I)
+                 and not any(ord(c) <= 32 or ord(c) >= 127 for c in url)
+                 and '\\' not in url)
+        if valid:
+            try:
+                ipaddress.ip_address(host)
+                valid = False
+            except ValueError:
+                pass
+    except ValueError:
+        valid = False
+    return host if valid else None
 
 
 def render_report(plan, listing, language='en'):
@@ -397,9 +426,20 @@ def render_report(plan, listing, language='en'):
     lines = [safe_text(a) + ': not listed this run' for a in plan.get('not_listed', [])] + lines
     lines += [stopped + ': ' + safe_text(r) for r in plan['reasons']]
     lines += ['', '**' + decision + '**', '']
-    lines += [str(i) + '. ' + describe(a) + ' (' + safe_text(a['reason']) + ')' for i, a in enumerate(plan['decisions'], 1)] or [empty]
+    unsafe = []
+    hosts = {}
+    for a in plan['actions']:
+        if a['action'] != 'unsubscribe':
+            continue
+        m = lookup[a['account'], a['id']]
+        host = safe_unsubscribe_host(a['url'])
+        if not host or m.get('spam') or m.get('phishing'):
+            unsafe.append(a | {'reason': 'Unsafe unsubscribe'})
+        else:
+            hosts[a['account'], a['id']] = host
+    lines += [str(i) + '. ' + describe(a) + ' (' + safe_text(a['reason']) + ')' for i, a in enumerate(plan['decisions'] + unsafe, 1)] or [empty]
     lines += ['', '**' + planned + '**', '']
-    lines += ['- ' + a['action'] + ': ' + describe(a) + (' | ' + safe_text(a['url']) if 'url' in a else '') for a in plan['actions']] or [empty]
+    lines += ['- ' + a['action'] + ': ' + describe(a) + (' | ' + safe_text(hosts.get((a['account'], a['id']), '')) if 'url' in a else '') for a in plan['actions'] if a['action'] != 'unsubscribe' or (a['account'], a['id']) in hosts] or [empty]
     lines += ['', '**' + new + '**', '', empty, '']
     return '\n'.join(lines)
 
@@ -423,6 +463,92 @@ def load_inputs(paths):
     return result
 
 
+def commit_state(store, token, plan_path, results_path=None):
+    with lock_gate(store):
+        require_lock(store, token)
+        def read(path):
+            try:
+                return json.loads(load_inputs([path])[0])
+            except ValueError as error:
+                raise ValueError(str(path) + ': ' + str(error)) from error
+        plan = read(plan_path)
+        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'first_run'}, str(plan_path))
+        for key in ('actions', 'reasons', 'not_listed'):
+            if not isinstance(plan.get(key), list):
+                raise ValueError(str(plan_path) + '.' + key + ': expected an array')
+        counts = plan.get('counts')
+        known_keys(counts, set(counts) if isinstance(counts, dict) else set(), str(plan_path) + '.counts')
+        if any(type(n) is not int or n < 0 for n in counts.values()):
+            raise ValueError(str(plan_path) + '.counts: expected non-negative integer counts')
+        actions = set()
+        for i, action in enumerate(plan['actions']):
+            label = str(plan_path) + '.actions.' + str(i)
+            known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'url'}, label)
+            if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action')):
+                raise ValueError(label + ': expected account, id and action strings')
+            if action['action'] not in VERBS or action['account'] not in counts:
+                raise ValueError(label + '.action: expected a known action in a counted account')
+            key = (action['account'], action['id'], action['action'])
+            if key in actions:
+                raise ValueError(label + '.id: expected a unique action')
+            actions.add(key)
+        import execute
+        execution = execute.Execution(store, token, plan_path)
+        execution.validate()
+        executed = []
+        if results_path is not None:
+            results = read(results_path)
+            known_keys(results, {'results'}, str(results_path))
+            if not isinstance(results.get('results'), list):
+                raise ValueError(str(results_path) + '.results: expected an array')
+            seen = set()
+            for i, entry in enumerate(results['results']):
+                label = str(results_path) + '.results.' + str(i)
+                known_keys(entry, {'account', 'id', 'action', 'status'}, label)
+                for k in ('account', 'id', 'action', 'status'):
+                    if not isinstance(entry.get(k), str):
+                        raise ValueError(label + '.' + k + ': expected a string')
+                key = (entry['account'], entry['id'], entry['action'])
+                if key not in actions or key in seen:
+                    raise ValueError(label + '.id: expected a unique action matching the plan account, id and action')
+                seen.add(key)
+                if entry['status'] not in {'executed', 'failed', 'skipped', 'unexecuted', 'unsubscribe_not_executable', 'unsubscribe_not_attempted', 'issued_unknown'}:
+                    raise ValueError(label + '.status: expected executed, failed, skipped, unexecuted, unsubscribe_not_executable, unsubscribe_not_attempted or issued_unknown')
+                if entry['status'] == 'executed' and entry['action'] in {'trash', 'archive', 'move', 'spam'}:
+                    executed.append(entry['account'])
+        if results_path is not None and (not execution.path.exists() or results['results'] != execution.state['results']):
+            raise ValueError(str(results_path) + ': expected results recorded by the step machine for this token and plan')
+        config_path = store / 'config.toml'
+        try:
+            config = tomllib.loads(load_inputs([config_path])[0])
+        except ValueError as error:
+            raise ValueError(str(config_path) + ': expected valid TOML: ' + str(error)) from error
+        state = store / 'state.json'
+        previous = read(state) if state.exists() else {}
+        # Reuse the same config and saved-count validation as planning.
+        try:
+            validate_inputs({'accounts': {}, 'messages': []}, config, previous)
+        except ValueError as error:
+            source = state if str(error).startswith('state.json') else config_path
+            raise ValueError(str(source) + ': ' + str(error)) from error
+        counts = {a: n for a, n in counts.items() if a in config['accounts']}
+        if not plan['reasons']:
+            for account in executed:
+                if account in counts:
+                    counts[account] -= 1
+        if any(n < 0 for n in counts.values()):
+            raise ValueError(str(plan_path) + '.counts: expected at least as many observed messages as executed removals')
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=store, delete=False) as out:
+                temporary = Path(out.name)
+                json.dump({**previous, **counts}, out)
+            temporary.replace(state)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -430,6 +556,10 @@ def main(argv=None):
     for name in ('release', 'check'):
         command = sub.add_parser(name)
         command.add_argument('--token', required=True)
+    commit = sub.add_parser('commit-state', allow_abbrev=False)
+    commit.add_argument('--token', required=True)
+    commit.add_argument('--plan', required=True)
+    commit.add_argument('--results')
     plan = sub.add_parser('plan', allow_abbrev=False)
     plan.add_argument('--token', required=True)
     plan.add_argument('--inbox', required=True)
@@ -437,7 +567,7 @@ def main(argv=None):
     for name in ('config', 'rules', 'never-touch', 'guardrails', 'plan-out', 'report-out'):
         plan.add_argument('--' + name)
     args = parser.parse_args(argv)
-    for name in ('inbox', 'config', 'rules', 'never_touch', 'guardrails', 'plan_out', 'report_out'):
+    for name in ('inbox', 'config', 'rules', 'never_touch', 'guardrails', 'plan_out', 'report_out', 'plan', 'results'):
         if getattr(args, name, None) == '':
             raise ValueError('--' + name.replace('_', '-') + ': expected a non-empty path')
     store = private_store()
@@ -449,9 +579,17 @@ def main(argv=None):
         with lock_gate(store):
             require_lock(store, args.token)
         print('Lock is held and unexpired')
+    elif args.command == 'commit-state':
+        commit_state(store, args.token, args.plan, args.results)
     else:
         sources = [getattr(args, n.replace('-', '_')) or store / (n + ('.md' if n == 'guardrails' else '.toml')) for n in ('config', 'rules', 'never-touch', 'guardrails')]
-        protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate')}
+        protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'inbox.json', 'config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')}
+        protected |= {p.resolve() for p in store.glob('execution-*.json')}
+        for name in (args.plan_out, args.report_out):
+            if name:
+                candidate = Path(name).expanduser().resolve()
+                if candidate.parent == store and candidate.name.startswith('execution-') and candidate.suffix == '.json':
+                    protected.add(candidate)
         # Keep the gate for the whole read/plan/write interval, excluding takeover.
         try:
             for flag, name in (('--plan-out', args.plan_out), ('--report-out', args.report_out)):
@@ -497,15 +635,14 @@ def main(argv=None):
                     else:
                         source = args.inbox
                     raise ValueError(str(source) + ': ' + message.strip()) from error
+                result['first_run'] = args.first_run
                 report = render_report(result, listing, config.get('language', 'en'))
                 payload = json.dumps(result, ensure_ascii=True, indent=2) + '\n'
                 sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
                 outputs = []
                 temporary = []
                 try:
-                    for name, content in ((args.plan_out, payload), (args.report_out, report),
-                                          (state, json.dumps({a: n for a, n in {**previous, **result.get('expected_counts', result['counts'])}.items()
-                                                              if a in config['accounts']}))):
+                    for name, content in ((args.plan_out, payload), (args.report_out, report)):
                         if name is None:
                             continue
                         destination = private_store(name, output=True)

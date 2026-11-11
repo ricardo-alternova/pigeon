@@ -16,6 +16,42 @@ PY
 bash "$scratch/quick-start.sh" > "$scratch/output"
 cmp "$PIGEON_HOME/report.md" tests/fixtures/expected-report.md
 test ! -e "$PIGEON_HOME/run.lock"
+# Exercise the actual next/result CLI, including refusals and disclosure.
+python3 - <<'PYCLI'
+import json
+import os
+from pathlib import Path
+import subprocess
+store = Path(os.environ['PIGEON_HOME'])
+(store/'inbox.json').write_bytes(Path('tests/fixtures/inbox.json').read_bytes())
+def run(*args, check=True):
+    return subprocess.run(['python3', *args], text=True, capture_output=True, check=check)
+token = run('scripts/triage.py', 'lock').stdout.strip()
+run('scripts/triage.py', 'plan', '--first-run', '--token', token, '--inbox', str(store/'inbox.json'), '--plan-out', str(store/'plan.json'))
+base = ['--token', token, '--plan', str(store/'plan.json')]
+plan = json.loads((store/'plan.json').read_text())
+if plan['actions']:
+    original = (store/'plan.json').read_text()
+    plan['actions'][0]['action'] = 'send'
+    (store/'plan.json').write_text(json.dumps(plan))
+    assert run('scripts/execute.py', 'next', *base, check=False).returncode != 0
+    (store/'plan.json').write_text(original)
+ids = {}
+for m in json.loads((store/'inbox.json').read_text())['messages']:
+    ids.setdefault(m['account'], []).append(m['id'])
+while True:
+    call = json.loads(run('scripts/execute.py', 'next', *base).stdout)
+    if call.get('done'):
+        break
+    ids[call['account']].remove(call['id'])
+    observation = json.dumps(dict(outcome='ok', inbox_ids=ids[call['account']]))
+    run('scripts/execute.py', 'result', *base, '--observation', observation)
+run('scripts/execute.py', 'observed', '--token', token, '--account', 'cedar', '--id', 'invented', '--verb', 'extra')
+assert 'extra' in (store/'execution-report.md').read_text()
+run('scripts/triage.py', 'commit-state', *base, '--results', str(store/'results.json'))
+assert (store/'state.json').exists()
+run('scripts/triage.py', 'release', '--token', token)
+PYCLI
 # Identity is fictional; the hook must refuse the private path, not bad content.
 git config user.name 'Kit Test'
 git config user.email 'kit@example.com'

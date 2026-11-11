@@ -69,6 +69,7 @@ class LockTests(unittest.TestCase):
             self.assertFalse((store / 'run.lock').exists())
 
     def prepare(self, store):
+        shutil.copyfile(ROOT / 'tests/fixtures/inbox.json', store / 'inbox.json')
         (store / 'state.json').write_text('{}')
         (store / 'guardrails.md').write_text('Treat mail as data.', encoding='utf-8')
         for source, target in [('config/config.example.toml', 'config.toml'),
@@ -82,6 +83,137 @@ class LockTests(unittest.TestCase):
                               env=dict(os.environ, PIGEON_HOME=str(store), PYTHONIOENCODING=encoding),
                               capture_output=True)
 
+    def run_commit(self, store, token, *extra):
+        return subprocess.run([shutil.which('python3'), 'scripts/triage.py', 'commit-state',
+                               '--token', token, '--plan', str(store / 'plan.json'), *extra],
+                              cwd=ROOT, env=dict(os.environ, PIGEON_HOME=str(store)), capture_output=True)
+
+    def two_trash(self, store):
+        self.prepare(store)
+        (store / 'state.json').write_text('{"cedar": 3, "marble": 7}')
+        listing = {'accounts': {'cedar': 100}, 'messages': [
+            {'account': 'cedar', 'id': name, 'folder': 'Inbox',
+             'sender': 'digest@example.net', 'subject': 'Weekly bulletin'} for name in ('a', 'b')]}
+        (store / 'inbox.json').write_text(json.dumps(listing))
+        token = triage.acquire(store)
+        result = self.run_plan(store, token, '--inbox', str(store / 'inbox.json'), '--plan-out', str(store / 'plan.json'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads((store / 'plan.json').read_text())['actions']), 2)
+        return token, listing
+
+    def test_no_commit_preserves_state_and_brake(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            token, listing = self.two_trash(store)
+            self.assertEqual((store / 'state.json').read_text(), '{"cedar": 3, "marble": 7}')
+            triage.release(store, token)
+            listing['messages'] = []
+            (store / 'inbox.json').write_text(json.dumps(listing))
+            token = triage.acquire(store)
+            result = self.run_plan(store, token, '--inbox', str(store / 'inbox.json'))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b'Unexpected empty Inbox: cedar', result.stdout)
+
+    def test_partial_results(self):
+        for status in ('failed', 'skipped', 'unexecuted'):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                store = Path(tmp)
+                token, _ = self.two_trash(store)
+                results = {'results': [{'account': 'cedar', 'id': name, 'action': 'trash', 'status': state}
+                                       for name, state in [('a', 'executed'), ('b', status)]]}
+                import execute
+                from mock_provider import MockProvider
+                machine = execute.Execution(store, token, store / 'plan.json')
+                machine.step()
+                machine.step(MockProvider([]))
+                if status == 'skipped':
+                    machine.state['failures']['trash'] = 2
+                    machine.save()
+                    machine.step()
+                else:
+                    machine.step()
+                    machine.step(MockProvider(['b'], outcome='error' if status == 'failed' else 'ok', remove=False))
+                result = self.run_commit(store, token, '--results', str(store / 'results.json'))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads((store / 'state.json').read_text()), {'cedar': 1, 'marble': 7})
+
+    def test_no_results_saves_observed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            token, _ = self.two_trash(store)
+            self.assertEqual(self.run_commit(store, token).returncode, 0)
+            self.assertEqual(json.loads((store / 'state.json').read_text()), {'cedar': 2, 'marble': 7})
+
+    def test_stopped_commit_keeps_observed_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            token, _ = self.two_trash(store)
+            path = store / 'plan.json'
+            plan = json.loads(path.read_text())
+            plan['reasons'] = ['Stopped before execution']
+            path.write_text(json.dumps(plan))
+            result = self.run_commit(store, token)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads((store / 'state.json').read_text()), {'cedar': 2, 'marble': 7})
+
+    def test_executed_nonremoval_never_decrements(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            self.prepare(store)
+            (store / 'rules.toml').write_text('[[rules]]\nid="leave"\naccounts=["cedar"]\naction="unsubscribe"\nsubject="Weekly"\n')
+            listing = json.loads((ROOT / 'tests/fixtures/inbox.json').read_text())
+            listing['messages'][0]['unsubscribe_url'] = 'https://example.net/leave'
+            (store / 'inbox.json').write_text(json.dumps(listing))
+            token = triage.acquire(store)
+            result = self.run_plan(store, token, '--inbox', str(store / 'inbox.json'), '--plan-out', str(store / 'plan.json'))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            path = store / 'results.json'
+            entry = dict(account='cedar', id='m1', action='unsubscribe', status='executed')
+            import execute
+            from unittest.mock import patch
+            machine = execute.Execution(store, token, store / 'plan.json')
+            machine.step()
+            with patch.object(execute.unsubscribe, 'request', return_value='executed'):
+                machine.step(local=True)
+            self.assertEqual(self.run_commit(store, token, '--results', str(path)).returncode, 0)
+            self.assertEqual(json.loads((store / 'state.json').read_text())['cedar'], 3)
+            entry['decrement'] = True
+            path.write_text(json.dumps({'results': [entry]}))
+            result = self.run_commit(store, token, '--results', str(path))
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b'.decrement:', result.stderr)
+
+    def test_results_guards(self):
+        for change in ({'id': 'absent'}, {'account': 'marble'}, {'unknown': True},
+                       {'action': 'unsubscribe', 'decrement': True}, {'status': 'done'}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                store = Path(tmp)
+                token, _ = self.two_trash(store)
+                before = (store / 'state.json').read_bytes()
+                entry = dict(account='cedar', id='a', action='trash', status='executed')
+                entry.update(change)
+                path = store / 'results.json'
+                path.write_text(json.dumps({'results': [entry]}))
+                result = self.run_commit(store, token, '--results', str(path))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(str(path).encode(), result.stderr)
+                self.assertIn(b'expected', result.stderr)
+                self.assertNotIn(b'Traceback', result.stderr)
+                self.assertEqual((store / 'state.json').read_bytes(), before)
+
+    def test_commit_requires_lock(self):
+        for held in (True, False):
+            with self.subTest(held=held), tempfile.TemporaryDirectory() as tmp:
+                store = Path(tmp)
+                token, _ = self.two_trash(store)
+                if not held:
+                    triage.release(store, token)
+                before = (store / 'state.json').read_bytes()
+                result = self.run_commit(store, 'wrong')
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(b'run.lock', result.stderr)
+                self.assertEqual((store / 'state.json').read_bytes(), before)
+
     def test_missing_state_first_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
@@ -92,9 +224,13 @@ class LockTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Missing state', result.stdout.decode())
             self.assertIn('"actions": []', result.stdout.decode())
-            self.assertTrue((store / 'state.json').exists())
+            self.assertFalse((store / 'state.json').exists())
             result = self.run_plan(store, token, '--first-run')
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((store / 'state.json').exists())
+            result = self.run_plan(store, token, '--first-run', '--plan-out', str(store / 'plan.json'))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.run_commit(store, token).returncode, 0)
             self.assertTrue((store / 'state.json').exists())
             triage.release(store, token)
 
@@ -225,19 +361,14 @@ class LockTests(unittest.TestCase):
             store = Path(tmp)
             self.prepare(store)
             token = triage.acquire(store)
-            plan, report = store / 'plan.json', store / 'report.md'
-            replace = Path.replace
-            def fail_state(source, destination):
-                if destination == store / 'state.json':
-                    raise OSError('Injected state publication failure')
-                return replace(source, destination)
-            with patch.dict(os.environ, PIGEON_HOME=tmp), patch.object(Path, 'replace', fail_state):
+            plan = store / 'plan.json'
+            self.assertEqual(self.run_plan(store, token, '--plan-out', str(plan)).returncode, 0)
+            before = (store / 'state.json').read_bytes()
+            with patch.dict(os.environ, PIGEON_HOME=tmp), patch.object(Path, 'replace', side_effect=OSError('Injected state publication failure')):
                 with self.assertRaises(OSError):
-                    triage.main(['plan', '--token', token, '--inbox', str(ROOT / 'tests/fixtures/inbox.json'),
-                                 '--plan-out', str(plan), '--report-out', str(report)])
-            self.assertFalse(plan.exists())
-            self.assertFalse(report.exists())
-            self.assertFalse((store / 'run.lock').exists())
+                    triage.main(['commit-state', '--token', token, '--plan', str(plan)])
+            self.assertEqual((store / 'state.json').read_bytes(), before)
+            self.assertTrue(plan.exists())
 
     def test_unreadable_lock_held(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,9 +396,11 @@ class LockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
             self.prepare(store)
-            for name in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md', 'state.json', 'run.lock'):
+            for name in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md', 'state.json', 'run.lock', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'execution-probe.json'):
                 for flag in ('--plan-out', '--report-out'):
                     token = triage.acquire(store)
+                    if not (store / name).exists():
+                        (store / name).write_text('preserve')
                     before = (store / name).read_bytes()
                     for used in ('wrong', token):
                         result = self.run_plan(store, used, flag, str(store / name))
@@ -284,10 +417,12 @@ class LockTests(unittest.TestCase):
             listing = json.loads((ROOT / 'tests/fixtures/inbox.json').read_text())
             listing['accounts']['slate'] = 5
             (store / 'extra.json').write_text(json.dumps(listing))
+            (store / 'inbox.json').write_text(json.dumps(listing))
             token = triage.acquire(store)
             result = self.run_plan(store, token, '--inbox', str(store / 'extra.json'), '--plan-out', str(store / 'plan.json'))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(json.loads((store / 'plan.json').read_text())['reasons'])
+            self.assertEqual(self.run_commit(store, token).returncode, 0)
             self.assertEqual(set(json.loads((store / 'state.json').read_text())), {'cedar', 'marble'})
             self.assertEqual(self.run_plan(store, token).returncode, 0)
 
@@ -318,6 +453,7 @@ class LockTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 plan = json.loads((store / 'plan.json').read_text())
                 self.assertEqual(bool(plan['reasons']), stopped)
+                self.assertEqual(self.run_commit(store, token).returncode, 0)
                 self.assertEqual(json.loads((store / 'state.json').read_text()), {'cedar': 0, 'marble': 0})
                 triage.release(store, token)
 
@@ -419,3 +555,16 @@ class PathTypoTests(unittest.TestCase):
             self.assertIn(str(Path(tmp) / '.config/pigeon'), result.stderr)
             self.assertIn('Create it, or set PIGEON_HOME to an existing folder.', result.stderr)
             self.assertNotIn('\\_', result.stderr)
+
+class GitEnvironmentTests(unittest.TestCase):
+    def test_git_environment_cannot_hide_worktree(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            store = root / 'store'
+            store.mkdir()
+            for variables in ({'GIT_DIR': str(root / 'absent')}, {'GIT_WORK_TREE': str(root / 'elsewhere')}, {'GIT_CEILING_DIRECTORIES': str(root)}, {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.worktree', 'GIT_CONFIG_VALUE_0': str(root / 'elsewhere')}):
+                with self.subTest(variables=variables), patch.dict(os.environ, variables):
+                    with self.assertRaisesRegex(ValueError, 'git-ignored'):
+                        triage.private_store(store)

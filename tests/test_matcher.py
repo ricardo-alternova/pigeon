@@ -126,6 +126,14 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(result['actions'], [])
         self.assertIn('Per-rule action limit exceeded', result['reasons'])
 
+    def test_si9_rule_ceiling_counts_companions(self):
+        for count, stopped in ((5, False), (6, True)):
+            self.batch(count, verb='unsubscribe')
+            self.rules[0]['after_unsubscribe'] = 'archive'
+            result = self.plan()
+            self.assertEqual('Per-rule action limit exceeded' in result['reasons'], stopped)
+            self.assertEqual(len(result['actions']), 0 if stopped else 2 * count)
+
     def test_si9_unsubscribe_ceiling(self):
         self.batch(11, 2, 'unsubscribe')
         result = self.plan()
@@ -194,6 +202,7 @@ class MatcherTests(unittest.TestCase):
         for url, spam, phishing in [('mailto:leave@example.net', False, False), ('http://example.net', False, False), ('https://example.net', True, False), ('https://example.net', False, True)]:
             m.update(unsubscribe_url=url, spam=spam, phishing=phishing)
             self.assertNotIn('m1', [a['id'] for a in self.plan()['actions']])
+            self.assertEqual(self.plan()['decisions'][0]['reason'], 'Unsafe unsubscribe')
         m.update(unsubscribe_url='https://example.net/leave', spam=False, phishing=False)
         self.assertEqual(self.plan()['actions'][0]['action'], 'unsubscribe')
 
@@ -252,6 +261,7 @@ class MatcherTests(unittest.TestCase):
                      '.'.join(['127', '0', '0', '1%2e']), '.'.join(['127', '0', '0', '1\\', 'example', 'net']), 'mail_host.example.net'):
             self.listing['messages'][0]['unsubscribe_url'] = 'https://' + host + '/leave'
             self.assertEqual(self.plan()['actions'], [])
+            self.assertEqual(self.plan()['decisions'][0]['reason'], 'Unsafe unsubscribe')
 
     def test_f7_numbering(self):
         self.batch(1, verb='report')
@@ -410,3 +420,34 @@ class TypoSafetyTests(unittest.TestCase):
                 with patch.dict('os.environ', PIGEON_HOME=str(path)):
                     with self.assertRaisesRegex(ValueError, 'PIGEON_HOME.*existing folder'):
                         triage.private_store()
+
+class ReportLinkTests(unittest.TestCase):
+    setUp = MatcherTests.setUp
+    batch = MatcherTests.batch
+    plan = MatcherTests.plan
+    def test_unsafe_unsubscribe_report_and_plain_mail_links(self):
+        self.batch(1, verb='unsubscribe')
+        m = self.listing['messages'][0]
+        for url, flags in [('http://example.net/leave', {}), ('https://example.net/leave', {'phishing': True}), ('https://' + str(triage.ipaddress.ip_address(0x7f000001)) + '/leave', {})]:
+            m.update(dict(unsubscribe_url=url, phishing=False) | flags)
+            report = triage.render_report(self.plan(), self.listing)
+            self.assertIn('Unsafe unsubscribe', report)
+            self.assertNotIn(url, report)
+        m.update(unsubscribe_url='https://example.net/private-token', phishing=False, subject='Weekly https://example.org/link WWW.example.com example.net')
+        report = triage.render_report(self.plan(), self.listing)
+        self.assertNotIn('private-token', report)
+        self.assertNotIn('https://', report)
+        self.assertNotIn('example.org', report)
+        self.assertNotIn('example.net', report)
+        self.assertNotIn('WWW.example.com', report)
+        self.assertIn(triage.safe_text('example.net'), report)
+
+    def test_plain_mail_links_unicode_and_linear(self):
+        for text in ('ex\u0430mple.com/login', 'example\u3002com', 'example.com_x', 'a.b.c.d.e.f.g.h.i.j.k.l.m.example.com'):
+            with self.subTest(text=text):
+                self.assertNotRegex(triage.safe_text(text), r'[^\W_][.\u3002][^\W\d_]')
+        import time
+        start = time.monotonic()
+        for text in ('a.' * 20000, 'a' * 40000):
+            triage.safe_text(text)
+        self.assertLess(time.monotonic() - start, 2)

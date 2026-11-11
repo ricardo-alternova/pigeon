@@ -1,7 +1,7 @@
 # Only the files listed below are public. Everything else stays ignored.
 # Un-ignore each parent directory before its contents.
 # Private kit data belongs in ~/.config/pigeon/ or the folder PIGEON_HOME names,
-# for example the ignored private/ folder.
+# outside the checkout; private/demo is for fictional data only.
 *
 !.agents/
 .agents/*
@@ -53,3 +53,9 @@ tests/fixtures/*
 !tests/e2e.sh
 !tests/fixtures/inbox.json
 !tests/fixtures/expected-report.md
+!scripts/execute.py
+!tests/mock_provider.py
+!tests/test_execute.py
+!scripts/unsubscribe.py
+!tests/test_unsubscribe.py
+!CHANGELOG.md
