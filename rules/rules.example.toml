@@ -1,4 +1,5 @@
 # Fictional sample rules. Key reference: docs/setup.md#rules
+# Exact sender, subject regex, account scope, trash and exclusions.
 [[rules]]
 id = "digest"
 accounts = ["cedar", "marble"]
@@ -7,9 +8,57 @@ subject = "Weekly"
 action = "trash"
 exclusions = ["invoice", "question"]
 
+# Domain and attachment predicates; archive action.
 [[rules]]
 id = "receipts"
 accounts = ["cedar"]
 domain = "example.org"
 has_attachment = true
 action = "archive"
+
+# Body rule example (invented):
+# [[rules]]
+# id = "delivery-notices"
+# accounts = ["cedar"]
+# body = "colis livré"
+# action = "archive"
+
+# Question rule example (invented):
+# [[rules]]
+# id = "renewal-question"
+# accounts = ["cedar"]
+# sender = "renewals@example.org"
+# action = "report"
+# question = "Keep this renewal notice?"
+
+# Dated folder and per-rule limit example (invented):
+# [[rules]]
+# id = "monthly-invoices"
+# accounts = ["cedar"]
+# sender = "invoices@example.org"
+# action = "move"
+# target = "Invoices/{year}/{month}"
+# limit = 20
+
+# Fixed folder move (requires an existing unique path):
+# [[rules]]
+# id = "reading"
+# accounts = ["cedar"]
+# sender = "reading@example.net"
+# action = "move"
+# target = "Reading"
+
+# Spam moves to Junk without reporting or blocking:
+# [[rules]]
+# id = "junk"
+# accounts = ["cedar"]
+# sender = "offers@example.invalid"
+# action = "spam"
+
+# Unsubscribe and a companion removal (two actions per matching message):
+# [[rules]]
+# id = "unsubscribe-digest"
+# accounts = ["cedar"]
+# sender = "news@example.net"
+# action = "unsubscribe"
+# after_unsubscribe = "archive"

@@ -343,7 +343,7 @@ class LockTests(unittest.TestCase):
             token = triage.acquire(store)
             result = self.run_plan(store, token, encoding='latin-1')
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('Requires your decision', result.stdout.decode('utf-8'))
+            self.assertIn('Needs you', result.stdout.decode('utf-8'))
             triage.release(store, token)
 
     def test_invalid_lock_held(self):

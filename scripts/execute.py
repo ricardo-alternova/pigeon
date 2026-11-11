@@ -41,9 +41,9 @@ class UncertainRequest(ValueError):
 class AssistantProvider:
     """Transport observations, never a gateway connection."""
     def __init__(self, observation):
-        triage.known_keys(observation, {'outcome', 'inbox_ids'}, 'observation')
-        if observation.get('outcome') not in ('ok', 'error'):
-            raise ValueError('observation.outcome: expected ok or error')
+        triage.known_keys(observation, {'outcome', 'inbox_ids', 'folder_id'}, 'observation')
+        if observation.get('outcome') not in ('ok', 'error', 'unknown'):
+            raise ValueError('observation.outcome: expected ok, error or unknown (create-folder only)')
         ids = observation.get('inbox_ids')
         if not isinstance(ids, list) or any(not isinstance(i, str) for i in ids):
             raise ValueError('observation.inbox_ids: expected complete post-action Inbox id array for the issued account')
@@ -69,13 +69,21 @@ class Execution:
         self.state = read(self.path) if self.path.exists() else dict(signature=self.signature, pending=None, results=[], failures={})
         self.validate_checkpoint()
 
+    def validate_folder_id(self, value, results, label):
+        known = {f['id'] for entries in read(self.store / 'inbox.json').get('folders', {}).values() for f in entries}
+        known.update(e['folder_id'] for e in results if 'folder_id' in e)
+        if (not isinstance(value, str) or not value.strip() or len(value) > 512
+                or any(triage.unicodedata.category(c) in {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'} for c in value)
+                or value in known):
+            raise ValueError(label + '.folder_id: expected a new unique folder id of 1 to 512 characters without controls or separators')
+
     def validate_checkpoint(self):
         label = str(self.path)
         triage.known_keys(self.state, {'signature', 'pending', 'results', 'failures'}, label)
         if self.state.get('signature') != self.signature:
             raise ValueError(label + '.signature: expected unchanged plan during execution')
         failures = self.state.get('failures')
-        triage.known_keys(failures, triage.VERBS, label + '.failures')
+        triage.known_keys(failures, triage.PLAN_VERBS, label + '.failures')
         for verb, count in failures.items():
             if type(count) is not int or count < 0:
                 raise ValueError(label + '.failures.' + verb + ': expected a non-negative integer')
@@ -85,16 +93,20 @@ class Execution:
         statuses = {'executed', 'failed', 'skipped', 'unexecuted', 'unsubscribe_not_executable', 'unsubscribe_not_attempted', 'issued_unknown'}
         for i, entry in enumerate(results):
             source = label + '.results.' + str(i)
-            triage.known_keys(entry, {'account', 'id', 'action', 'status'}, source)
+            triage.known_keys(entry, {'account', 'id', 'action', 'status', 'folder_id'}, source)
             call = self.plan['actions'][i]
             if (any(entry.get(k) != call[k] for k in ('account', 'id', 'action'))
                     or not isinstance(entry.get('status'), str) or entry['status'] not in statuses):
                 raise ValueError(source + ': expected matching planned action and status ' + ', '.join(sorted(statuses)))
+            if call['action'] == 'create-folder' and entry['status'] == 'executed':
+                self.validate_folder_id(entry.get('folder_id'), results[:i], source)
+            elif 'folder_id' in entry:
+                raise ValueError(source + '.folder_id: expected only on successful creation')
         if 'pending' not in self.state:
             raise ValueError(label + '.pending: expected null or the next planned action')
         pending = self.state['pending']
         if pending is not None:
-            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target'}, label + '.pending')
+            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path'}, label + '.pending')
             if len(results) == len(self.plan['actions']) or pending != self.plan['actions'][len(results)]:
                 raise ValueError(label + '.pending: expected the next planned action unchanged')
 
@@ -124,8 +136,8 @@ class Execution:
     def report(self):
         render_summary(self.store, self.token, self.signature, self.plan_path)
 
-    def record(self, call, status):
-        self.state['results'].append({k: call[k] for k in ('account', 'id', 'action')} | {'status': status})
+    def record(self, call, status, **extra):
+        self.state['results'].append({k: call[k] for k in ('account', 'id', 'action')} | {'status': status} | extra)
 
     def unsubscribe(self, call, gate):
         path = self.store / 'unsubscribe-failures.json'
@@ -217,13 +229,30 @@ class Execution:
                     raise ValueError('unsubscribe: expected local command, never a gateway observation')
                 if pending is None:
                     raise ValueError(str(self.path) + '.pending: expected an issued call before result')
+                if pending['action'] == 'create-folder':
+                    observation = provider.observation
+                    if observation['outcome'] == 'ok':
+                        self.validate_folder_id(observation.get('folder_id'), self.state['results'], 'observation')
+                    elif 'folder_id' in observation:
+                        raise ValueError('observation.folder_id: expected only on successful creation')
+                elif isinstance(provider, AssistantProvider) and (provider.observation['outcome'] == 'unknown' or 'folder_id' in provider.observation):
+                    raise ValueError('observation: unknown and folder_id are for create-folder only')
                 if isinstance(provider, AssistantProvider):
                     ids = provider.list_inbox_ids(pending['account'])
                     removed = {e['id'] for e in self.state['results'] if e['account'] == pending['account'] and e['status'] == 'executed' and e['action'] in {'trash', 'archive', 'move', 'spam'}}
-                    required = {m['id'] for m in read(self.store / 'inbox.json')['messages'] if m['account'] == pending['account']} - removed - {pending['id']}
+                    required = {m['id'] for m in read(self.store / 'inbox.json')['messages'] if m['account'] == pending['account']} - removed - ({pending['id']} if pending['action'] != 'create-folder' else set())
                     if len(ids) != len(set(ids)) or not required <= set(ids):
                         raise ValueError('observation.inbox_ids: expected complete Inbox reading retaining other not-yet-removed ids for this account')
                 outcome = provider.perform(pending)
+                if pending['action'] == 'create-folder':
+                    status = {'ok': 'executed', 'error': 'failed', 'unknown': 'issued_unknown'}[outcome]
+                    extra = {'folder_id': provider.observation['folder_id']} if status == 'executed' else {}
+                    self.state['failures']['create-folder'] = 0 if status == 'executed' else self.state['failures'].get('create-folder', 0) + 1
+                    self.record(pending, status, **extra)
+                    self.state['pending'] = None
+                    self.log(pending, status)
+                    self.save()
+                    return {'status': status}
                 absent = pending['id'] not in provider.list_inbox_ids(pending['account'])
                 status = 'executed' if outcome == 'ok' and absent else ('failed' if outcome == 'error' else 'unexecuted')
                 verb = pending['action']
@@ -237,6 +266,14 @@ class Execution:
                 raise ValueError(str(self.path) + '.pending: expected result before another next')
             while len(self.state['results']) < len(self.plan['actions']):
                 call = self.plan['actions'][len(self.state['results'])]
+                if call['action'] == 'move' and 'target_path' in call:
+                    creation = next(e for a, e in zip(self.plan['actions'], self.state['results'])
+                                    if a['action'] == 'create-folder' and a['account'] == call['account'] and a['target_path'] == call['target_path'])
+                    if creation['status'] != 'executed':
+                        self.record(call, 'unexecuted')
+                        self.log(call, 'unexecuted')
+                        self.save()
+                        continue
                 if self.state['failures'].get(call['action'], 0) >= 2:
                     self.record(call, 'skipped')
                     self.log(call, 'skipped')
@@ -249,7 +286,10 @@ class Execution:
                     # Carry the store so the command works in a fresh shell.
                     return {'run': ['env', 'PIGEON_HOME=' + str(self.store), 'python3', str(Path(__file__).resolve()), 'unsubscribe',
                                     '--token', self.token, '--plan', str(self.plan_path)]}
-                return call | {'verify': {'account': call['account'], 'read': 'complete Inbox ids; never re-read the old id'}}
+                issued = dict(call)
+                if call['action'] == 'move' and 'target_path' in call:
+                    issued['target'] = creation['folder_id']
+                return issued | {'verify': {'account': call['account'], 'read': 'complete Inbox ids; never re-read the old id'}}
             self.save()
             return {'done': True}
 
@@ -264,7 +304,7 @@ def render_summary(store, token, signature=None, plan_path=None):
     results = checkpoint['results'] if checkpoint is not None else []
     counts = {}
     for entry in results:
-        if entry['status'] == 'executed':
+        if entry['status'] == 'executed' and entry['action'] != 'create-folder':
             verb = entry['action']
             counts[verb] = counts.get(verb, 0) + 1
     lines = ['Run: ' + triage.safe_text(token), 'Plan: ' + (checkpoint['signature'] if checkpoint else 'no execution checkpoint'), '']
@@ -275,6 +315,25 @@ def render_summary(store, token, signature=None, plan_path=None):
     lines += ['', '**Issued calls to check (outcome unknown)**', '']
     pending = checkpoint.get('pending') if checkpoint else None
     lines += [triage.safe_text(json.dumps({k: pending[k] for k in ('account', 'id', 'action')} | {'status': 'issued_unknown'}, ensure_ascii=True))] if pending else ['none']
+    lines += ['', '**Actions not completed**', '']
+    incomplete = []
+    if checkpoint:
+        for i, call in enumerate(Execution(store, token, plan_path or store / 'plan.json').plan['actions']):
+            status = results[i]['status'] if i < len(results) else ('issued_unknown' if pending == call else 'unexecuted')
+            if status != 'executed':
+                incomplete.append(triage.safe_text(json.dumps(call | {'status': status}, ensure_ascii=True)))
+    lines += incomplete or ['none']
+    lines += ['', '**Folders requiring your help**', '']
+    instructions = []
+    if checkpoint:
+        for i, call in enumerate(Execution(store, token, plan_path or store / 'plan.json').plan['actions']):
+            if call['action'] != 'create-folder':
+                continue
+            result = results[i] if i < len(results) else None
+            if (result and result['status'] != 'executed') or pending == call:
+                instruction = 'Check whether this folder exists; create it if absent: ' if pending == call or result['status'] == 'issued_unknown' else 'Create this folder: '
+                instructions.append(triage.safe_text(call['account']) + ': ' + instruction + triage.code_path(call['target_path']) + '; dependent messages stay in Inbox this run.')
+    lines += instructions or ['none']
     lines += ['', '**Unplanned calls**', '']
     log = store / 'calls.jsonl'
     unplanned = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -312,7 +371,7 @@ def main():
         if name != 'observed':
             command.add_argument('--plan', required=True)
         if name == 'result':
-            command.add_argument('--observation', required=True, help='JSON object: outcome and inbox_ids')
+            command.add_argument('--observation', required=True, help='JSON object: outcome (ok/error for removals; ok/error/unknown for creation), inbox_ids, and folder_id only for successful creation')
         if name == 'observed':
             command.add_argument('--plan', help='Current plan path; defaults to private plan.json')
             for key in ('account', 'id', 'verb'):

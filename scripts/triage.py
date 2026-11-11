@@ -5,6 +5,7 @@ commit-state saves Inbox counts after a run. Pass results.json written by
 execute.py; hand-written files are refused. expected_counts is a forecast,
 never saved state. See docs/setup.md for result formats and statuses.
 """
+from datetime import datetime
 import argparse
 import ipaddress
 from urllib.parse import urlsplit
@@ -29,6 +30,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # refresh during execution; user-supplied regexes can be slow.
 
 VERBS = frozenset({'trash', 'archive', 'move', 'spam', 'unsubscribe', 'report'})
+PLAN_VERBS = VERBS | {'create-folder'}
+RULE_LIMIT_CAP = 50
+BODY_LIMIT = 2000
+QUESTION_LIMIT = 500
 STALE_SECONDS = 45 * 60
 
 
@@ -138,16 +143,17 @@ def validate_predicate(rule):
                                 or any(not isinstance(x, str) for x in rule['exclusions'])):
         raise ValueError('exclusions: Exclusions must be a list of strings')
 
-    for key in ('sender', 'domain', 'subject'):
+    for key in ('sender', 'domain', 'subject', 'body'):
         if key in rule and (not isinstance(rule[key], str) or not rule[key].strip()):
             raise ValueError(key + ': expected a non-empty string')
-    if not any(k in rule for k in ('sender', 'domain', 'subject')):
-        raise ValueError('Rule requires a message predicate: expected sender, domain or subject')
-    try:
-        if 'subject' in rule and re.search(rule['subject'], '', re.IGNORECASE):
-            raise ValueError('subject: Subject matches empty text; expected a regex that does not match empty text')
-    except re.error as error:
-        raise ValueError('subject: Invalid subject regex; expected a valid Python regular expression') from error
+    if not any(k in rule for k in ('sender', 'domain', 'subject', 'body')):
+        raise ValueError('Rule requires a message predicate: expected sender, domain, subject or body')
+    for key in ('subject',):
+        try:
+            if key in rule and re.search(rule[key], '', re.IGNORECASE):
+                raise ValueError(key + ': Predicate matches empty text; expected a regex that does not match empty text')
+        except re.error as error:
+            raise ValueError(key + ': Invalid ' + key + ' regex; expected a valid Python regular expression') from error
 
 
 def parse_rules(text, *, protection=False):
@@ -177,6 +183,20 @@ def normalize_sender(value):
         return None
 
 
+def folder_path(value, *, template=False):
+    if not isinstance(value, str) or not value or len(value) > 255:
+        raise ValueError('target: expected a folder path of 1 to 255 characters')
+    checked = value
+    if template:
+        checked = checked.replace('{year}', '2026').replace('{month}', '01')
+    if (any(c in checked for c in '{}\\∕⁄／⧸＼﹨╱⟋⧵╲⟍') or
+            any(unicodedata.category(c) in {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'} for c in checked) or
+            len(checked.split('/')) > 8 or
+            any(x.strip() in ('', '.', '..') for x in checked.split('/'))):
+        raise ValueError('target: expected at most 8 nonempty, non-dot path segments, no controls or unknown placeholders')
+    return value
+
+
 def validate_rules(rules):
     ids = set()
     for i, rule in enumerate(rules, 1):
@@ -187,8 +207,16 @@ def validate_rules(rules):
                 raise ValueError('Rule id and action must be non-empty strings')
             if 'target' in rule and (rule['action'] != 'move' or not isinstance(rule['target'], str)):
                 raise ValueError('rule.target: expected a folder name string on move rules only')
-            if set(rule) - {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe'}:
-                known_keys(rule, {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe'}, 'rule')
+            if set(rule) - {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'body', 'question', 'limit'}:
+                known_keys(rule, {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'body', 'question', 'limit'}, 'rule')
+            if 'limit' in rule and (type(rule['limit']) is not int or not 1 <= rule['limit'] <= RULE_LIMIT_CAP):
+                raise ValueError('limit: expected an integer from 1 to 50')
+            if 'target' in rule:
+                folder_path(rule['target'], template=True)
+            if 'question' in rule and (rule['action'] != 'report'
+                    or not isinstance(rule['question'], str) or not rule['question'].strip()
+                    or len(rule['question']) > QUESTION_LIMIT):
+                raise ValueError('question: expected a non-empty string of at most 500 characters on report rules only')
             if 'after_unsubscribe' in rule and (rule['action'] != 'unsubscribe' or rule['after_unsubscribe'] not in ('trash', 'archive')):
                 raise ValueError('after_unsubscribe: expected trash or archive on unsubscribe rules')
             if rule['id'] in ids:
@@ -221,15 +249,23 @@ def matches(message, rule, protection=False):
             return False
     if 'subject' in rule and not re.search(rule['subject'], message['subject'], re.IGNORECASE):
         return False
+    if 'body' in rule:
+        if 'body' not in message:
+            return False
+        # Escaping every operator makes this a literal search without backtracking.
+        if not re.search(re.escape(rule['body']), message['body'], re.IGNORECASE):
+            return False
     if 'has_attachment' in rule and message.get('has_attachment', False) != rule['has_attachment']:
         return False
-    return not any(word.casefold() in message['subject'].casefold() for word in rule.get('exclusions', []))
+    return not any(word.casefold() in text.casefold()
+                   for word in rule.get('exclusions', [])
+                   for text in [message['subject']] + ([message['body']] if 'body' in rule else []))
 
 
 def validate_actions(actions, listing):
     allowed = {(m['account'], m['id']) for m in listing['messages'] if m.get('folder') == 'Inbox'}
     for action in actions:
-        if action['action'] not in VERBS or (action['account'], action['id']) not in allowed:
+        if action['action'] not in PLAN_VERBS or (action['account'], action['id']) not in allowed:
             raise ValueError('Action is outside this account Inbox listing')
 
 
@@ -273,11 +309,13 @@ def validate_inputs(listing, config, previous):
         label = 'Inbox.messages.' + str(i)
         required = {'account', 'id', 'folder', 'sender', 'subject'}
         flags = {'has_attachment', 'spam', 'phishing', 'unsubscribe_one_click'}
-        strings = required | {'body', 'sender_name', 'unsubscribe_url'}
+        strings = required | {'body', 'sender_name', 'unsubscribe_url', 'date'}
         known_keys(message, strings | flags, label)
         for key in required | set(message):
             if key not in message or (type(message[key]) is not bool if key in flags else not isinstance(message[key], str)):
                 raise ValueError(label + '.' + key + ': expected ' + ('boolean' if key in flags else 'string'))
+        if 'body' in message and len(message['body']) > BODY_LIMIT:
+            raise ValueError(label + '.body: expected at most 2000 characters')
     folders = listing.get('folders', {})
     known_keys(folders, set(accounts), 'Inbox.folders')
     for account, entries in folders.items():
@@ -321,10 +359,12 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         if totals[account] < count:
             raise ValueError('Inbox.accounts.' + account + ': Account total is smaller than Inbox count; expected an all-folder total at least ' + str(count))
     actions, decisions, hits = [], [], {}
+    creates = set()
     for original in messages:
         sender = normalize_sender(original.get('sender'))
         message = dict(original, sender=sender)
         reason = 'No matching rule'
+        question = {}
         if sender is None:
             reason = 'Invalid sender'
         elif any(matches(message, hold, protection=True) for hold in never_touch):
@@ -334,15 +374,43 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                 if not matches(message, rule):
                     continue
                 key = (rule['id'], message['account'])
-                hits[key] = hits.get(key, 0) + 1
+                if 'question' not in rule:
+                    hits[key] = hits.get(key, 0) + 1
                 verb = rule['action']
                 action = {'account': message['account'], 'id': message['id'], 'action': verb, 'rule': rule['id']}
                 if verb == 'move':
-                    folders = [f for f in listing.get('folders', {}).get(message['account'], []) if f['name'] == rule.get('target')]
-                    if len(folders) != 1:
+                    target = rule.get('target')
+                    if target and ('{year}' in target or '{month}' in target):
+                        try:
+                            date = datetime.fromisoformat(message.get('date', '').replace('Z', '+00:00'))
+                            if not 1990 <= date.year <= 2100:
+                                raise ValueError('date year outside fixed range')
+                        except ValueError:
+                            reason = 'Move date is missing or invalid'
+                            break
+                        target = target.replace('{year}', f'{date.year:04d}').replace('{month}', f'{date.month:02d}')
+                    if message['account'] not in listing.get('folders', {}):
+                        reason = 'Listing lacked folder information; message stays in Inbox'
+                        break
+                    entries = listing['folders'][message['account']]
+                    folders = [f for f in entries if target and f['name'].casefold() == target.casefold()]
+                    # Without the full path, a leaf matching a nested destination cannot identify its path.
+                    if not folders and target and '/' in target and any(f['name'].casefold() == target.rsplit('/', 1)[1].casefold() for f in entries):
+                        raise ValueError('Inbox.folders.' + message['account'] + '.name: expected full path, not a destination leaf name')
+                    if len(folders) > 1 or not target:
                         reason = 'Move target is ambiguous or missing'
                         break
-                    action['target'] = folders[0]['id']
+                    if folders:
+                        action['target'] = folders[0]['id']
+                    elif '{year}' in rule['target'] or '{month}' in rule['target']:
+                        action['target_path'] = folder_path(target)
+                        folder_key = (message['account'], target)
+                        if folder_key not in creates:
+                            actions.append(action | {'action': 'create-folder'})
+                            creates.add(folder_key)
+                    else:
+                        reason = 'Move target is ambiguous or missing'
+                        break
                 if verb == 'unsubscribe':
                     action['url'] = message.get('unsubscribe_url', '')
                     if not safe_unsubscribe_host(action['url']) or message.get('spam') or message.get('phishing'):
@@ -350,6 +418,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                         break
                 if verb == 'report':
                     reason = 'Rule requests a decision'
+                    question = {'question': rule['question']} if 'question' in rule else {}
                     break
                 actions.append(action)
                 if verb == 'unsubscribe' and 'after_unsubscribe' in rule:
@@ -358,11 +427,13 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                 reason = None
                 break
         if reason:
-            decisions.append({'account': message['account'], 'id': message['id'], 'reason': reason})
+            decisions.append({'account': message['account'], 'id': message['id'], 'reason': reason, **question})
     if sum(a['action'] in {'trash', 'move', 'archive', 'spam'} for a in actions) > 50:
         reasons.append('Destructive action limit exceeded')
-    if any(sum(a['rule'] == r['id'] for a in actions) > 10 for r in rules):
-        reasons.append('Per-rule action limit exceeded')
+    for rule in rules:
+        count = sum(a['rule'] == rule['id'] and a['action'] != 'create-folder' for a in actions)
+        if count > rule.get('limit', 10):
+            reasons.append(f"Per-rule action limit exceeded: {rule['id']} ({count} of {rule.get('limit', 10)})")
     if sum(a['action'] == 'unsubscribe' for a in actions) > 10:
         reasons.append('Unsubscribe limit exceeded')
     if any(n > totals[a] * 0.2 for (_, a), n in hits.items()):
@@ -380,7 +451,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
 
 
 STRINGS = {
-    'en': ('Requires your decision', 'Planned actions', 'New rules', 'None', 'Stopped'),
+    'en': ('Needs you', 'Planned actions', 'New rules', 'None', 'Stopped'),
     'es': ('Requiere tu decisión', 'Acciones previstas', 'Reglas nuevas', 'Ninguno', 'Detenido'),
 }
 
@@ -392,6 +463,12 @@ def safe_text(value):
     value = re.sub(r'(?<=[^\W_])[.。．｡](?=[^\W\d_])', '[dot]', value)
     value = value.replace('://', '[colon]//').replace('@', '[at]')
     return re.sub(r'([\\`*_{}\[\]()<>!|#])', r'\\\1', ' '.join(value.split()))
+
+
+def code_path(value):
+    # A delimiter longer than any embedded backtick run keeps literal paths inert.
+    delimiter = '`' * (max((len(s) for s in re.findall(r'`+', value)), default=0) + 1)
+    return delimiter + ' ' + value + ' ' + delimiter
 
 
 def safe_unsubscribe_host(url):
@@ -437,9 +514,9 @@ def render_report(plan, listing, language='en'):
             unsafe.append(a | {'reason': 'Unsafe unsubscribe'})
         else:
             hosts[a['account'], a['id']] = host
-    lines += [str(i) + '. ' + describe(a) + ' (' + safe_text(a['reason']) + ')' for i, a in enumerate(plan['decisions'] + unsafe, 1)] or [empty]
+    lines += [str(i) + '. ' + describe(a) + ' (' + safe_text(a['reason']) + ')' + (' | ' + safe_text(a['question']) if 'question' in a else '') for i, a in enumerate(plan['decisions'] + unsafe, 1)] or [empty]
     lines += ['', '**' + planned + '**', '']
-    lines += ['- ' + a['action'] + ': ' + describe(a) + (' | ' + safe_text(hosts.get((a['account'], a['id']), '')) if 'url' in a else '') for a in plan['actions'] if a['action'] != 'unsubscribe' or (a['account'], a['id']) in hosts] or [empty]
+    lines += ['- ' + a['action'] + ': ' + describe(a) + (' | ' + code_path(a['target_path']) if 'target_path' in a else '') + (' | ' + safe_text(hosts.get((a['account'], a['id']), '')) if 'url' in a else '') for a in plan['actions'] if a['action'] != 'unsubscribe' or (a['account'], a['id']) in hosts] or [empty]
     lines += ['', '**' + new + '**', '', empty, '']
     return '\n'.join(lines)
 
@@ -483,10 +560,10 @@ def commit_state(store, token, plan_path, results_path=None):
         actions = set()
         for i, action in enumerate(plan['actions']):
             label = str(plan_path) + '.actions.' + str(i)
-            known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'url'}, label)
+            known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url'}, label)
             if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action')):
                 raise ValueError(label + ': expected account, id and action strings')
-            if action['action'] not in VERBS or action['account'] not in counts:
+            if action['action'] not in PLAN_VERBS or action['account'] not in counts:
                 raise ValueError(label + '.action: expected a known action in a counted account')
             key = (action['account'], action['id'], action['action'])
             if key in actions:
@@ -504,7 +581,7 @@ def commit_state(store, token, plan_path, results_path=None):
             seen = set()
             for i, entry in enumerate(results['results']):
                 label = str(results_path) + '.results.' + str(i)
-                known_keys(entry, {'account', 'id', 'action', 'status'}, label)
+                known_keys(entry, {'account', 'id', 'action', 'status', 'folder_id'}, label)
                 for k in ('account', 'id', 'action', 'status'):
                     if not isinstance(entry.get(k), str):
                         raise ValueError(label + '.' + k + ': expected a string')

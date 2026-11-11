@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — rule features
+
+- Move rules accept {year}/{month} in target paths, resolved from message dates (years 1990–2100). The step machine issues create-folder once per missing dated path. Failed, skipped or uncertain creation leaves dependent moves unexecuted; check the new folder-help instructions and issued_unknown status before retrying.
+- Rules accept limit (1–50, default 10); exceeding it stops the whole plan. Global ceilings and brakes still apply.
+- Listing folders entries use full slash-separated paths in name. Missing folder metadata leaves affected mail in Inbox; existing paths match without case sensitivity.
+- Listings may now carry date and body; collect them when rules use dated targets or body. Body excerpts are at most 2000 characters. Rule body is a case-insensitive literal match; exclusions also check it.
+- Report rules accept question (at most 500 characters), shown under Questions for you in the run message. These messages stay in Inbox without calls or removal counts.
+
 ## Unreleased — M0 execution
 
 Upgrade from the planner-only release of 2026-11-10 by following AGENTS.md in order. Planning no longer saves state. The execution step machine records results; commit-state saves confirmed counts before lock release.

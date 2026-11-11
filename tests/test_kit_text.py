@@ -12,6 +12,21 @@ DOCS = ['README.md', 'AGENTS.md', 'CLAUDE.md',
 
 
 class KitTextTests(unittest.TestCase):
+    def test_rule_examples_load(self):
+        import sys
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import triage
+        text = (ROOT / 'rules/rules.example.toml').read_text()
+        self.assertTrue(triage.parse_rules(text))
+        # Every commented TOML entry is also a valid, usable example.
+        expanded = '\n'.join(line[2:] if line.startswith('# ') and
+                             (line[2:].startswith('[[rules]]') or '=' in line)
+                             else line for line in text.splitlines())
+        rules = triage.parse_rules(expanded)
+        self.assertEqual({r['action'] for r in rules}, triage.VERBS)
+        self.assertTrue({'body', 'question', 'limit', 'target', 'after_unsubscribe'}
+                        <= set().union(*(r.keys() for r in rules)))
+
     def test_execution_commands(self):
         text = (ROOT / 'AGENTS.md').read_text()
         for command in ('triage.py lock', 'triage.py plan', 'execute.py next',

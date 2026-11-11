@@ -124,14 +124,14 @@ class MatcherTests(unittest.TestCase):
         self.batch(11)
         result = self.plan()
         self.assertEqual(result['actions'], [])
-        self.assertIn('Per-rule action limit exceeded', result['reasons'])
+        self.assertTrue(any(reason.startswith('Per-rule') and reason.endswith(': ' + self.rules[0]['id'] + ' (11 of 10)') for reason in result['reasons']))
 
     def test_si9_rule_ceiling_counts_companions(self):
         for count, stopped in ((5, False), (6, True)):
             self.batch(count, verb='unsubscribe')
             self.rules[0]['after_unsubscribe'] = 'archive'
             result = self.plan()
-            self.assertEqual('Per-rule action limit exceeded' in result['reasons'], stopped)
+            self.assertEqual(any(reason.startswith('Per-rule action limit exceeded:') for reason in result['reasons']), stopped)
             self.assertEqual(len(result['actions']), 0 if stopped else 2 * count)
 
     def test_si9_unsubscribe_ceiling(self):
@@ -359,6 +359,83 @@ class MatcherTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Invalid subject regex'):
             self.plan()
 
+
+class BodyQuestionTests(unittest.TestCase):
+    plan = MatcherTests.plan
+    batch = MatcherTests.batch
+    def setUp(self):
+        MatcherTests.setUp(self)
+        self.batch(1)
+        self.rules = [dict(id='body', accounts=['cedar'], body='livré',
+                           action='archive')]
+        self.listing['messages'][0]['body'] = 'Colis LIVRÉ — 打合せ'
+
+    def test_body_match_missing_exclusion_and_protection(self):
+        self.assertEqual(len(self.plan()['actions']), 1)
+        message = self.listing['messages'][0]
+        excerpt = message.pop('body')
+        self.assertEqual(self.plan()['actions'], [])
+        message['body'] = excerpt
+        self.rules[0]['exclusions'] = ['livré']
+        self.assertEqual(self.plan()['actions'], [])
+        self.rules[0]['exclusions'] = []
+        self.holds = [dict(sender=message['sender'])]
+        self.assertEqual(self.plan()['decisions'][0]['reason'], 'Protected by never-touch')
+        self.rules[0].update(action='report', question='Keep it?')
+        self.assertNotIn('question', self.plan()['decisions'][0])
+
+    def test_body_limit(self):
+        self.listing['messages'][0]['body'] = 'x' * 2001
+        with self.assertRaisesRegex(ValueError, r'Inbox.messages.0.body'):
+            self.plan()
+
+    def test_question_escaped_and_excerpt_hidden(self):
+        self.rules[0].update(action='report', question='Keep [this](https://example.org)?')
+        plan = self.plan()
+        self.assertEqual(plan['actions'], [])
+        self.assertEqual(plan['expected_counts'], plan['counts'])
+        self.assertEqual(plan['decisions'][0]['question'], self.rules[0]['question'])
+        report = triage.render_report(plan, self.listing)
+        self.assertIn(triage.safe_text(self.rules[0]['question']), report)
+        self.assertNotIn(self.listing['messages'][0]['body'], report)
+        self.rules[0]['action'] = 'archive'
+        self.rules[0].pop('question')
+        self.assertNotIn(self.listing['messages'][0]['body'], triage.render_report(self.plan(), self.listing))
+
+    def test_question_does_not_trip_brakes(self):
+        self.batch(60, verb='report')
+        self.listing['accounts']['cedar'] = 60
+        self.rules[0]['question'] = 'Keep it?'
+        plan = self.plan()
+        self.assertEqual(plan['reasons'], [])
+        self.assertEqual(len(plan['decisions']), 60)
+        self.assertEqual(plan['expected_counts'], {'cedar': 60})
+
+    def test_body_question_strictness(self):
+        for key, value in [('body', 1), ('body', ''), ('question', 1), ('question', ''),
+                           ('question', 'x' * 501), ('boddy', 'word')]:
+            rule = dict(id='r', accounts=['cedar'], subject='Weekly', action='report')
+            rule[key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                triage.validate_rules([rule])
+        self.rules[0]['question'] = 'Keep it?'
+        with self.assertRaisesRegex(ValueError, 'question'):
+            self.plan()
+        for value in (True, [], None):
+            self.listing['messages'][0]['body'] = value
+            with self.assertRaisesRegex(ValueError, 'body'):
+                triage.validate_inputs(self.listing, self.config, {})
+
+    def test_adversarial_body_is_bounded(self):
+        import time
+        message = self.listing['messages'][0]
+        message['body'] = 'a' * 1999 + '!'
+        started = time.monotonic()
+        for pattern in ('z+$', '(a+)+$', '(a|aa)+$'):
+            with self.subTest(pattern=pattern):
+                self.assertFalse(triage.matches(message, dict(accounts=['cedar'], body=pattern)))
+        self.assertLess(time.monotonic() - started, 2.0)
+
 class TypoSafetyTests(unittest.TestCase):
     setUp = MatcherTests.setUp
     plan = MatcherTests.plan
@@ -451,3 +528,36 @@ class ReportLinkTests(unittest.TestCase):
         for text in ('a.' * 20000, 'a' * 40000):
             triage.safe_text(text)
         self.assertLess(time.monotonic() - start, 2)
+
+class LiteralBodyRegressionTests(unittest.TestCase):
+    def test_hostile_literals_no_process(self):
+        import time
+        from unittest.mock import patch
+        started = time.monotonic()
+        with patch.object(triage.subprocess, 'run', side_effect=AssertionError('process started')):
+            for literal, excerpt, expected in (
+                    ('(a+)+$', 'a' * 1999 + '!', False),
+                    ('[', 'a' * 2000, False),
+                    ('.*', 'x.*y', True),
+                    ('LIVRÉ', 'colis livré', True),
+                    ('打合せ', '打合せ', True),
+                    ('i', 'ı', True),
+                    ('é', 'e\u0301', False),
+                    ('a' * 1999 + 'b', 'a' * 2000, False)):
+                rule = dict(id='r', accounts=['cedar'], action='report', body=literal)
+                triage.validate_rules([rule])
+                self.assertEqual(triage.matches(dict(account='cedar', sender='a@example.org', subject='', body=excerpt), rule), expected)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_batch_fast_and_deterministic(self):
+        import time
+        from unittest.mock import patch
+        listing = dict(accounts={'cedar': 1000}, messages=[
+            dict(account='cedar', id=str(i), folder='Inbox', sender='a@example.org', subject='', body='a' * 2000)
+            for i in range(100)])
+        rules = [dict(id=str(i), accounts=['cedar'], action='report', body='missing' + str(i)) for i in range(5)]
+        start = time.monotonic()
+        with patch.object(triage.subprocess, 'run', side_effect=AssertionError('process started')):
+            plans = [json.dumps(triage.build_plan(listing, rules, [], {'accounts': {'cedar': {}}})).encode() for _ in range(2)]
+        self.assertEqual(plans[0], plans[1])
+        self.assertLess(time.monotonic() - start, 0.75)
