@@ -1,0 +1,15 @@
+name: Privacy checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python3 scripts/leak_check.py
+      - run: python3 scripts/leak_check.py --history
+      - run: python3 -m unittest discover -s tests
+      - run: bash tests/e2e.sh

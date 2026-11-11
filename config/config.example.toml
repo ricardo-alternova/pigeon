@@ -1,0 +1,14 @@
+# Key reference: docs/setup.md#configuration
+language = "en"
+# Time zone for the assistant’s run message.
+timezone = "UTC"
+# Maximum Inbox messages across all accounts before the planner stops.
+inbox_limit = 100
+
+[accounts.cedar]
+executor_app = "cedar-mail"
+address = "reader@example.com"
+
+[accounts.marble]
+executor_app = "marble-mail"
+address = "reader@example.org"

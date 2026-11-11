@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+set -- --staged
+if [ -n "${PIGEON_DENY:-}" ]; then
+    if [ ! -d "$PIGEON_DENY" ]; then
+        echo "leak-check: PIGEON_DENY expected an existing folder" >&2
+        exit 1
+    fi
+    set -- "$@" --deny "$PIGEON_DENY"
+fi
+exec python3 scripts/leak_check.py "$@"

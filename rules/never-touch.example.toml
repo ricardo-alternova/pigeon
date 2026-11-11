@@ -1,0 +1,5 @@
+# Fictional never-touch entries: messages matching any entry are never acted on. Key reference: docs/setup.md#rules
+# To explicitly disable protection, replace entries with: allow_empty = true
+[[rules]]
+accounts = ["cedar", "marble"]
+sender = "keeper@example.com"

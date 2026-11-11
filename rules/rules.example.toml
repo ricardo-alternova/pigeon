@@ -1,0 +1,15 @@
+# Fictional sample rules. Key reference: docs/setup.md#rules
+[[rules]]
+id = "digest"
+accounts = ["cedar", "marble"]
+sender = "digest@example.net"
+subject = "Weekly"
+action = "trash"
+exclusions = ["invoice", "question"]
+
+[[rules]]
+id = "receipts"
+accounts = ["cedar"]
+domain = "example.org"
+has_attachment = true
+action = "archive"
