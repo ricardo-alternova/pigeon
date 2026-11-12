@@ -82,7 +82,6 @@ def exchange(host, address, method, target):
 
 
 def _request(url, one_click=False, *, resolver=socket.getaddrinfo, transport=exchange):
-    """Internal injections support offline tests only; no CLI or environment bypass."""
     method = 'POST' if one_click else 'GET'
     try:
         for hop in range(4):

@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Offline Inbox planner. No mail or network operations.
+"""Inbox planner.
 
-commit-state saves Inbox counts after a run. Pass results.json written by
-execute.py; hand-written files are refused. expected_counts is a forecast,
-never saved state. See docs/setup.md for result formats and statuses.
+See docs/setup.md.
 """
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -12,7 +10,7 @@ import argparse
 import ipaddress
 from urllib.parse import urlsplit
 from contextlib import contextmanager
-from email.utils import getaddresses
+from email.utils import getaddresses, quote
 import fcntl
 import unicodedata
 import math
@@ -28,16 +26,16 @@ import time
 import tomllib
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-# Known limits: POSIX only; spam/phishing flags use exact keys; locks do not
-# refresh during execution; user-supplied regexes can be slow.
-
-VERBS = frozenset({'trash', 'archive', 'move', 'spam', 'unsubscribe', 'report'})
-PLAN_VERBS = VERBS | {'create-folder'}
+VERBS = frozenset({'trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'})
+PLAN_VERBS = (VERBS - {'draft', 'report'}) | {'create-folder', 'create-draft'}
+DRAFT_LIMIT = 10
 RULE_LIMIT_CAP = 50
+BRAKE_FLOOR = 10
 BODY_LIMIT = 2000
 QUESTION_LIMIT = 500
 STALE_SECONDS = 45 * 60
 TAKEOVER_MARGIN = 10 * 60
+REFRESH_MARGIN = 5 * 60
 LOG_TAIL_BYTES = 256 * 1024
 LOG_NAMES = ('calls.jsonl', 'history.log', 'decisions.jsonl')
 
@@ -127,7 +125,7 @@ def read_lock(store, *, now=None):
         if not path.stat().st_mode & 0o444:
             raise ValueError('Run lock is unreadable and held')
         held = parse_json(read_text(path), path)
-        known_keys(held, {'token', 'created', 'backend', 'id', 'etag', 'drive_created', 'lost'}, 'run.lock')
+        known_keys(held, {'token', 'created', 'started', 'backend', 'id', 'etag', 'drive_created', 'lost'}, 'run.lock')
         if 'lost' in held and held['lost'] is not True:
             raise ValueError('invalid loss flag')
         if 'backend' in held:
@@ -175,6 +173,16 @@ def require_lock(store, token, *, now=None):
         raise ValueError(str(store / 'run.lock') + ': token expected to match the holder and be unexpired; stop writes')
 
 
+def refresh(store, token, *, now=None):
+    import execute
+    clock = time.time() if now is None else now.timestamp()
+    with lock_gate(store):
+        require_lock(store, token, now=clock)
+        held = read_lock(store, now=clock)
+        execute.atomic(store / 'run.lock', held | {'created': clock, 'started': held.get('started', held['created'])})
+    return token
+
+
 def release(store, token):
     if store_lock_setting(store)['kind'] == 'onedrive':
         raise ValueError('run.lock: release requires the conditional drive exchange')
@@ -216,7 +224,9 @@ def store_lock_setting(store):
     path = store / 'config.toml'
     if not path.exists():
         raise ValueError('config.toml: copy config/config.example.toml into the working folder and configure it before taking the lock')
-    return lock_setting(parse_toml(load_inputs([path])[0], path))
+    config = parse_toml(load_inputs([path])[0], path)
+    check_version(config, path)
+    return lock_setting(config)
 
 
 def lock_text(value, limit):
@@ -247,6 +257,10 @@ def lock_item(data, clock):
 
 def lock_observation(path):
     try:
+        if isinstance(path, dict):
+            if len(json.dumps(path).encode()) > LOCK_OBSERVATION_LIMIT or not isinstance(path.get('status'), str):
+                raise ValueError()
+            return path
         path = Path(path)
         if not path.is_file() or not path.stat().st_mode & 0o444:
             raise ValueError()
@@ -263,7 +277,6 @@ def lock_observation(path):
 
 
 def drive_lock(store, operation, token=None, observation=None, *, now=None):
-    # Pure local decisions: the assistant transports exactly one issued call.
     import execute
     clock = time.time() if now is None else now.timestamp()
     setting = store_lock_setting(store)
@@ -273,7 +286,7 @@ def drive_lock(store, operation, token=None, observation=None, *, now=None):
     with lock_gate(store):
         def issue(phase, *, created_item=None, **extra):
             call = dict(account=setting['account'], folder=setting['folder'], name=LOCK_NAME,
-                        operation='create' if phase in ('create', 'recreate') else 'delete' if phase in ('takeover', 'release') else 'read')
+                        operation='create' if phase in ('create', 'recreate') else 'delete' if phase in ('takeover', 'release', 'refresh') else 'read')
             if call['operation'] == 'create':
                 call['conflict'] = 'fail'
             call.update(extra)
@@ -302,8 +315,10 @@ def drive_lock(store, operation, token=None, observation=None, *, now=None):
                 return issue('create')
             require_lock(store, token, now=clock)
             held = read_lock(store, now=clock)
-            if operation == 'release':
-                return issue('release', if_match=held['etag'])
+            if operation in ('release', 'refresh'):
+                if operation == 'refresh':
+                    execute.atomic(store / 'run.lock', held | {'lost': True})
+                return issue(operation, if_match=held['etag'])
             return issue('verify')
         if not path.exists():
             raise ValueError('lock exchange: no issued call; not held')
@@ -329,10 +344,12 @@ def drive_lock(store, operation, token=None, observation=None, *, now=None):
                     raise ValueError('lock observation: created item changed; not held')
                 if clock - item['drive_created'] > STALE_SECONDS:
                     raise ValueError('lock observation: created item already expired; not held')
-                trim_logs(store)
-                execute.atomic(store / 'run.lock', dict(token=token, created=min(clock, item['drive_created']), backend=setting, **item))
+                if operation != 'refresh':
+                    trim_logs(store)
+                execute.atomic(store / 'run.lock', dict(token=token, created=min(clock, item['drive_created']), started=read_lock(store).get('started', read_lock(store)['created']) if operation == 'refresh' else min(clock, item['drive_created']), backend=setting, **item))
                 path.unlink()
-                (store / 'execution-report.md').unlink(missing_ok=True)
+                if operation != 'refresh':
+                    (store / 'execution-report.md').unlink(missing_ok=True)
                 return token
             if phase == 'create' and data == {'status': 'conflict'}:
                 return issue('read')
@@ -343,10 +360,10 @@ def drive_lock(store, operation, token=None, observation=None, *, now=None):
                     path.unlink()
                     raise ValueError('Run lock is busy; not held')
                 return issue('takeover', if_match=item['etag'])
-            if phase in ('takeover', 'release') and data == {'status': 'deleted'}:
+            if phase in ('takeover', 'release', 'refresh') and data == {'status': 'deleted'}:
                 if pending['call'].get('operation') != 'delete' or not pending['call'].get('if_match'):
                     raise ValueError('lock exchange: conditional delete was not issued; not held')
-                if phase == 'takeover':
+                if phase in ('takeover', 'refresh'):
                     return issue('recreate')
                 require_lock(store, token, now=clock)
                 if pending['call']['if_match'] != read_lock(store, now=clock)['etag']:
@@ -375,7 +392,7 @@ def drive_lock(store, operation, token=None, observation=None, *, now=None):
 # Fixed durable set, also the upload order. Run-local plans and checkpoints stay local.
 STATE_FILES = ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json',
                'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md',
-               'rules.toml', 'never-touch.toml', 'state.json')
+               'rules.toml', 'never-touch.toml', 'tool-paths.json', 'state.json')
 STATE_LIMIT = 4 * 1024 * 1024
 
 
@@ -401,7 +418,9 @@ def state_setting(config):
 
 
 def state_config(store):
-    return parse_toml(load_inputs([store / 'config.toml'])[0], store / 'config.toml')
+    config = parse_toml(load_inputs([store / 'config.toml'])[0], store / 'config.toml')
+    check_version(config, store / 'config.toml')
+    return config
 
 
 def require_fetched(store, token):
@@ -409,6 +428,7 @@ def require_fetched(store, token):
     if setting['kind'] != 'local':
         path = store / 'state-exchange.json'
         data = parse_json(read_text(path), path) if path.exists() else {}
+        known_keys(data, set(data) if isinstance(data, dict) else set(), str(path))
         if data.get('token') != token or data.get('phase') != 'ready' or data.get('setting') != setting:
             raise ValueError('state-exchange.json: planning requires a completed fetch in the ready phase for this token and configuration; release lock')
 
@@ -438,6 +458,10 @@ def validate_state_file(name, raw, config, folder):
             raise ValueError(str(folder / name) + ': ' + str(error)) from None
         if any(a not in config['accounts'] for r in entries for a in r.get('accounts', [])):
             raise ValueError(str(folder / name) + ': unconfigured account')
+    elif name == 'tool-paths.json':
+        data = parse_json(text, folder / name)
+        validate_tool_paths(data, config, drop=True)
+        (folder / name).write_text(json.dumps(data), encoding='utf-8')
     elif name == 'state.json':
         validate_inputs({'accounts': {}, 'messages': []}, config, parse_json(text, folder / name))
     elif name == 'numbers.json':
@@ -466,7 +490,7 @@ def validate_state_file(name, raw, config, folder):
                     if part['target'] is not None:
                         folder_path(part['target'])
             else:
-                if (not isinstance(data, dict) or set(data) != {'sequence', 'time', 'run', 'account', 'id', 'verb', 'outcome'}
+                if (not isinstance(data, dict) or set(data) - {'tool'} != {'sequence', 'time', 'run', 'account', 'id', 'verb', 'outcome'}
                         or type(data['sequence']) is not int or data['sequence'] < 1
                         or type(data['time']) not in (int, float) or not math.isfinite(data['time'])
                         or any(not isinstance(data[k], str) for k in ('run', 'account', 'id', 'verb', 'outcome'))):
@@ -492,8 +516,7 @@ def validate_unsubscribe_memory(memory):
         raise ValueError('unsubscribe-failures.json.senders: expected unique lowercase digests')
 
 
-def drive_state(store, operation, token, observation=None, *, lock_observation=None, now=None):
-    """In-process decisions only: no subprocess or network; assistant transports calls."""
+def drive_state(store, operation, token, observation=None, *, lock_observation=None, now=None, batch=False, verified=False):
     import execute
     config = state_config(store)
     setting = state_setting(config)
@@ -502,7 +525,18 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
     path = store / 'state-exchange.json'
     incoming = store / 'state-incoming'
     outgoing = store / 'state-outgoing'
-    if operation == 'send' and observation is None:
+    if operation == 'send' and batch and observation is not None:
+        observed = state_observation(observation)
+        data = parse_json(read_text(path), path)
+        if data.get('token') != token or data.get('phase') != 'send' or data.get('index') != 0:
+            raise ValueError('state send: no pending batch; never retry')
+        if set(observed) != set(data['names']):
+            observed = {name: {'status': 'failed'} for name in data['names']}
+        result = {'done': True}
+        for name in data['names']:
+            result = drive_state(store, 'send', token, observed[name] if isinstance(observed[name], dict) else {'status': 'failed'}, now=now)
+        return result
+    if operation == 'send' and observation is None and not verified:
         require_fetched(store, token)
         result = drive_lock(store, 'state-send', token, lock_observation, now=now)
         if isinstance(result, dict):
@@ -510,6 +544,7 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
     with lock_gate(store):
         require_lock(store, token, now=now.timestamp() if now else None)
         data = parse_json(read_text(path), path) if path.exists() else {}
+        known_keys(data, set(data) if isinstance(data, dict) else set(), str(path))
         def save():
             execute.atomic(path, data)
         def issue(name, verb):
@@ -542,6 +577,8 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
                 raise ValueError('state fetch: expected exactly the fixed names; release lock')
             if any(v not in ('fetched', 'absent') for v in observed.values()):
                 raise ValueError('state fetch: failed or uncertain download; release lock')
+            if all(v == 'absent' for v in observed.values()) and any((store / n).exists() for n in ('state.json', 'numbers.json', *LOG_NAMES)):
+                raise ValueError('drive store empty but local records exist')
             expected = {n for n in STATE_FILES if observed[n] == 'fetched'}
             if {p.name for p in incoming.iterdir()} != expected:
                 raise ValueError('state incoming: unexpected or missing file; release lock')
@@ -612,6 +649,8 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
                 pass
         if data['index'] < len(data['names']):
             save()
+            if batch:
+                return {'calls': [issue(name, 'upload') for name in data['names']]}
             return {'call': issue(data['names'][data['index']], 'upload')}
         data['phase'] = 'sent' if data['failed'] else 'ready'
         save()
@@ -626,13 +665,78 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
 
 def state_observation(path):
     # Bounded JSON observations; all fields are checked against issued operations.
-    raw = state_bytes(Path(path))
+    raw = json.dumps(path).encode() if isinstance(path, dict) else state_bytes(Path(path))
     if len(raw) > LOCK_OBSERVATION_LIMIT:
         raise ValueError(str(path) + ': state observation: exceeds 4096 bytes')
     value = parse_json(raw, path)
     if not isinstance(value, dict):
         raise ValueError(str(path) + ': state observation: expected object')
     return value
+
+
+def batch_lock(store, observation=None, *, now=None):
+    if observation is None:
+        result = drive_lock(store, 'acquire', now=now)
+    else:
+        path = store / 'lock-exchange.json'
+        pending = parse_json(read_text(path), path)
+        if pending['phase'] in ('create', 'recreate'):
+            observed = state_observation(observation)
+            if set(observed) != {'create', 'read'}:
+                raise ValueError('lock batch: expected create and read observations')
+            result = drive_lock(store, 'acquire', observation=observed['create'], now=now)
+            if result.get('call', {}).get('operation') != 'read':
+                raise ValueError('lock batch: expected confirmation read')
+            result = drive_lock(store, 'acquire', observation=observed['read'], now=now)
+        else:
+            result = drive_lock(store, 'acquire', observation=observation, now=now)
+    if isinstance(result, dict) and result['call']['operation'] == 'create':
+        call = result['call']
+        read = {k: v for k, v in call.items() if k != 'conflict'} | {'operation': 'read'}
+        return {'calls': [call, read]}
+    return result
+
+
+def finish_run(store, token, plan=None, observation=None, *, now=None):
+    import execute
+    if plan is not None and execute.read(plan).get('dry_run'):
+        raise ValueError('dry-run plan: finish-run is refused')
+    if store_lock_setting(store)['kind'] == 'local':
+        if observation is not None:
+            raise ValueError('finish-run: local finish takes no observation')
+        if plan is not None:
+            commit_state(store, token, plan, now=now)
+            message = render_message(store, token, plan, None, now=now)
+        else:
+            message = ''
+        release(store, token)
+        return dict(done=True, message=message)
+    path = store / 'finish-exchange.json'
+    if observation is None:
+        require_fetched(store, token)
+        if path.exists() and execute.read(path).get('token') == token:
+            raise ValueError('finish-run: already issued; never retry')
+        return drive_lock(store, 'finish', token, now=now)
+    observed = state_observation(observation)
+    if path.exists() and execute.read(path).get('token') == token:
+        pending = execute.read(path)
+        if pending['phase'] != 'issued':
+            raise ValueError('finish-run: observations already consumed')
+        execute.atomic(path, pending | {'phase': 'consumed'})
+        if set(observed) != {'uploads', 'release'}:
+            raise ValueError('finish-run: expected uploads and release observations')
+        sent = drive_state(store, 'send', token, observed['uploads'], now=now, batch=True) if pending['uploads'] else {'done': True}
+        drive_lock(store, 'release', token, observed['release'], now=now)
+        return sent | {'message': (sent.get('warning', '') + '\n' if sent.get('warning') else '') + pending['message']}
+    drive_lock(store, 'finish', token, observed, now=now)
+    message = ''
+    if plan is not None:
+        commit_state(store, token, plan, now=now, lock_verified=True)
+        message = render_message(store, token, plan, None, now=now)
+    uploads = drive_state(store, 'send', token, now=now, batch=True, verified=True).get('calls', [])
+    released = drive_lock(store, 'release', token, now=now)
+    execute.atomic(path, dict(token=token, phase='issued', uploads=bool(uploads), message=message))
+    return {'calls': uploads + [released['call']]}
 
 
 def validate_holds(holds):
@@ -684,6 +788,182 @@ def parse_rules(text, *, protection=False):
     return entries
 
 
+def table_cells(line):
+    """Split pipe rows while preserving code spans and escaped pipes."""
+    line = line.strip()
+    if not line.startswith('|'):
+        return None
+    cells, cell, fence = [], '', ''
+    i = 1
+    while i < len(line):
+        c = line[i]
+        if c == '\\' and i + 1 < len(line) and line[i + 1] == '|':
+            cell += '|'
+            i += 2
+            continue
+        if c == '`':
+            end = i + 1
+            while end < len(line) and line[end] == '`':
+                end += 1
+            ticks = line[i:end]
+            if not fence:
+                fence = ticks
+            elif fence == ticks:
+                fence = ''
+            cell += ticks
+            i = end
+            continue
+        if c == '|' and not fence:
+            cells.append(cell.strip())
+            cell = ''
+        else:
+            cell += c
+        i += 1
+    if cell or not line.endswith('|'):
+        cells.append(cell.strip())
+    return cells
+
+
+def convert_rules(table, scopes_path, out_path, review_path=None):
+    scopes = parse_toml(read_text(scopes_path), 'scopes')
+    if any(not isinstance(v, list) or not v or
+           any(not isinstance(a, str) or not a.strip() for a in v) for v in scopes.values()):
+        raise ValueError('scopes: expected nonempty lists of account handles')
+    out = Path(out_path)
+    if out.exists() or out.is_symlink():
+        raise ValueError('out: file already exists')
+    if review_path and Path(review_path).resolve() in {out.resolve(), Path(table).resolve(), Path(scopes_path).resolve()}:
+        raise ValueError('review: expected a distinct output path')
+    lines = read_text(table).splitlines()
+    entries, blocks, reviews, seen = [], [], [], set()
+    rows = active = disabled = 0
+    in_table = False
+    for index, line in enumerate(lines):
+        cells = table_cells(line)
+        separator = cells and len(cells) == 5 and all(re.fullmatch(r':?-{3,}:?', c) for c in cells)
+        if separator:
+            in_table = index > 0 and len(table_cells(lines[index - 1]) or []) == 5
+            continue
+        if not cells:
+            in_table = False
+            continue
+        # Headers immediately preceding separators belong to the next table.
+        following = table_cells(lines[index + 1]) if index + 1 < len(lines) else None
+        if following and len(following) == 5 and all(re.fullmatch(r':?-{3,}:?', c) for c in following):
+            continue
+        if not in_table:
+            continue
+        rows += 1
+        identity = cells[0] if cells else ''
+        reason = None
+        if identity in seen:
+            reason = 'duplicate id'
+        seen.add(identity)
+        try:
+            if reason:
+                raise ValueError(reason)
+            if len(cells) != 5:
+                raise ValueError('expected five cells')
+            identity, pattern, action, scope, source = cells
+            if not identity.strip() or any(unicodedata.category(c) == 'Cc' for c in identity):
+                raise ValueError('invalid id')
+            spans = list(re.finditer(r'(`+)(.+?)\1(?!`)', pattern))
+            tokens = [m[2] for m in spans]
+            note, start = '', 0
+            for span in spans:
+                note += pattern[start:span.start()]
+                start = span.end()
+            note += pattern[start:]
+            if not tokens:
+                raise ValueError('no tokens')
+            predicates = []
+            for token in tokens:
+                if token.startswith('subject:') and token[8:].strip():
+                    predicates.append({'subject': re.escape(token[8:])})
+                elif re.fullmatch(r"[^\s@<>;,`]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", token):
+                    predicates.append({'sender': token})
+                elif re.fullmatch(r'@?(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}', token):
+                    predicates.append({'domain': token.lstrip('@')})
+                else:
+                    raise ValueError('unknown pattern')
+            if len(tokens) > 1 and any('subject' in p for p in predicates):
+                raise ValueError('ambiguous patterns')
+            accounts = []
+            for name in scope.split(','):
+                if name.strip() not in scopes:
+                    raise ValueError('unknown scope')
+                accounts.extend(a for a in scopes[name.strip()] if a not in accounts)
+            parts = [p.strip() for p in action.split('+')]
+            base = parts[0].casefold()
+            details = {}
+            if base in ('trash', 'archive', 'spam'):
+                verb = base
+            elif re.fullmatch(r'(?:move|mover)\s+.+', parts[0], re.I):
+                verb = 'move'
+                details['target'] = folder_path(parts[0].split(None, 1)[1], template=True)
+            elif base in ('unsubscribe', 'baja') or re.fullmatch(r'baja https://\S+', parts[0], re.I):
+                verb = 'unsubscribe'
+            else:
+                raise ValueError('unknown action')
+            if len(parts) > 1:
+                if len(parts) != 2 or verb != 'unsubscribe' or parts[1].casefold() not in ('trash', 'archive'):
+                    raise ValueError('unknown action')
+                details['after_unsubscribe'] = parts[1].casefold()
+            batch = []
+            for n, predicate in enumerate(predicates, 1):
+                rule = dict(id=identity if n == 1 else f'{identity}-{n}', accounts=accounts,
+                            action=verb, **predicate, **details)
+                if verb == 'trash':
+                    rule['exclusions'] = []
+                if note.strip():
+                    rule['enabled'] = False
+                batch.append(rule)
+            try:
+                validate_rules(batch)
+            except ValueError:
+                raise ValueError('invalid rule') from None
+            if any(r['id'] in {e['id'] for e in entries} for r in batch):
+                raise ValueError('duplicate id')
+            entries.extend(batch)
+            comments = []
+            for label, text in (('Source', source), ('Note', note.strip())):
+                if text:
+                    clean = ''.join(c if unicodedata.category(c) not in {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'} else ' ' for c in text)
+                    comments.append('# ' + label + ': ' + clean)
+            for rule in batch:
+                blocks.append('\n'.join(comments + ['[[rules]]'] +
+                              [k + ' = ' + (str(v).lower() if isinstance(v, bool) else json.dumps(v, ensure_ascii=False))
+                               for k, v in rule.items()]))
+            if note.strip():
+                disabled += 1
+            else:
+                active += 1
+        except ValueError as error:
+            # Only fixed reasons are emitted; cells never become diagnostic text.
+            reason = str(error)
+            if reason.startswith('target:'):
+                reason = 'invalid target'
+            reviews.append(f'{safe_text(identity)}\tline {index + 1}\t{reason}')
+    content = '\n\n'.join(blocks) + '\n' if blocks else 'rules = []\n'
+    parse_rules(content)
+    review = '\n'.join(reviews) + ('\n' if reviews else '')
+    if review_path:
+        with Path(review_path).open('x', encoding='utf-8') as target:
+            target.write(review)
+    with out.open('x', encoding='utf-8') as target:
+        os.chmod(target.name, 0o600)
+        try:
+            target.write(content)
+            target.flush()
+            parse_rules(read_text(out))
+        except (ValueError, OSError):
+            out.unlink()
+            raise
+    if not review_path:
+        print(review, end='')
+    print(f'rows read: {rows}, active: {active}, switched off: {disabled}, sent to review: {len(reviews)}')
+
+
 def normalize_sender(value):
     try:
         addresses = getaddresses([value])
@@ -721,8 +1001,27 @@ def validate_rules(rules):
                 raise ValueError('Rule id and action must be non-empty strings')
             if 'target' in rule and (rule['action'] != 'move' or not isinstance(rule['target'], str)):
                 raise ValueError('rule.target: expected a folder name string on move rules only')
-            if set(rule) - {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'body', 'question', 'limit'}:
-                known_keys(rule, {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'body', 'question', 'limit'}, 'rule')
+            if set(rule) - {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'body', 'question', 'limit', 'enabled', 'draft', 'draft_text', 'draft_to'}:
+                known_keys(rule, {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'body', 'question', 'limit', 'enabled', 'draft', 'draft_text', 'draft_to'}, 'rule')
+            if rule['action'] == 'draft':
+                if rule.get('draft') not in ('reply', 'forward'):
+                    raise ValueError('draft: expected reply or forward')
+                text = rule.get('draft_text')
+                if not isinstance(text, str) or not 1 <= len(text) <= 4000 or not text.strip():
+                    raise ValueError('draft_text: expected 1 to 4000 characters')
+                recipients = rule.get('draft_to')
+                if rule['draft'] == 'forward':
+                    if (not isinstance(recipients, list) or not 1 <= len(recipients) <= 5
+                            or any(not isinstance(a, str) or normalize_sender(a) != a.casefold() or any(unicodedata.category(c) in {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'} for c in a) for a in recipients)):
+                        raise ValueError('draft_to: expected 1 to 5 bare addresses')
+                elif 'draft_to' in rule:
+                    raise ValueError('draft_to: refused on reply')
+            else:
+                for key in ('draft', 'draft_text', 'draft_to'):
+                    if key in rule:
+                        raise ValueError(key + ': expected action draft')
+            if 'enabled' in rule and type(rule['enabled']) is not bool:
+                raise ValueError('enabled: expected boolean')
             if 'limit' in rule and (type(rule['limit']) is not int or not 1 <= rule['limit'] <= RULE_LIMIT_CAP):
                 raise ValueError('limit: expected an integer from 1 to 50')
             if 'target' in rule:
@@ -748,6 +1047,8 @@ def validate_rules(rules):
 
 
 def matches(message, rule, protection=False):
+    if not protection and not rule.get('enabled', True):
+        return False
     if (not protection or 'accounts' in rule) and message['account'] not in rule.get('accounts', []):
         return False
     sender = message['sender'].casefold()
@@ -815,56 +1116,68 @@ def schedule_slot(config, now):
 def validate_positions(positions, config):
     known_keys(positions, set(config['accounts']), 'state.json._positions')
     for account, value in positions.items():
-        kind = config['accounts'][account].get('quiet_kind', 'ids')
+        fields = config['accounts'][account]
+        kind = fields.get('quiet_kind', 'history' if fields.get('provider')=='gmail' else 'ids')
         if kind == 'history':
             if not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,128}', value):
                 raise ValueError('state.json._positions.' + account + ': expected 1 to 128 plain digits')
         elif (not isinstance(value, list) or len(value) > NEWEST_IDS or
-              any(not isinstance(i, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,512}', i) for i in value)
+              any(not isinstance(i, str) or not re.fullmatch(r'[A-Za-z0-9_=+/-]{1,512}', i) for i in value)
               or len(value) != len(set(value))):
-            raise ValueError('state.json._positions.' + account + ': expected up to 10 unique ASCII ids (1 to 512 letters, digits, underscore or hyphen)')
+            raise ValueError('state.json._positions.' + account + ': expected up to 10 unique ASCII ids (1 to 512 letters, digits or _ - = + /)')
 
 
 def read_observation(path, config, saved):
-    # Bounded, in-process parser; gateway data is never a call or report template.
+    # Errors identify fields only; gateway values never become diagnostics.
+    account = ', '.join(safe_text(a) for a in config['accounts'])
+    field = 'observation'
     try:
         path = Path(path)
-        if not path.is_file():
-            return None
+        if not path.is_file() or not path.stat().st_mode & 0o444:
+            raise ValueError()
         with path.open('rb') as stream:
             raw = stream.read(OBSERVATION_LIMIT + 1)
         if len(raw) > OBSERVATION_LIMIT:
-            return None
+            raise ValueError()
         data = json.loads(raw)
+        field = 'accounts'
         if not isinstance(data, dict) or set(data) != set(config['accounts']):
-            return None
+            raise ValueError()
         positions = {}
         quiet = True
         for account, fields in config['accounts'].items():
             entry = data[account]
-            kind = fields.get('quiet_kind', 'ids')
+            kind = fields.get('quiet_kind', 'history' if fields.get('provider')=='gmail' else 'ids')
+            field = 'fields'
             known_keys(entry, {'outcome', 'position', 'arrivals'} if kind == 'history' else {'outcome', 'ids'}, 'observation')
+            field = 'outcome'
             if entry.get('outcome') != 'ok':
-                return None
+                raise ValueError()
+            field = 'position' if kind == 'history' else 'ids'
+            positions[account] = entry.get(field)
+            validate_positions({account: positions[account]}, config)
             if kind == 'history':
-                positions[account] = entry.get('position')
+                if account in saved and int(positions[account]) < int(saved[account]):
+                    raise ValueError()
+                field = 'arrivals'
                 arrivals = entry.get('arrivals')
                 if (not isinstance(arrivals, list) or len(arrivals) > 1000 or
-                        any(not isinstance(i, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,512}', i) for i in arrivals)):
-                    return None
+                        any(not isinstance(i, str) or not re.fullmatch(r'[A-Za-z0-9_=+/-]{1,512}', i) for i in arrivals)):
+                    raise ValueError()
                 quiet = quiet and not arrivals
             else:
-                positions[account] = entry.get('ids')
-        validate_positions(positions, config)
-        for account, value in positions.items():
-            if config['accounts'][account].get('quiet_kind', 'ids') == 'history':
-                if account in saved and int(value) < int(saved[account]):
-                    return None
-            else:
-                quiet = quiet and value == saved.get(account)
+                quiet = quiet and positions[account] == saved.get(account)
         return positions, quiet
     except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        print('Quiet check: ' + safe_text(account) + ': invalid ' + field + '; full run', file=sys.stderr)
         return None
+
+
+def gateway_account(config, account):
+    fields = config['accounts'][account]
+    if 'executor_account' not in fields:
+        return {}
+    return {k: fields[k] for k in ('executor_app', 'executor_account') if k in fields}
 
 
 def quiet_check(store, config, previous, observation, scheduled, now):
@@ -873,7 +1186,8 @@ def quiet_check(store, config, previous, observation, scheduled, now):
     token = read_lock(store)['token'] if (store / 'run.lock').exists() else None
     if token is not None and path.exists():
         cached = parse_json(read_text(path), path)
-        if cached['token'] == token:
+        known_keys(cached, {'token', 'decision', 'positions'}, str(path))
+        if cached.get('token') == token:
             return cached['decision']
     saved = previous.get('_positions', {})
     observed = read_observation(observation, config, saved) if observation is not None else None
@@ -900,10 +1214,115 @@ def quiet_check(store, config, previous, observation, scheduled, now):
     return decision
 
 
+def message_id(value):
+    return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_=+/-]{1,512}', value) is not None
+
+
+def validate_drafts(records, config):
+    if not isinstance(records, list):
+        raise ValueError('state.json._drafts: expected array')
+    seen = set()
+    for record in records:
+        known_keys(record, {'account', 'id', 'draft_id', 'rule', 'created'}, 'state.json._drafts')
+        if (set(record) != {'account', 'id', 'draft_id', 'rule', 'created'}
+                or record['account'] not in config['accounts'] or not message_id(record['id'])
+                or (record['draft_id'] is not None and not message_id(record['draft_id']))
+                or not isinstance(record['rule'], str)):
+            raise ValueError('state.json._drafts: expected account, message id, draft id, rule and creation time')
+        state_timestamp(record['created'], 'state.json._drafts.created')
+        key = record['account'], record['id']
+        if key in seen:
+            raise ValueError('state.json._drafts: duplicate message')
+        seen.add(key)
+
+
+def validate_calendar_config(config):
+    calendars = config.get('calendars', {})
+    known_keys(calendars, set(calendars) if isinstance(calendars, dict) else set(), 'config.calendars')
+    winners = 0
+    pairs = set()
+    for name, fields in calendars.items():
+        known_keys(fields, {'executor_app', 'executor_account', 'wins'}, 'config.calendars.' + name)
+        if not isinstance(fields.get('executor_app'), str) or not fields['executor_app'].strip():
+            raise ValueError('calendar executor_app: expected nonempty string')
+        if 'executor_account' in fields:
+            value = fields['executor_account']
+            if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value):
+                raise ValueError('calendar executor_account: expected account handle')
+            pair = fields['executor_app'], value
+            if pair in pairs:
+                raise ValueError('calendar executor_account: expected unique app/account pair')
+            pairs.add(pair)
+        if type(fields.get('wins', False)) is not bool:
+            raise ValueError('calendar wins: expected boolean')
+        winners += fields.get('wins', False)
+    if winners > 1:
+        raise ValueError('calendars: at most one wins')
+    settings = config.get('calendar', {})
+    known_keys(settings, {'days', 'work_start', 'work_end', 'quiet_start', 'quiet_end'}, 'config.calendar')
+    if type(settings.get('days', 3)) is not int or not 1 <= settings.get('days', 3) <= 14:
+        raise ValueError('calendar.days: expected integer 1 to 14')
+    for prefix in ('work', 'quiet'):
+        start, end = settings.get(prefix + '_start'), settings.get(prefix + '_end')
+        if start is None and end is None:
+            continue
+        if any(not isinstance(v, str) or not re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]', v) for v in (start, end)) or start >= end:
+            raise ValueError('calendar.' + prefix + ': expected paired increasing HH:MM times')
+
+
+def calendar_events(data, config):
+    known_keys(data, set(config.get('calendars', {})), 'calendar.json')
+    for name, events in data.items():
+        if isinstance(events, dict) and set(events) == {'failed'} and events['failed'] is True:
+            continue
+        if not isinstance(events, list):
+            raise ValueError('calendar.json: expected event array or {"failed": true}')
+        seen = set()
+        for event in events:
+            required = {'id', 'start', 'end', 'all_day', 'response', 'cancelled'}
+            known_keys(event, required | {'subject'}, 'calendar event')
+            if not required <= set(event) or not message_id(event['id']) or event['id'] in seen:
+                raise ValueError('calendar event: expected complete fields and unique message-style id')
+            seen.add(event['id'])
+            if any(type(event[k]) is not bool for k in ('all_day', 'cancelled')) or event['response'] not in ('pending', 'accepted', 'tentative', 'declined', 'organizer') or not isinstance(event.get('subject', ''), str):
+                raise ValueError('calendar event: invalid flags, response or subject')
+            times = []
+            for key in ('start', 'end'):
+                value = event[key]
+                if not isinstance(value, str):
+                    raise ValueError('calendar event: expected ISO dates or offset times')
+                if event['all_day']:
+                    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+                        raise ValueError('calendar event: expected all-day date')
+                    parsed = datetime.strptime(value, '%Y-%m-%d')
+                else:
+                    parsed = datetime.fromisoformat(value)
+                    if parsed.tzinfo is None:
+                        raise ValueError('calendar event: expected offset time')
+                times.append(parsed.timestamp() if not event['all_day'] else parsed)
+            if times[1] <= times[0]:
+                raise ValueError('calendar event: end must follow start')
+    return data
+
+
+FORMAT_VERSION = 1
+
+
+def check_version(data, source):
+    value = data.get('version', FORMAT_VERSION)
+    if type(value) is not int or value < 1 or value > FORMAT_VERSION:
+        raise ValueError(f'{source}: version {value!r} found; supported version {FORMAT_VERSION}')
+
+
 def validate_inputs(listing, config, previous):
-    known_keys(config, {'accounts', 'language', 'inbox_limit', 'timezone', 'schedule', 'lock', 'state'}, 'config')
+    check_version(config, 'config.toml')
+    check_version(previous, 'state.json')
+    known_keys(config, {'version', 'accounts', 'language', 'inbox_limit', 'timezone', 'schedule', 'lock', 'state', 'relist_inbox', 'calendar', 'calendars'}, 'config')
+    validate_calendar_config(config)
     lock_setting(config)
     state_setting(config)
+    if config.get('relist_inbox', 'all') not in ('all', 'new_plus_count'):
+        raise ValueError('config.relist_inbox: expected all or new_plus_count')
     if not isinstance(config.get('language', 'en'), str) or config.get('language', 'en') not in STRINGS:
         raise ValueError('config.language: expected en or es')
     if type(config.get('inbox_limit', 100)) is not int or config.get('inbox_limit', 100) <= 0:
@@ -930,13 +1349,25 @@ def validate_inputs(listing, config, previous):
     if not isinstance(accounts, dict) or not accounts:
         raise ValueError('config.accounts: expected a non-empty table')
     for account, fields in accounts.items():
-        if account == '_positions':
+        if account in {'version', '_positions', '_drafts'}:
             raise ValueError('config.accounts._positions: reserved state key')
-        known_keys(fields, {'address', 'executor_app', 'quiet_kind'}, 'config.accounts.' + account)
+        known_keys(fields, {'address', 'executor_app', 'executor_account', 'quiet_kind', 'provider'}, 'config.accounts.' + account)
         for key, value in fields.items():
             if not isinstance(value, str) or not value.strip():
                 raise ValueError('config.accounts.' + account + '.' + key + ': expected a non-empty string')
-        if fields.get('quiet_kind', 'ids') not in ('history', 'ids'):
+        if 'provider' in fields and fields['provider'] not in ('gmail', 'outlook'):
+            raise ValueError('config.accounts.' + account + '.provider: expected gmail or outlook')
+        if fields.get('provider') and 'quiet_kind' in fields and fields['quiet_kind'] != ('history' if fields['provider']=='gmail' else 'ids'):
+            raise ValueError('config.accounts.' + account + '.quiet_kind: expected history for gmail or ids for outlook')
+        if 'executor_account' in fields:
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', fields['executor_account']):
+                raise ValueError('config.accounts.' + account + '.executor_account: expected 1 to 128 ASCII letters, digits, underscore or hyphen')
+            if any(other != account and isinstance(f, dict) and
+                   (f.get('executor_app'), f.get('executor_account')) ==
+                   (fields.get('executor_app'), fields['executor_account'])
+                   for other, f in accounts.items()):
+                raise ValueError('config.accounts.' + account + '.executor_account: expected a unique executor_app and executor_account pair')
+        if fields.get('quiet_kind', 'history' if fields.get('provider')=='gmail' else 'ids') not in ('history', 'ids'):
             raise ValueError('config.accounts.' + account + '.quiet_kind: expected history or ids')
     known_keys(listing, {'accounts', 'messages', 'folders'}, 'Inbox')
     if not isinstance(listing.get('accounts'), dict):
@@ -966,10 +1397,11 @@ def validate_inputs(listing, config, previous):
             known_keys(folder, {'id', 'name'}, 'Inbox.folders.' + account)
             if any(not isinstance(folder.get(k), str) for k in ('id', 'name')):
                 raise ValueError('Inbox.folders.' + account + ': expected id and name strings')
-    known_keys(previous, set(accounts) | {'_positions'}, 'state.json')
+    known_keys(previous, set(accounts) | {'version', '_positions', '_drafts'}, 'state.json')
+    validate_drafts(previous.get('_drafts', []), config)
     if '_positions' in previous:
         validate_positions(previous['_positions'], config)
-    if any(type(n) is not int or n < 0 for a, n in previous.items() if a != '_positions'):
+    if any(type(n) is not int or n < 0 for a, n in previous.items() if a not in {'version', '_positions', '_drafts'}):
         raise ValueError('state.json: expected non-negative integer counts')
 
 
@@ -984,7 +1416,8 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
     totals = listing['accounts']
     not_listed = [a for a in config['accounts'] if a not in totals]
     if set(totals) - set(config['accounts']) or not set(totals) & set(config['accounts']):
-        return {'actions': [],
+        return {'relist_inbox': config.get('relist_inbox', 'all'),
+                'remaining': [dict(account=m['account'], id=m['id'], sender=m['sender'], subject=m['subject'], reason='Run stopped') for m in messages], 'actions': [],
                 'decisions': [{'account': m['account'], 'id': m['id'], 'reason': 'Run stopped'} for m in messages],
                 'reasons': list(stop_reasons) + ['Listing has an unconfigured account' if set(totals) - set(config['accounts']) else 'No configured account listed'],
                 'not_listed': not_listed,
@@ -1016,11 +1449,18 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
             for rule in candidates:
                 if selections is None and not matches(message, rule):
                     continue
+                if rule['action'] == 'draft' and any(d['account'] == message['account'] and d['id'] == message['id'] for d in (previous or {}).get('_drafts', [])):
+                    reason = 'Draft waiting'
+                    break
                 key = (rule['id'], message['account'])
                 if 'question' not in rule:
                     hits[key] = hits.get(key, 0) + 1
                 verb = rule['action']
                 action = {'account': message['account'], 'id': message['id'], 'action': verb, 'rule': rule['id']}
+                if verb == 'draft':
+                    if not message_id(message['id']):
+                        raise ValueError('Inbox.messages.id: expected a valid message id for draft creation')
+                    action.update(action='create-draft', draft=rule['draft'], draft_text=rule['draft_text'], draft_to=rule.get('draft_to', []))
                 if verb == 'move':
                     target = rule.get('target')
                     if target and ('{year}' in target or '{month}' in target):
@@ -1095,10 +1535,14 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         count = sum(a['rule'] == rule['id'] and a['action'] != 'create-folder' for a in actions)
         if count > rule.get('limit', 10):
             reasons.append(f"Per-rule action limit exceeded: {rule['id']} ({count} of {rule.get('limit', 10)})")
+    if sum(a['action'] == 'create-draft' for a in actions) > DRAFT_LIMIT:
+        reasons.append('Draft limit exceeded')
     if sum(a['action'] == 'unsubscribe' for a in actions) > 10:
         reasons.append('Unsubscribe limit exceeded')
-    if any(n > totals[a] * 0.2 for (_, a), n in hits.items()):
-        reasons.append('Rule exceeds twenty percent of account total')
+    for (rule, account), count in sorted(hits.items()):
+        allowed = max(BRAKE_FLOOR, totals[account] // 5)
+        if count > allowed:
+            reasons.append(f'Rule exceeds twenty percent of account total: {rule}, {account} ({count} matches, total {totals[account]}, allowed {allowed})')
     if reasons:
         actions = []
         decisions = [{'account': m['account'], 'id': m['id'], 'reason': 'Run stopped'} for m in messages]
@@ -1107,8 +1551,58 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
     for action in actions:
         if action['action'] in {'trash', 'archive', 'move', 'spam'}:
             expected[action['account']] -= 1
-    return {'actions': actions, 'decisions': decisions, 'reasons': reasons, 'counts': counts,
-            'expected_counts': expected, 'not_listed': not_listed}
+    result = {'actions': actions, 'decisions': decisions, 'reasons': reasons, 'counts': counts,
+            'expected_counts': expected, 'not_listed': not_listed,
+            'relist_inbox': config.get('relist_inbox', 'all')}
+    result['remaining'] = remaining_items(result, listing)
+    for item in result['remaining']:
+        for record in (previous or {}).get('_drafts', []):
+            if (item['account'], item['id']) == (record['account'], record['id']):
+                item['reason'] = 'Draft waiting since ' + record['created'] + ('; draft may exist; check Drafts by hand' if record['draft_id'] is None else '')
+    return result
+
+
+REMOVALS = {'trash', 'archive', 'move', 'spam'}
+
+
+def recover_drafts(store, previous, token):
+    previous = dict(previous)
+    drafts = list(previous.get('_drafts', []))
+    known = {(d['account'], d['id']) for d in drafts}
+    path = store / 'calls.jsonl'
+    entries = [parse_json(line, path) for line in (read_text(path).splitlines() if path.exists() else [])]
+    failed = {(e['run'], e['account'], e['id']) for e in entries if e['verb'] == 'create-draft' and e['outcome'] == 'failed'}
+    for entry in entries:
+        key = (entry['account'], entry['id'])
+        if (entry['run'] != token and entry['verb'] == 'create-draft' and entry['outcome'] == 'issued' and key not in known
+                and (entry['run'], *key) not in failed):
+            drafts.append(dict(account=key[0], id=key[1], draft_id=None, rule='uncertain-draft',
+                               created=datetime.fromtimestamp(entry['time'], timezone.utc).isoformat()))
+            known.add(key)
+    if drafts: previous['_drafts'] = drafts
+    return previous
+
+
+def remaining_items(plan, listing, results=None, *, final=False):
+    decisions = {(i['account'], i['id']): i for i in plan['decisions']}
+    removed = {(i['account'], i['id']) for i in (plan['actions'] if results is None else results)
+               if i['action'] in REMOVALS and (results is None or i['status'] == 'executed')}
+    statuses = {(i['account'], i['id']): (('Draft waiting since ' + i.get('created', '') if i['action'] == 'create-draft' else 'Unsubscribe leaves message in Inbox') if i['status'] == 'executed' else i['status'])
+                for i in results or [] if i['action'] != 'create-folder'}
+    items = []
+    for m in listing['messages']:
+        key = (m['account'], m['id'])
+        if key in removed and not final:
+            continue
+        item = dict(account=m['account'], id=m['id'], sender=m['sender'], subject=m['subject'])
+        item.update(decisions.get(key, {'reason': 'Returned to Inbox after removal' if final and key in removed else statuses.get(key, 'New arrival during run' if final else 'unexecuted' if results is not None else 'Unsubscribe leaves message in Inbox')}))
+        prior = next((i for i in plan.get('remaining', []) if (i['account'], i['id']) == key), {})
+        if prior.get('reason', '').startswith('Draft waiting since '):
+            item['reason'] = prior['reason']
+        if statuses.get(key) == 'issued_unknown' and any(a['action'] == 'create-draft' and (a['account'], a['id']) == key for a in plan['actions']):
+            item['reason'] = 'check Drafts by hand'
+        items.append(item)
+    return items
 
 
 REPLY_LIMIT = 2000
@@ -1138,23 +1632,37 @@ def read_numbers(store):
 def number_decisions(store, plan, listing):
     import execute
     data = read_numbers(store)
-    protected = {(i['account'], i['id']) for i in plan['decisions'] if i['reason'] == 'Protected by never-touch'}
-    present = {(i['account'], i['id']) for i in plan['decisions'] + plan.get('reply', [])} - protected
+    protected = {(i['account'], i['id']) for i in plan['decisions'] + plan.get('remaining', []) if i['reason'] == 'Protected by never-touch'}
+    present = {(i['account'], i['id']) for i in plan.get('remaining', plan['decisions']) + plan.get('reply', [])} - protected
     data['items'] = [i for i in data['items'] if i['account'] not in listing['accounts'] or (i['account'], i['id']) in present]
     lookup = {(i['account'], i['id']): i['number'] for i in data['items']}
-    for item in plan['decisions']:
+    log = store / 'decisions.jsonl'
+    kept = set()
+    for line in read_text(log).splitlines() if log.exists() and any(i['reason'] == 'No matching rule' for i in plan.get('remaining', [])) else []:
+        for part in parse_json(line, log)['parts']:
+            if part['verb'] in {'leave', 'yes', 'no'} and part['outcome'] == 'answered':
+                kept.add((part['account'], part['id']))
+    for item in plan.get('remaining', plan['decisions']):
         if item['reason'] == 'Protected by never-touch':
             continue
         key = (item['account'], item['id'])
+        if key in kept and item['reason'] == 'No matching rule':
+            item['reason'] = 'Kept by owner reply'
+        item.setdefault('previously_listed', key in lookup)
         if key not in lookup:
             lookup[key] = data['next']
             data['items'].append(dict(number=data['next'], account=key[0], id=key[1]))
             data['next'] += 1
         item['number'] = lookup[key]
+        for decision in plan['decisions']:
+            if (decision['account'], decision['id']) == key:
+                decision['number'] = lookup[key]
     execute.atomic(store / 'numbers.json', data)
 
 
 def parse_reply(text):
+    if re.search(r'\b(calendar|event|invitation|accept|decline)\b', text, re.I):
+        raise ValueError('The owner answers invitations in the calendar itself.')
     # Bounded linear scans; no backtracking, unbounded integer conversion or clock.
     if not text.strip() or len(text) > REPLY_LIMIT:
         raise ValueError('Reply must contain 1 to 2000 characters')
@@ -1171,6 +1679,8 @@ def parse_reply(text):
         seen.add(number)
         command = words[1].strip()
         verb, target = command.casefold(), None
+        if verb.split()[0] in {'send', 'resend', 'transmit', 'submit', 'deliver', 'dispatch', 'reply', 'forward', 'email', 'mail'}:
+            raise ValueError('The owner sends drafts by hand from the mailbox.')
         fields = command.split(maxsplit=2)
         if len(fields) == 3 and fields[0].casefold() == 'move' and fields[1].casefold() == 'to':
             verb, target = 'move', folder_path(fields[2].strip())
@@ -1207,13 +1717,29 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=()):
         raise ValueError('Reply action could not be planned')
     if result['reasons']:
         raise ValueError('; '.join(result['reasons']))
+    for item in result['decisions']:
+        if any((e['account'], e['id']) == (item['account'], item['id']) and e['verb'] in {'leave', 'yes', 'no'} for e in entries):
+            item['reason'] = 'Kept by owner reply'
+    result['remaining'] = remaining_items(result, listing)
+    for item in result['remaining']:
+        for record in (previous or {}).get('_drafts', []):
+            if (item['account'], item['id']) == (record['account'], record['id']):
+                item['reason'] = 'Draft waiting since ' + record['created'] + ('; draft may exist; check Drafts by hand' if record['draft_id'] is None else '')
     result['reply'] = entries
     return result
 
 
 STRINGS = {
-    'en': ('Needs you', 'Planned actions', 'New rules', 'None', 'Stopped'),
-    'es': ('Requiere tu decisión', 'Acciones previstas', 'Reglas nuevas', 'Ninguno', 'Detenido'),
+    'en': ('None', 'Stopped'),
+    'es': ('Ninguno', 'Detenido'),
+}
+
+
+SECTION_LABELS = {
+    'en': {'inbox': 'Still in Inbox (by account)', 'planned': 'Planned actions',
+           'rules': 'New rules', 'handled': 'Handled automatically', 'notes': 'Run notes'},
+    'es': {'inbox': 'Todavía en Recibidos (por cuenta)', 'planned': 'Acciones previstas',
+           'rules': 'Reglas nuevas', 'handled': 'Gestionado automáticamente', 'notes': 'Notas de ejecución'},
 }
 
 
@@ -1254,8 +1780,102 @@ def safe_unsubscribe_host(url):
     return host if valid else None
 
 
+def render_remaining(plan, listing, language='en'):
+    lines = []
+    for account in plan['counts']:
+        items = [i for i in plan.get('remaining', remaining_items(plan, listing)) if i['account'] == account]
+        lines.append(safe_text(account) + ': ' + str(len(items)))
+        hidden = 0
+        for item in items:
+            if plan.get('relist_inbox') == 'new_plus_count' and item.get('previously_listed'):
+                hidden += 1
+                continue
+            lines.append((str(item['number']) + '. ' if 'number' in item else '- ') +
+                         safe_text(account + ': ' + item['sender'][:160] + ' | ' + item['subject'][:240]) +
+                         ' (' + safe_text(item['reason']) + ')' +
+                         (' | ' + safe_text(item['question']) if 'question' in item else ''))
+        if plan.get('relist_inbox') == 'new_plus_count':
+            lines.append(safe_text(account) + ': ' + str(hidden) +
+                         (' previously listed' if language == 'en' else ' ya enumerados'))
+    return lines
+
+
+def render_drafts(plan, listing, results=None):
+    actions = [(i, a) for i, a in enumerate(plan['actions']) if a['action'] == 'create-draft']
+    if not actions:
+        return []
+    lookup = {(m['account'], m['id']): m for m in listing['messages']}
+    lines = ['', '**Drafts**', '']
+    for i, action in actions:
+        status = 'would create' if plan.get('dry_run') else (results[i]['status'] if results is not None and i < len(results) else 'planned')
+        lines.append(safe_text(action['account'] + ': ' + action['draft'] + ' | ' + lookup.get((action['account'], action['id']), {}).get('subject', '')) + ' | ' + status)
+        if action['draft_to']:
+            lines.append('Recipients: ' + ', '.join(action['draft_to']))
+        if status == 'issued_unknown':
+            lines.append('check Drafts by hand')
+        fence = '`' * max(3, 1 + max((len(x) for x in re.findall(r'`+', action['draft_text'])), default=0))
+        lines += [fence, action['draft_text'], fence]
+    return lines
+
+
+def calendar_section(data, config, now):
+    if not config.get('calendars'):
+        return []
+    calendar_events(data, config)
+    zone = ZoneInfo(config.get('timezone', 'UTC'))
+    today = now.astimezone(zone).date()
+    settings = config.get('calendar', {})
+    start = datetime.combine(today, datetime.min.time(), zone).timestamp()
+    end = datetime.combine(today + timedelta(days=settings.get('days', 3)), datetime.min.time(), zone).timestamp()
+    events, pending, unread = [], [], []
+    for name in sorted(config['calendars']):
+        if name not in data or data[name] == {'failed': True}:
+            unread.append(safe_text(name) + ': not read; overlaps against it were not checked')
+            continue
+        for event in data[name]:
+            if event['cancelled'] or event['response'] == 'declined':
+                continue
+            if event['all_day']:
+                a = datetime.combine(datetime.strptime(event['start'], '%Y-%m-%d').date(), datetime.min.time(), zone)
+                b = datetime.combine(datetime.strptime(event['end'], '%Y-%m-%d').date(), datetime.min.time(), zone)
+            else:
+                a, b = (datetime.fromisoformat(event[k]).astimezone(zone) for k in ('start', 'end'))
+            item = (a.timestamp(), name, event['id'], b.timestamp(), event, a, b)
+            if event['response'] == 'pending':
+                pending.append(item)
+            if not event['all_day'] and a.timestamp() < end and b.timestamp() > start:
+                events.append(item)
+    def describe(item):
+        _, name, ident, _, event, a, b = item
+        return safe_text(name + ' | ' + ident + ' | ' + a.isoformat() + ' — ' + b.isoformat() + ' | ' + event.get('subject', ''))
+    lines = ['', '**Calendar**', '', 'Invitations waiting for an answer']
+    for item in sorted(pending):
+        a, b = item[5:]
+        marks = []
+        clock = a.strftime('%H:%M')
+        if not item[4]['all_day'] and 'work_start' in settings and (clock < settings['work_start'] or clock >= settings['work_end'] or (b.date() == a.date() and b.strftime('%H:%M') > settings['work_end'])):
+            marks.append('outside working hours')
+        if not item[4]['all_day'] and 'quiet_start' in settings:
+            qstart = a.replace(hour=int(settings['quiet_start'][:2]), minute=int(settings['quiet_start'][3:]), second=0, microsecond=0).timestamp()
+            qend = a.replace(hour=int(settings['quiet_end'][:2]), minute=int(settings['quiet_end'][3:]), second=0, microsecond=0).timestamp()
+            if a.timestamp() < qend and b.timestamp() > qstart:
+                marks.append('inside quiet window')
+        lines.append('- ' + describe(item) + (' | ' + ', '.join(marks) if marks else ''))
+    lines.append('Overlaps')
+    ordered = sorted(events)
+    for i, first in enumerate(ordered):
+        for second in ordered[i + 1:]:
+            if second[0] >= first[3]:
+                break
+            winner = next((x[1] for x in (first, second) if config['calendars'][x[1]].get('wins')), None)
+            lines.append('- ' + describe(first) + ' / ' + describe(second) + (' | ' + safe_text(winner) + ' stays' if winner else ''))
+    lines += unread
+    return lines
+
+
 def render_report(plan, listing, language='en'):
-    decision, planned, new, empty, stopped = STRINGS[language]
+    empty, stopped = STRINGS[language]
+    planned, new = (SECTION_LABELS[language][k] for k in ('planned', 'rules'))
     lookup = {(m['account'], m['id']): m for m in listing['messages']}
     def describe(item):
         m = lookup[item['account'], item['id']]
@@ -1263,23 +1883,117 @@ def render_report(plan, listing, language='en'):
     lines = ['Inbox: ' + str(sum(plan['counts'].values())) + ' total | ' + ' · '.join(safe_text(a) + ' ' + str(n) for a, n in plan['counts'].items())]
     lines = [safe_text(a) + ': not listed this run' for a in plan.get('not_listed', [])] + lines
     lines += [stopped + ': ' + safe_text(r) for r in plan['reasons']]
-    lines += ['', '**' + decision + '**', '']
-    unsafe = []
-    hosts = {}
-    for a in plan['actions']:
-        if a['action'] != 'unsubscribe':
-            continue
-        m = lookup[a['account'], a['id']]
-        host = safe_unsubscribe_host(a['url'])
-        if not host or m.get('spam') or m.get('phishing'):
-            unsafe.append(a | {'reason': 'Unsafe unsubscribe'})
-        else:
-            hosts[a['account'], a['id']] = host
-    lines += [(str(a['number']) + '. ' if 'number' in a else '- ') + describe(a) + ' (' + safe_text(a['reason']) + ')' + (' | ' + safe_text(a['question']) if 'question' in a else '') for i, a in enumerate(plan['decisions'] + unsafe, 1)] or [empty]
+    lines += render_drafts(plan, listing)
+    lines += ['', '**' + SECTION_LABELS[language]['inbox'] + '**', ''] + render_remaining(plan, listing, language)
+    lines += plan.get('calendar_section', [])
+    hosts = {(a['account'], a['id']): safe_unsubscribe_host(a['url']) for a in plan['actions'] if 'url' in a}
     lines += ['', '**' + planned + '**', '']
     lines += ['- ' + a['action'] + ': ' + describe(a) + (' | ' + code_path(a['target_path']) if 'target_path' in a else '') + (' | ' + safe_text(hosts.get((a['account'], a['id']), '')) if 'url' in a else '') for a in plan['actions'] if a['action'] != 'unsubscribe' or (a['account'], a['id']) in hosts] or [empty]
     lines += ['', '**' + new + '**', '', empty, '']
     return '\n'.join(lines)
+
+
+def render_message(store, token, plan_path, results_path, *, now=None):
+    import execute
+    require_lock(store, token)
+    plan = execute.read(plan_path)
+    if plan.get('dry_run') is True:
+        require_fetched(store, token)
+        listing = execute.read(store / 'inbox.json')
+        config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')])
+        previous = execute.read(store / 'state.json') if (store / 'state.json').exists() else {}
+        stops = ['Missing state; prior run records exist'] if not (store / 'state.json').exists() and not plan.get('first_run') else []
+        expected = build_plan(listing, rules, holds, config, previous, stops)
+        if any(plan.get(k) != expected[k] for k in expected):
+            raise ValueError('dry-run plan: expected unchanged private inputs and listing')
+        lookup = {(m['account'], m['id']): m for m in listing['messages']}
+        language = config.get('language', 'en')
+        labels = SECTION_LABELS[language]
+        would = 'would ' if language == 'en' else 'haría '
+        lines = ['Dry run', 'Replies to this dry run are not acted on; no reply number is live.'] if language == 'en' else ['Simulación', 'Las respuestas a esta simulación no se aplican; ningún número está activo.']
+        lines += [STRINGS[language][1] + ': ' + safe_text(r) for r in plan['reasons']]
+        lines += ['[' + safe_text(a['rule']) + '] ' + would + safe_text(a['action']) + ': ' + safe_text(a['account'] + ': ' + lookup[a['account'], a['id']]['sender'] + ' | ' + lookup[a['account'], a['id']]['subject']) + (' | ' + code_path(a.get('target_path', a.get('target'))) if 'target_path' in a or 'target' in a else '') for a in plan['actions']]
+        lines += render_drafts(plan, listing)
+        lines += ['', 'Decisions for the owner' if language == 'en' else 'Decisiones para el propietario']
+        lines += [safe_text(i['account'] + ': ' + lookup[i['account'], i['id']]['subject'] + ' | ' + i['reason']) + (' | ' + safe_text(i['question']) if 'question' in i else '') for i in plan['decisions']]
+        lines += ['', labels['inbox']]
+        items = remaining_items(dict(plan, actions=[]), listing)
+        for item in items:
+            actions = [a['action'] for a in plan['actions'] if (a['account'], a['id']) == (item['account'], item['id'])]
+            if actions: item['reason'] = would + ', '.join(actions)
+        lines += render_remaining(dict(plan, actions=[], remaining=items), listing, language)
+        lines += plan.get('calendar_section', [])
+        return '\n'.join(lines) + '\n'
+    execution = execute.Execution(store, token, plan_path)
+    if not execution.path.exists():
+        raise ValueError('message: missing execution results for this token and plan; run execute.py next')
+    results = execute.read(results_path or store / 'results.json')
+    if results != {'results': execution.state['results']}:
+        raise ValueError('message: results must match this token and plan checkpoint')
+    plan = execution.plan
+    listing = execution.current_listing(execute.read(store / 'inbox.json'))
+    config = parse_toml(load_inputs([store / 'config.toml'])[0], store / 'config.toml')
+    language = config.get('language', 'en')
+    labels = SECTION_LABELS[language]
+    observed = list(results['results'])
+    pending = execution.state['pending']
+    if pending is not None:
+        observed.append(pending | {'status': 'issued_unknown'})
+    remaining = execution.remaining_items(listing, observed)
+    # Read saved numbers only: rendering never allocates or changes them.
+    numbers = {(i['account'], i['id']): i['number'] for i in read_numbers(store)['items']}
+    old = {(i['account'], i['id']): i for i in plan.get('remaining', [])}
+    for item in remaining:
+        key = item['account'], item['id']
+        if key in numbers and item['reason'] != 'Protected by never-touch':
+            item['number'] = numbers[key]
+        item['previously_listed'] = old.get(key, {}).get('previously_listed', False)
+    handled = {}
+    notes = [safe_text(r) for r in plan['reasons']]
+    if execution.stop_reason():
+        notes.insert(0, safe_text(execution.stop_reason()))
+    for index, action in enumerate(plan['actions']):
+        status = (observed[index]['status'] if index < len(observed) else 'unexecuted')
+        if status == 'executed' and action['action'] != 'create-folder':
+            groups = handled.setdefault(action['action'], {})
+            group = action.get('target_path', action.get('rule', action.get('target', '')))
+            groups[group] = groups.get(group, 0) + 1
+        elif status != 'executed':
+            notes.append(safe_text(action['account'] + ': ' + action['action'] + ': ' + status))
+            if action['action'] == 'create-folder':
+                instruction = ('Check whether this folder exists; create it if absent: ' if status == 'issued_unknown' else 'Create this folder: ')
+                notes.append(safe_text(action['account'] + ': ' + instruction) + code_path(action['target_path']) + '; dependent messages stay in Inbox this run.')
+    notes += [safe_text(a) + ': not listed this run' for a in plan.get('not_listed', [])]
+    log = store / 'calls.jsonl'
+    for line in read_text(log).splitlines() if log.exists() else []:
+        entry = parse_json(line, log)
+        if entry['run'] == token and entry['outcome'] == 'unplanned':
+            notes.append('Unplanned call: ' + safe_text(json.dumps(entry, ensure_ascii=True)))
+    started = datetime.fromtimestamp(read_lock(store).get('started', read_lock(store)['created']), ZoneInfo(config.get('timezone', 'UTC')))
+    count = sum('number' in i for i in remaining)
+    need = (str(count) + ' need you' if count else 'nothing needs you') if language == 'en' else (str(count) + ' requieren tu decisión' if count else 'nada requiere tu decisión')
+    total = sum(sum(groups.values()) for groups in handled.values())
+    stopped = bool(plan['reasons']) or bool(execution.stop_reason()) or len(results['results']) != len(plan['actions'])
+    summary = STRINGS[language][1].lower() if stopped else str(total) + (' handled' if language == 'en' else ' gestionados')
+    lines = []
+    if plan.get('scheduled') and 'schedule' in config:
+        slot = schedule_slot(config, started)
+        delay = int((started.timestamp() - slot.timestamp()) // 60)
+        if delay > 15:
+            lines.append(('Late start: ' if language == 'en' else 'Inicio tardío: ') + slot.strftime('%Y-%m-%d %H:%M %Z') + ', ' + str(delay) + ' min')
+    lines.append('📬 Triage · ' + started.strftime('%A, %Y-%m-%d, %H:%M %Z') + ' · ' + need + ' · ' + summary)
+    lines += [safe_text(a) + ': not listed this run' for a in plan.get('not_listed', [])]
+    if handled:
+        lines += ['', '**' + labels['handled'] + '**']
+        for verb, groups in handled.items():
+            lines.append(safe_text(verb) + ': ' + str(sum(groups.values())) + ' (' + '; '.join(safe_text(k) + ': ' + str(v) for k, v in groups.items()) + ')')
+    lines += render_drafts(plan, execute.read(store / 'inbox.json'), observed)
+    confirmed = dict(plan, remaining=remaining)
+    lines += ['', '**' + labels['inbox'] + '**', ''] + render_remaining(confirmed, listing, language)
+    lines += plan.get('calendar_section', [])
+    if notes:
+        lines += ['', '**' + labels['notes'] + '**', ''] + notes
+    return '\n'.join(lines) + '\n'
 
 
 def load_inputs(paths):
@@ -1303,6 +2017,102 @@ def load_inputs(paths):
     return result
 
 
+def load_safety(sources):
+    """Read safety files, collecting independent errors before refusing."""
+    problems, values = [], []
+    for index, path in enumerate(sources):
+        try:
+            text = load_inputs([path])[0]
+            value = parse_toml(text, path) if index < 3 else text
+            values.append(value)
+        except (ValueError, OSError) as error:
+            problems.append(str(error))
+            values.append(None)
+    config, rules_data, holds_data, _ = values
+    if config is not None:
+        # Validate independent top-level settings and each account separately.
+        accounts = config.get('accounts')
+        probes = [dict(accounts={'probe': {}}, **{k: v}) for k, v in config.items() if k not in ('accounts', 'state', 'lock')]
+        probes.append({k: config[k] for k in ('accounts', 'lock', 'state') if k in config})
+        if isinstance(accounts, dict):
+            probes.extend({'accounts': {a: fields}} for a, fields in accounts.items())
+        for probe in probes:
+            try:
+                validate_inputs({'accounts': {}, 'messages': []}, probe, {})
+            except ValueError as error:
+                problems.append(str(sources[0]) + ': ' + str(error))
+    entries = []
+    for index, data in ((1, rules_data), (2, holds_data)):
+        parsed = []
+        if data is not None:
+            try:
+                known_keys(data, {'rules', 'allow_empty'} if index == 2 else {'rules'}, 'rule file')
+                raw = data.get('rules', [])
+                if not isinstance(raw, list) or not raw:
+                    parse_rules(read_text(sources[index]), protection=index == 2)
+                else:
+                    seen = set()
+                    for number, entry in enumerate(raw, 1):
+                        try:
+                            (validate_rules if index == 1 else validate_holds)([entry])
+                            if index == 1 and entry['id'] in seen:
+                                raise ValueError('rule ' + repr(entry['id']) + ': Duplicate rule id; expected a unique id')
+                            if index == 1:
+                                seen.add(entry['id'])
+                            if isinstance(config, dict) and isinstance(config.get('accounts'), dict):
+                                for account in entry.get('accounts', []):
+                                    if account not in config['accounts']:
+                                        raise ValueError(('rule ' + repr(entry['id']) if index == 1 else 'entry ' + str(number)) + ': account ' + repr(account) + ' expected one of config.toml accounts: ' + ', '.join(config['accounts']))
+                            parsed.append(entry)
+                        except ValueError as error:
+                            problems.append(str(sources[index]) + ': ' + str(error))
+                if 'allow_empty' in data and type(data['allow_empty']) is not bool:
+                    raise ValueError('allow_empty: expected boolean')
+            except ValueError as error:
+                problems.append(str(sources[index]) + ': ' + str(error))
+        entries.append(parsed)
+    if problems:
+        raise ValueError('\n'.join(dict.fromkeys(problems)))
+    return config, *entries
+
+
+def rule_cases(store, config, rules, holds):
+    path = store / 'cases.toml'
+    if not path.exists():
+        return [], 0
+    data = parse_toml(load_inputs([path])[0], path)
+    known_keys(data, {'cases'}, 'cases.toml')
+    cases = data.get('cases')
+    if not isinstance(cases, list): raise ValueError('cases.toml: expected cases array')
+    failures, names = [], set()
+    for case in cases:
+        known_keys(case, {'name', 'account', 'sender', 'subject', 'has_attachment', 'body', 'expect', 'expect_rule'}, 'cases.toml case')
+        name = case.get('name')
+        if not isinstance(name, str) or not name.strip() or name in names:
+            raise ValueError('cases.toml: expected unique nonempty case name')
+        names.add(name)
+        if case.get('account') not in config['accounts'] or case.get('expect') not in VERBS | {'none', 'never-touch'}:
+            raise ValueError('cases.toml: expected configured account and supported expectation')
+        if 'expect_rule' in case and (not isinstance(case['expect_rule'], str) or not case['expect_rule']):
+            raise ValueError('cases.toml: expected rule id string')
+        message = {k:v for k,v in case.items() if k in {'account', 'sender', 'subject', 'has_attachment', 'body'}}
+        message.update(id='case', folder='Inbox')
+        validate_inputs(dict(accounts={case['account']:1},messages=[message]),config,{})
+        sender = normalize_sender(message['sender'])
+        message['sender'] = sender
+        found, rule_id = 'none', None
+        if sender is not None:
+            if any(matches(message, h, protection=True) for h in holds):
+                found = 'never-touch'
+            else:
+                rule = next((r for r in rules if matches(message, r)), None)
+                if rule is not None: found, rule_id = rule['action'], rule['id']
+        if found != case['expect'] or ('expect_rule' in case and case['expect_rule'] != rule_id):
+            expected_rule = case.get('expect_rule')
+            failures.append(safe_text(name) + ': expected ' + case['expect'] + (' rule ' + safe_text(expected_rule) if expected_rule else '') + ', found ' + found + (' rule ' + safe_text(rule_id) if rule_id else ''))
+    return failures, len(cases)
+
+
 def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_verified=False):
     with lock_gate(store):
         require_lock(store, token)
@@ -1314,7 +2124,9 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
             except ValueError as error:
                 raise ValueError(str(path) + ': ' + str(error)) from error
         plan = read(plan_path)
-        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'first_run', 'reply'}, str(plan_path))
+        if plan.get('dry_run'):
+            raise ValueError('dry-run plan: commit-state is refused')
+        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled'}, str(plan_path))
         for key in ('actions', 'reasons', 'not_listed'):
             if not isinstance(plan.get(key), list):
                 raise ValueError(str(plan_path) + '.' + key + ': expected an array')
@@ -1325,7 +2137,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         actions = set()
         for i, action in enumerate(plan['actions']):
             label = str(plan_path) + '.actions.' + str(i)
-            known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url'}, label)
+            known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to'}, label)
             if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action')):
                 raise ValueError(label + ': expected account, id and action strings')
             if action['action'] not in PLAN_VERBS or action['account'] not in counts:
@@ -1337,28 +2149,35 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         import execute
         execution = execute.Execution(store, token, plan_path)
         execution.validate()
+        if execution.state.get('single_reads') and 'final_listing' not in execution.state:
+            raise ValueError('commit-state: final whole Inbox reading required; run execute.py final')
+        expected_results = (store / 'results.json').resolve()
+        results_path = expected_results if results_path is None else results_path
+        if Path(results_path).resolve() != expected_results:
+            raise ValueError(str(results_path) + ': expected this run’s results file ' + str(expected_results))
+        if not expected_results.is_file():
+            raise ValueError(str(expected_results) + ': expected results recorded by the step machine for this token and plan; run execute.py next')
         executed = []
-        if results_path is not None:
-            results = read(results_path)
-            known_keys(results, {'results'}, str(results_path))
-            if not isinstance(results.get('results'), list):
-                raise ValueError(str(results_path) + '.results: expected an array')
-            seen = set()
-            for i, entry in enumerate(results['results']):
-                label = str(results_path) + '.results.' + str(i)
-                known_keys(entry, {'account', 'id', 'action', 'status', 'folder_id'}, label)
-                for k in ('account', 'id', 'action', 'status'):
-                    if not isinstance(entry.get(k), str):
-                        raise ValueError(label + '.' + k + ': expected a string')
-                key = (entry['account'], entry['id'], entry['action'])
-                if key not in actions or key in seen:
-                    raise ValueError(label + '.id: expected a unique action matching the plan account, id and action')
-                seen.add(key)
-                if entry['status'] not in {'executed', 'failed', 'skipped', 'unexecuted', 'unsubscribe_not_executable', 'unsubscribe_not_attempted', 'issued_unknown'}:
-                    raise ValueError(label + '.status: expected executed, failed, skipped, unexecuted, unsubscribe_not_executable, unsubscribe_not_attempted or issued_unknown')
-                if entry['status'] == 'executed' and entry['action'] in {'trash', 'archive', 'move', 'spam'}:
-                    executed.append(entry['account'])
-        if results_path is not None and (not execution.path.exists() or results['results'] != execution.state['results']):
+        results = read(results_path)
+        known_keys(results, {'results'}, str(results_path))
+        if not isinstance(results.get('results'), list):
+            raise ValueError(str(results_path) + '.results: expected an array')
+        seen = set()
+        for i, entry in enumerate(results['results']):
+            label = str(results_path) + '.results.' + str(i)
+            known_keys(entry, {'account', 'id', 'action', 'status', 'folder_id', 'reason', 'draft_id', 'created'}, label)
+            for k in ('account', 'id', 'action', 'status'):
+                if not isinstance(entry.get(k), str):
+                    raise ValueError(label + '.' + k + ': expected a string')
+            key = (entry['account'], entry['id'], entry['action'])
+            if key not in actions or key in seen:
+                raise ValueError(label + '.id: expected a unique action matching the plan account, id and action')
+            seen.add(key)
+            if entry['status'] not in {'executed', 'failed', 'skipped', 'unexecuted', 'unsubscribe_not_executable', 'unsubscribe_not_attempted', 'issued_unknown'}:
+                raise ValueError(label + '.status: expected executed, failed, skipped, unexecuted, unsubscribe_not_executable, unsubscribe_not_attempted or issued_unknown')
+            if entry['status'] == 'executed' and entry['action'] in {'trash', 'archive', 'move', 'spam'}:
+                executed.append(entry['account'])
+        if (not execution.path.exists() or results['results'] != execution.state['results']):
             raise ValueError(str(results_path) + ': expected results recorded by the step machine for this token and plan')
         config_path = store / 'config.toml'
         try:
@@ -1366,7 +2185,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         except ValueError as error:
             raise ValueError(str(config_path) + ': expected valid TOML: ' + str(error)) from error
         state = store / 'state.json'
-        previous = read(state) if state.exists() else {}
+        previous = recover_drafts(store, read(state) if state.exists() else {}, token)
         # Reuse the same config and saved-count validation as planning.
         try:
             validate_inputs({'accounts': {}, 'messages': []}, config, previous)
@@ -1380,12 +2199,16 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
                     counts[account] -= 1
         if any(n < 0 for n in counts.values()):
             raise ValueError(str(plan_path) + '.counts: expected at least as many observed messages as executed removals')
-        if not plan.get('reply'):
-            previous.pop('_positions', None)
+        if execution.stop_reason():
+            change = execution.state['outside_change']
+            counts[change['account']] -= len(change['ids'])
+        if 'final_listing' in execution.state:
+            counts = {a: sum(m['account'] == a for m in execution.state['final_listing']['messages']) for a in counts}
         path = store / 'quiet-check.json'
         cached = read(path) if path.exists() else {}
+        known_keys(cached, {'token', 'decision', 'positions'}, str(path))
         positions = cached.get('positions') if cached.get('token') == token else None
-        if (not plan.get('reply') and not plan['reasons'] and positions is not None and counts.keys() == config['accounts'].keys()
+        if (not execution.stop_reason() and not plan.get('reply') and not plan['reasons'] and positions is not None and counts.keys() == config['accounts'].keys()
                 and execution.path.exists()
                 and len(execution.state['results']) == len(plan['actions'])):
             validate_positions(positions, config)
@@ -1402,22 +2225,459 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
                              parts=[e | {'outcome': statuses.get((e['account'], e['id']), 'answered' if e['verb'] in {'leave', 'yes', 'no'} else 'unexecuted')} for e in plan['reply']])
                 with log.open('a', encoding='utf-8') as out:
                     out.write(json.dumps(batch, ensure_ascii=True) + '\n')
+        listing = execution.current_listing(read(store / 'inbox.json'))
+        observed = list(execution.state['results'])
+        if execution.state['pending'] is not None:
+            observed.append(execution.state['pending'] | {'status': 'issued_unknown'})
+        confirmed = dict(plan, actions=[], remaining=execution.remaining_items(listing, observed),
+                         reasons=plan['reasons'] + ([execution.stop_reason()] if execution.stop_reason() else []))
+        old = {(i['account'], i['id']): i for i in plan.get('remaining', [])}
+        for item in confirmed['remaining']:
+            item['previously_listed'] = old.get((item['account'], item['id']), {}).get('previously_listed', False)
+        records = {(d['account'], d['id']): d for d in previous.get('_drafts', [])}
+        for action, result in zip(plan['actions'], observed):
+            if action['action'] == 'create-draft' and result['status'] in {'executed', 'issued_unknown'}:
+                records[action['account'], action['id']] = dict(account=action['account'], id=action['id'], draft_id=result.get('draft_id'), rule=action['rule'], created=result.get('created', datetime.fromtimestamp(read_lock(store).get('started', read_lock(store)['created']), timezone.utc).isoformat()))
+        present = {(m['account'], m['id']) for m in listing['messages']}
+        removed = {(r['account'], r['id']) for r in observed if r['action'] in REMOVALS and r['status'] == 'executed'}
+        records = [d for key, d in records.items() if d['account'] not in listing['accounts'] or key in present - removed]
+        if records or '_drafts' in previous:
+            previous['_drafts'] = records
+        number_decisions(store, confirmed, listing)
+        language = config.get('language', 'en')
+        report = render_report(confirmed, listing, language)
+        marker = '**' + SECTION_LABELS[language]['inbox'] + '**'
+        report = report.replace(marker, '\n'.join(render_drafts(plan, read(store / 'inbox.json'), observed)) + '\n' + marker, 1)
+        (store / 'report.md').write_text(report, encoding='utf-8')
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=store, delete=False) as out:
                 temporary = Path(out.name)
-                json.dump({**previous, **counts}, out, sort_keys=True)
+                json.dump({**previous, **counts, 'version': FORMAT_VERSION}, out, sort_keys=True)
             temporary.replace(state)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
 
+TOOL_KINDS = PLAN_VERBS | {'message-read', 'profile', 'ids', 'attachments', 'labels', 'message', 'history', 'folders'}
+
+
+# Read recipes and action tools are closed per provider and call kind.
+PROVIDER_TOOLS = {
+    'gmail': {
+        'profile': {'gmail.users.getProfile'},
+        'ids': {'gmail.users.messages.list'}, 'attachments': {'gmail.users.messages.list'},
+        'labels': {'gmail.users.labels.list'}, 'message': {'gmail.users.messages.get'},
+        'message-read': {'gmail.users.messages.get'}, 'history': {'gmail.users.history.list'},
+        'trash': {'gmail.users.messages.trash'},
+        'archive': {'gmail.users.messages.modify'}, 'move': {'gmail.users.messages.modify'},
+        'spam': {'gmail.users.messages.modify'}, 'create-folder': {'gmail.users.labels.create'},
+        'create-draft': {'gmail.users.drafts.create'},
+    },
+    'outlook': {
+        'profile': {'meUser.meUserGetUser'},
+        'ids': {'meMailFolder.meMailFoldersListMessages'},
+        'folders': {'meMailFolder.meListMailFolders', 'meMailFolder.meMailFoldersListChildFolders'},
+        'message-read': {'meMessage.meGetMessages'},
+        'trash': {'meMessage.meMoveMessages'}, 'archive': {'meMessage.meMoveMessages'},
+        'move': {'meMessage.meMoveMessages'}, 'spam': {'meMessage.meMoveMessages'},
+        'create-folder': {'meMailFolder.meCreateMailFolders', 'meMailFolder.meMailFoldersCreateChildFolders'},
+        'create-draft': {'meMessage.meCreateReply', 'meMessage.meCreateForward'},
+    },
+}
+
+
+def checked_tool(config, account, kind, path):
+    fields = config.get('accounts', {}).get(account, {})
+    match = re.fullmatch(r'tools(?:\.([A-Za-z_][A-Za-z0-9_-]*)|\["([A-Za-z_][A-Za-z0-9_-]*)"\])\.([A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*)', path) if isinstance(path, str) and len(path) <= 200 else None
+    if (not match or (match[1] or match[2]) != fields.get('executor_app')
+            or kind not in TOOL_KINDS or any(word in path.casefold() for word in ('send', 'delete'))
+            or (kind != 'create-draft' and any(word in path.casefold() for word in ('reply', 'forward')))):
+        raise ValueError('tool-paths.json: expected own account app and safe tool for ' + kind)
+    tail = match[3]
+    provider = fields.get('provider')
+    if provider in PROVIDER_TOOLS and tail not in PROVIDER_TOOLS[provider].get(kind, set()):
+        raise ValueError('tool-paths.json: expected provider tool for ' + kind)
+    if kind == 'create-draft' and provider not in PROVIDER_TOOLS and not re.search(r'(?:draft.*create|create.*(?:draft|reply|forward))', tail, re.I):
+        raise ValueError('tool-paths.json: expected a draft-creating tool')
+    return 'tools.' + (match[1] or match[2]) + '.' + tail
+
+
+def validate_tool_paths(data, config, *, drop=False):
+    known_keys(data, set(data) if isinstance(data, dict) else set(), 'tool-paths.json')
+    for account, entries in list(data.items()):
+        if not isinstance(entries, dict):
+            raise ValueError('tool-paths.json: expected account tool map')
+        for kind, path in list(entries.items()):
+            try:
+                entries[kind] = checked_tool(config, account, kind, path)
+            except ValueError as error:
+                if not drop: raise
+                print('Refused: ' + str(error) + '; dropped ' + safe_text(account) + '/' + safe_text(kind), file=sys.stderr)
+                del entries[kind]
+
+
+def saved_tool(store, account, kind):
+    path = store / 'tool-paths.json'
+    data = parse_json(read_text(path), path) if path.exists() else {}
+    validate_tool_paths(data, state_config(store), drop=True)
+    tool = data.get(account, {}).get(kind)
+    return {'tool': tool} if tool else {}
+
+
+LISTING_BATCH = 50
+LISTING_PAGES = 1000
+
+
+def mail_call(fields, kind, *, page=None, id=None, parent=''):
+    gmail = fields['provider'] == 'gmail'
+    query = {}
+    path = {'userId': 'me'} if gmail else {}
+    if gmail:
+        tool = {'profile':'getProfile', 'ids':'messages.list', 'attachments':'messages.list',
+                'labels':'labels.list', 'message':'messages.get', 'history':'history.list'}[kind]
+        tool = 'gmail.users.' + tool
+        if kind in ('ids', 'attachments', 'history'):
+            query = dict(maxResults=100)
+            if kind == 'history':
+                query.update(startHistoryId=id, labelId='INBOX', historyTypes=['messageAdded', 'labelAdded'])
+            else:
+                query['labelIds'] = ['INBOX']
+            if kind == 'attachments': query['q'] = 'has:attachment'
+            if page is not None: query['pageToken'] = page
+        if kind == 'message':
+            path['id'] = id
+            query = dict(format='metadata', metadataHeaders=['From', 'Subject', 'List-Unsubscribe', 'List-Unsubscribe-Post'])
+    else:
+        tool = 'meMailFolder.' + ('meMailFoldersListMessages' if kind == 'ids' else
+                                'meMailFoldersListChildFolders' if id else 'meListMailFolders')
+        if kind == 'ids':
+            path = {'mailFolder-id':'inbox'}
+            query = {'$select':['id', 'from', 'subject', 'receivedDateTime', 'hasAttachments'],
+                     '$orderby':['receivedDateTime desc'], '$top':100, '$skip':page or 0}
+        else:
+            if id: path = {'mailFolder-id':id}
+            query = {'$select':['id', 'displayName', 'totalItemCount', 'childFolderCount'],
+                     '$top':100, '$skip':page or 0, 'includeHiddenFolders':True}
+    if not gmail and kind == 'profile':
+        tool = 'meUser.meUserGetUser'
+        path = {}
+        query = {'$select': ['mail', 'userPrincipalName']}
+    inner = {}
+    if path: inner['path'] = path
+    if query: inner['query'] = query
+    return dict(path='tools.' + fields['executor_app'] + '.' + tool,
+                input=dict(accountId=fields['executor_account'], input=inner))
+
+
+def listing_call(config, job, ids_only, store=None):
+    call = mail_call(config['accounts'][job['account']], ('ids' if job['kind']=='arrivals' else job['kind']), page=job.get('page'), id=job.get('id'))
+    if ids_only and job['kind'] == 'ids' and config['accounts'][job['account']]['provider']=='outlook':
+        call['input']['input']['query']['$select'] = ['id']
+    if store is not None:
+        saved = saved_tool(store, job['account'], 'ids' if job['kind']=='arrivals' else job['kind'])
+        if saved: call['path'] = saved['tool']
+    return call
+
+
+def listing_exchange(store, token, results=None, *, ids_only=False, accounts=None, manual_part=None):
+    """Persist issued reads before returning them; mail values remain data."""
+    import execute
+    with lock_gate(store):
+        require_lock(store, token)
+        require_fetched(store, token)
+        config, rules, holds = load_safety([store / n for n in ('config.toml','rules.toml','never-touch.toml','guardrails.md')])
+        names = list(accounts if accounts is not None else config['accounts'])
+        manual = [a for a in names if not ids_only and any('body' in r and a in r.get('accounts', []) for r in rules + holds)]
+        part = None
+        if manual:
+            if manual_part is None:
+                raise ValueError('listing: body accounts require --manual-part: ' + ', '.join(manual))
+            part = parse_json(read_text(manual_part), manual_part)
+            validate_inputs(part, config, {})
+            if set(part['accounts']) != set(manual) or any(m['account'] not in manual for m in part['messages']) or set(part.get('folders', {})) - set(manual):
+                raise ValueError('listing: manual part must contain exactly: ' + ', '.join(manual))
+            build_plan(part, rules, holds, config, {})
+        elif manual_part is not None:
+            raise ValueError('listing: no manual accounts expected')
+        names = [a for a in names if a not in manual]
+        for account in names:
+            fields = config['accounts'][account]
+            if not all(fields.get(k) for k in ('provider','executor_app','executor_account')):
+                raise ValueError('listing: ' + account + ': build the whole listing by hand; mixed listings refused')
+        filename = store / ('final-listing-exchange.json' if ids_only else 'listing-exchange.json')
+        fingerprint = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+        if filename.exists():
+            state = parse_json(read_text(filename), filename)
+        else: state = {}
+        if state.get('token') != token:
+            if results is not None: raise ValueError('listing: no pending batch')
+            state = dict(token=token, config=fingerprint, round=0, queue=[], pending=[], failed={},
+                         data={a:dict(ids=[], attachments=[], messages=[], folders=[], total=0, seen={}) for a in names})
+            for a in names:
+                for kind in (['ids'] if ids_only else ['profile','ids','attachments','labels'] if config['accounts'][a]['provider']=='gmail' else ['profile','ids','folders']):
+                    state['queue'].append(dict(account=a,kind=kind))
+        if state['config'] != fingerprint or set(state['data']) != set(names):
+            raise ValueError('listing: configuration changed')
+        if results is not None:
+            values = parse_json(read_text(results), 'listing results')
+            if not state['pending'] or not isinstance(values,list) or len(values) != len(state['pending']):
+                raise ValueError('listing: expected one result per issued call in order')
+            # A message response carries the requested ID; validate before consuming any result.
+            for job, value in zip(state['pending'], values):
+                if job['kind']=='message' and isinstance(value,dict) and value.get('ok') is True and isinstance(value.get('value'),dict) and message_id(value['value'].get('id')) and value['value']['id'] != job['id']:
+                    raise ValueError('listing: results out of order or mismatched message id')
+            for job, value in zip(state['pending'], values):
+                a, kind = job['account'], job['kind']
+                if a in state['failed']: continue
+                try:
+                    if not isinstance(value,dict) or value.get('ok') is not True or not isinstance(value.get('value'),dict): raise ValueError()
+                    consume_listing(state, job, value['value'], config, ids_only)
+                except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
+                    state['failed'][a] = kind
+            state['pending'] = []
+        if ids_only and not state['pending'] and not state['queue'] and not state.get('arrivals_checked'):
+            original = parse_json(read_text(store/'inbox.json'), 'inbox')
+            for a,d in state['data'].items():
+                if a in state['failed']: continue
+                old = {m['id'] for m in original['messages'] if m['account']==a}
+                new = [i for i in d['ids'] if i not in old]
+                d['new'] = new
+                if new:
+                    state['queue'] += ([dict(account=a,kind='message',id=i) for i in new] + [dict(account=a,kind='attachments')] if config['accounts'][a]['provider']=='gmail' else [dict(account=a,kind='arrivals')])
+            state['arrivals_checked'] = True
+        if state['pending']:
+            jobs = state['pending']
+        else:
+            state['queue'] = [j for j in state['queue'] if j['account'] not in state['failed']]
+            jobs = state['queue'][:LISTING_BATCH]
+            state['queue'] = state['queue'][LISTING_BATCH:]
+            state['pending'] = jobs
+            if jobs: state['round'] += 1
+        execute.atomic(filename, state)
+        if jobs:
+            return dict(round=state['round'], batches_remaining=(len(state['queue'])+LISTING_BATCH-1)//LISTING_BATCH,
+                        calls=[listing_call(config, j, ids_only, store) for j in jobs], failed=state['failed'])
+        listing = part or dict(accounts={},messages=[],folders={})
+        listing.setdefault('folders', {})
+        for a,d in state['data'].items():
+            if a in state['failed']: continue
+            listing['accounts'][a] = (parse_json(read_text(store/'inbox.json'), 'inbox')['accounts'][a] if ids_only else d['total'])
+            listing['folders'][a] = d['folders']
+            if ids_only:
+                original = parse_json(read_text(store/'inbox.json'), 'inbox')
+                old = {m['id']:m for m in original['messages'] if m['account']==a}
+                for m in d['messages']:
+                    if config['accounts'][a]['provider']=='gmail': m['has_attachment'] = m['id'] in d['attachments']
+                    old[m['id']] = m
+                if any(i not in old for i in d['ids']):
+                    raise ValueError('final: arrival fields missing for ' + a)
+                listing['messages'] += [old[i] for i in d['ids']]
+            else:
+                for m in d['messages']:
+                    if config['accounts'][a]['provider']=='gmail': m['has_attachment'] = m['id'] in d['attachments']
+                listing['messages'] += d['messages']
+        validate_inputs(listing, config, {})
+        execute.atomic(store / ('final-inbox.json' if ids_only else 'inbox.json'), listing)
+        return dict(done=True, counts={a:len(d['ids']) for a,d in state['data'].items() if a not in state['failed']}, failed=state['failed'])
+
+
+def outlook_identity(value, fields):
+    address = fields.get('address')
+    if not address or not any(isinstance(value.get(k), str) and value[k].casefold() == address.casefold() for k in ('mail', 'userPrincipalName')):
+        raise ValueError('Outlook identity mismatch or missing address')
+
+
+def consume_listing(state, job, value, config, ids_only):
+    a, kind = job['account'], job['kind']
+    d = state['data'][a]
+    gmail = config['accounts'][a]['provider']=='gmail'
+    def integer(v):
+        if type(v) is not int or v < 0: raise ValueError()
+        return v
+    def string(v):
+        if not isinstance(v,str): raise ValueError()
+        return v
+    def identifier(v):
+        if not message_id(v): raise ValueError()
+        return v
+    def enqueue(**kw): state['queue'].append(dict(account=a, **kw))
+    if kind == 'arrivals':
+        fresh = dict(account=a,kind='ids', **({'page':job['page']} if 'page' in job else {}))
+        temp = dict(data={a:dict(ids=[],attachments=[],messages=[],folders=[],total=0,seen=d.setdefault('arrival_seen',{}))},queue=[])
+        consume_listing(temp, fresh, value, config, False)
+        d['messages'] += [m for m in temp['data'][a]['messages'] if m['id'] in d['new']]
+        state['queue'] += [dict(j,kind='arrivals') for j in temp['queue']]
+        return
+    if kind == 'profile' and not gmail:
+        outlook_identity(value, config['accounts'][a])
+        return
+    if kind == 'profile':
+        d['total'] = integer(value['messagesTotal'])
+        if 'address' in config['accounts'][a] and value.get('emailAddress','').casefold() != config['accounts'][a]['address'].casefold(): raise ValueError()
+        return
+    if kind == 'message':
+        if identifier(value['id']) != job['id']: raise ValueError()
+        if 'INBOX' not in value.get('labelIds', []):
+            return
+        headers = value['payload']['headers']
+        if not isinstance(headers,list): raise ValueError()
+        h = {}
+        for entry in headers:
+            name, text = string(entry['name']).lower(), string(entry['value'])
+            if name in h: raise ValueError()
+            h[name] = text
+        if not isinstance(value['internalDate'],str) or not re.fullmatch(r'[0-9]{1,16}',value['internalDate']): raise ValueError()
+        m = dict(account=a,id=job['id'],folder='Inbox',sender=h.get('from', ''),subject=h.get('subject') or '',
+                 date=datetime.fromtimestamp(int(value['internalDate'])/1000,timezone.utc).isoformat(),
+                 unsubscribe_one_click=h.get('list-unsubscribe-post','').strip().casefold()=='list-unsubscribe=one-click')
+        urls = re.findall(r'<(https://[^<>\s]+)>',h.get('list-unsubscribe',''),re.I)
+        if urls: m['unsubscribe_url'] = urls[0]
+        validate_inputs(dict(accounts={a:d['total']},messages=[m]),config,{})
+        d['messages'].append(m)
+        return
+    key = 'labels' if kind=='labels' else 'messages' if gmail else 'value'
+    rows = value[key]
+    if not isinstance(rows,list): raise ValueError()
+    if kind=='labels':
+        for row in rows:
+            identifier(row['id']); string(row['name'])
+            if row['type'] not in ('user','system'): raise ValueError()
+            if row['type']=='user': d['folders'].append(dict(id=row['id'],name=row['name']))
+        return
+    seen_key = kind + ':' + job.get('id','')
+    seen = d['seen'].setdefault(seen_key,[])
+    marker = job.get('page','first')
+    if marker in seen or len(seen)>=LISTING_PAGES: raise ValueError()
+    seen.append(marker)
+    for row in rows:
+        ident = identifier(row['id'])
+        if kind in ('ids','attachments'):
+            target = d['attachments'] if kind=='attachments' else d['ids']
+            if ident in target: raise ValueError()
+            target.append(ident)
+            if kind=='ids' and not ids_only:
+                if gmail: enqueue(kind='message',id=ident)
+                else:
+                    sender = row['from']['emailAddress']
+                    address = string(sender['address'])
+                    name = string(sender.get('name',''))
+                    if type(row['hasAttachments']) is not bool: raise ValueError()
+                    m = dict(account=a,id=ident,folder='Inbox',sender=('"' + quote(name) + '" <' + address + '>') if name else address,
+                             subject=string(row.get('subject') or ''),date=string(row['receivedDateTime']),has_attachment=row['hasAttachments'])
+                    validate_inputs(dict(accounts={a:0},messages=[m]),config,{})
+                    d['messages'].append(m)
+        else:
+            if any(f['id']==ident for f in d['folders']): raise ValueError()
+            name = string(row['displayName'])
+            full = job.get('parent','') + name
+            try:
+                folder_path(full)
+            except ValueError:
+                pass
+            else:
+                d['folders'].append(dict(id=ident,name=full))
+            d['total'] += integer(row['totalItemCount'])
+            if integer(row['childFolderCount']): enqueue(kind='folders',id=ident,parent=full+'/')
+    page = value.get('nextPageToken') if gmail else (job.get('page',0)+100 if len(rows)==100 else None)
+    if page is not None:
+        if gmail and (not isinstance(page,str) or not page or page in seen): raise ValueError()
+        if len(seen)>=LISTING_PAGES: raise ValueError()
+        enqueue(**{k:v for k,v in job.items() if k!='account' and k!='page'},page=page)
+
+
+def quiet_gateway(store, token, config, previous, results=None):
+    import execute
+    path = store/'quiet-gateway.json'
+    state = parse_json(read_text(path),path) if path.exists() else {}
+    if state.get('token') != token:
+        if results is not None: raise ValueError('quiet-check: no pending batch')
+        state = dict(token=token,round=0,queue=[],pending=[],observations={},seen={})
+        for a,f in config['accounts'].items():
+            if not all(f.get(k) for k in ('provider','executor_app','executor_account')):
+                raise ValueError('quiet-check: mixed providers require manual observations')
+            kind = 'profile' if f['provider']=='gmail' else 'ids'
+            if f['provider'] == 'outlook': state['queue'].append(dict(account=a,kind='profile'))
+            state['queue'].append(dict(account=a,kind=kind))
+            if kind=='profile' and a in previous.get('_positions',{}):
+                state['queue'].append(dict(account=a,kind='history',id=previous['_positions'][a]))
+            state['observations'][a] = dict(outcome='ok',position=None,arrivals=[]) if kind=='profile' else dict(outcome='ok',ids=[])
+    if results is not None:
+        values=parse_json(read_text(results),'quiet results')
+        if not state['pending'] or not isinstance(values,list) or len(values)!=len(state['pending']): raise ValueError('quiet-check: expected results in issued order')
+        for j,v in zip(state['pending'],values):
+            a=j['account']; entry=state['observations'][a]
+            try:
+                if v['ok'] is not True: raise ValueError()
+                value=v['value']
+                if j['kind']=='profile' and config['accounts'][a]['provider']=='outlook':
+                    outlook_identity(value, config['accounts'][a])
+                elif j['kind']=='profile':
+                    pos=value['historyId']
+                    if not isinstance(pos,str) or not pos.isascii() or not pos.isdigit(): raise ValueError()
+                    entry['position']=pos
+                elif j['kind']=='ids':
+                    rows=value['value']
+                    if not isinstance(rows,list) or len(rows)>NEWEST_IDS: raise ValueError()
+                    ids=[r['id'] for r in rows]
+                    if len(set(ids))!=len(ids) or any(not message_id(i) for i in ids): raise ValueError()
+                    entry['ids']=ids
+                else:
+                    rows=value['history']
+                    if not isinstance(rows,list): raise ValueError()
+                    for h in rows:
+                        for k in ('messagesAdded','labelsAdded'):
+                            for event in h.get(k,[]):
+                                m=event['message']; ident=m['id']
+                                if not message_id(ident): raise ValueError()
+                                if 'INBOX' in event.get('labelIds',m.get('labelIds',[])) and ident not in entry['arrivals']: entry['arrivals'].append(ident)
+                    page=value.get('nextPageToken')
+                    seen=state['seen'].setdefault(a,[])
+                    if page is not None:
+                        if not isinstance(page,str) or not page or page in seen or len(seen)>=LISTING_PAGES: raise ValueError()
+                        seen.append(page); state['queue'].append(j|dict(page=page))
+            except (ValueError,TypeError,KeyError,AttributeError):
+                entry['outcome']='error'
+                print('Quiet check: '+safe_text(a)+': failed '+j['kind']+'; full run',file=sys.stderr)
+        state['pending']=[]
+    if not state['pending']:
+        state['pending']=state['queue'][:LISTING_BATCH];state['queue']=state['queue'][LISTING_BATCH:]
+        if state['pending']: state['round']+=1
+    execute.atomic(path,state)
+    if not state['pending']:
+        observation=store/'quiet-observation.json'
+        execute.atomic(observation,state['observations'])
+        return observation
+    calls=[]
+    for j in state['pending']:
+        call=mail_call(config['accounts'][j['account']],j['kind'],page=j.get('page'),id=j.get('id'))
+        if j['kind']=='ids':
+            call['input']['input']['query'].update({'$select':['id'],'$top':NEWEST_IDS})
+        calls.append(call)
+    return dict(calls=calls,round=state['round'],batches_remaining=(len(state['queue'])+LISTING_BATCH-1)//LISTING_BATCH)
+
+
 def main(argv=None, *, now=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('validate', allow_abbrev=False)
+    for name in ('tool-save', 'tool-show', 'tool-drop'):
+        tool = sub.add_parser(name, allow_abbrev=False)
+        if name != 'tool-show':
+            tool.add_argument('--token', required=True)
+            tool.add_argument('--account', required=True)
+            tool.add_argument('--kind', required=True, choices=sorted(TOOL_KINDS))
+        if name == 'tool-save': tool.add_argument('--tool', required=True)
+    sub.add_parser('setup', allow_abbrev=False)
+    converter = sub.add_parser('convert-rules', allow_abbrev=False)
+    for flag in ('table', 'scopes', 'out', 'review'):
+        converter.add_argument('--' + flag, required=flag != 'review')
     lock = sub.add_parser('lock', allow_abbrev=False)
     lock.add_argument('--observation')
+    lock.add_argument('--batch', action='store_true')
+    lock.add_argument('--refresh', action='store_true')
+    lock.add_argument('--token')
     for name in ('release', 'check'):
         command = sub.add_parser(name)
         command.add_argument('--token', required=True)
@@ -1428,32 +2688,114 @@ def main(argv=None, *, now=None):
         command.add_argument('--token', required=True)
         command.add_argument('--observation')
         command.add_argument('--lock-observation')
+    finish = sub.add_parser('finish-run', allow_abbrev=False)
+    finish.add_argument('--token', required=True)
+    finish.add_argument('--plan')
+    finish.add_argument('--observation')
     commit = sub.add_parser('commit-state', allow_abbrev=False)
     commit.add_argument('--token', required=True)
     commit.add_argument('--plan', required=True)
     commit.add_argument('--results')
     commit.add_argument('--lock-observation')
+    message = sub.add_parser('message', allow_abbrev=False)
+    message.add_argument('--token', required=True)
+    message.add_argument('--plan', required=True)
+    message.add_argument('--results')
+    listing = sub.add_parser('listing', allow_abbrev=False)
+    listing.add_argument('--token', required=True)
+    listing.add_argument('--results')
+    listing.add_argument('--manual-part')
+    listing.add_argument('--ids-only', action='store_true')
     quiet = sub.add_parser('quiet-check', allow_abbrev=False)
     quiet.add_argument('--token', required=True)
     quiet.add_argument('--observation')
+    quiet.add_argument('--results')
     quiet.add_argument('--scheduled', action='store_true')
     for command_name in ('plan', 'reply'):
         plan = sub.add_parser(command_name, allow_abbrev=False)
+        if command_name == 'plan':
+            plan.add_argument('--dry-run', action='store_true')
+            plan.add_argument('--calendar')
         if command_name == 'reply':
             plan.add_argument('--reply', required=True)
         plan.add_argument('--token', required=True)
         plan.add_argument('--inbox', required=True)
         plan.add_argument('--scheduled', action='store_true')
-        plan.add_argument('--first-run', action='store_true', help='Allow a missing state file on the first run')
         for name in ('config', 'rules', 'never-touch', 'guardrails', 'plan-out', 'report-out'):
             plan.add_argument('--' + name)
     args = parser.parse_args(argv)
     for name in ('inbox', 'config', 'rules', 'never_touch', 'guardrails', 'plan_out', 'report_out', 'plan', 'results', 'reply'):
         if getattr(args, name, None) == '':
             raise ValueError('--' + name.replace('_', '-') + ': expected a non-empty path')
+    if args.command == 'convert-rules':
+        convert_rules(args.table, args.scopes, args.out, args.review)
+        return
+    if args.command == 'setup':
+        store = private_store(output=True)
+        examples = {'config.toml': 'config/config.example.toml',
+                    'guardrails.md': 'config/guardrails.example.md',
+                    'rules.toml': 'rules/rules.example.toml',
+                    'never-touch.toml': 'rules/never-touch.example.toml'}
+        for name in examples:
+            if (store / name).exists() or (store / name).is_symlink():
+                raise ValueError(str(store / name) + ': expected no existing setup file')
+        root = Path(__file__).resolve().parents[1]
+        contents = {name: read_text(root / source) for name, source in examples.items()}
+        store.mkdir(parents=True, exist_ok=True, mode=0o700)
+        store.chmod(0o700)
+        for name, content in contents.items():
+            with (store / name).open('x', encoding='utf-8') as out:
+                os.chmod(out.name, 0o600)
+                out.write(content)
+        print(str(store) + ': next run python3 scripts/triage.py validate')
+        return
     store = private_store()
-    if args.command == 'lock':
-        result = drive_lock(store, 'acquire', observation=args.observation, now=now) if store_lock_setting(store)['kind'] == 'onedrive' else acquire(store)
+    if args.command in ('tool-save', 'tool-show', 'tool-drop'):
+        import execute
+        with lock_gate(store):
+            config = state_config(store)
+            path = store / 'tool-paths.json'
+            data = parse_json(read_text(path), path) if path.exists() else {}
+            validate_tool_paths(data, config, drop=True)
+            if args.command != 'tool-show':
+                require_lock(store, args.token)
+                require_fetched(store, args.token)
+                if args.command == 'tool-save' and args.account not in config['accounts']: raise ValueError('tool account: expected configured handle')
+                if args.command == 'tool-save':
+                    data.setdefault(args.account, {})[args.kind] = args.tool
+                else:
+                    data.get(args.account, {}).pop(args.kind, None)
+                validate_tool_paths(data, config)
+                execute.atomic(path, data)
+            print(json.dumps(data, sort_keys=True))
+    elif args.command == 'validate':
+        config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')])
+        state_path = store / 'state.json'
+        if state_path.exists():
+            validate_inputs(dict(accounts={},messages=[]),config,parse_json(read_text(state_path),state_path))
+        print(f'version: {config.get("version", FORMAT_VERSION)}')
+        for account, fields in config['accounts'].items():
+            available = all(fields.get(k) for k in ('provider', 'executor_app', 'executor_account'))
+            manual = any('body' in r and account in r.get('accounts', []) for r in rules + holds)
+            print(account + ': scripted listing ' + ('manual part required' if manual else 'available' if available else 'unavailable'))
+        print(f'switched off: {sum(not r.get("enabled", True) for r in rules)}')
+        print(f'ok: {len(config["accounts"])} accounts, {len(rules)} rules, {len(holds)} never-touch entries')
+        failures, count = rule_cases(store, config, rules, holds)
+        for failure in failures: print(failure)
+        print(f'cases: {count}, failed: {len(failures)}')
+        if failures: return 1
+    elif args.command == 'lock':
+        if args.batch and args.refresh:
+            raise ValueError('--batch: use acquisition only')
+        if args.refresh and not args.token:
+            raise ValueError('--refresh: expected --token of the holder')
+        if args.token and not args.refresh:
+            raise ValueError('--token: requires --refresh')
+        if args.batch and store_lock_setting(store)['kind'] == 'onedrive':
+            result = batch_lock(store, args.observation, now=now)
+            print(json.dumps(result, sort_keys=True) if isinstance(result, dict) else result)
+            return
+        result = drive_lock(store, 'refresh' if args.refresh else 'acquire', args.token, args.observation, now=now) if store_lock_setting(store)['kind'] == 'onedrive' else (refresh(store, args.token, now=now) if args.refresh else acquire(store))
         print(json.dumps(result, sort_keys=True) if isinstance(result, dict) else result)
     elif args.command == 'release':
         result = drive_lock(store, 'release', args.token, args.observation, now=now) if store_lock_setting(store)['kind'] == 'onedrive' else release(store, args.token)
@@ -1464,13 +2806,22 @@ def main(argv=None, *, now=None):
         print('Lock is held and unexpired')
     elif args.command in ('fetch-state', 'send-state'):
         print(json.dumps(drive_state(store, 'fetch' if args.command == 'fetch-state' else 'send', args.token, args.observation, lock_observation=args.lock_observation, now=now), sort_keys=True))
+    elif args.command == 'finish-run':
+        print(json.dumps(finish_run(store, args.token, args.plan, args.observation, now=now), ensure_ascii=True))
     elif args.command == 'commit-state':
+        if parse_json(load_inputs([args.plan])[0], args.plan).get('dry_run'):
+            raise ValueError('dry-run plan: commit-state is refused')
         if store_lock_setting(store)['kind'] == 'onedrive':
             result = drive_lock(store, 'commit', args.token, args.lock_observation, now=now)
             if isinstance(result, dict):
                 print(json.dumps(result, sort_keys=True))
                 return
         commit_state(store, args.token, args.plan, args.results, now=now, lock_verified=True)
+    elif args.command == 'message':
+        with lock_gate(store):
+            print(render_message(store, args.token, args.plan, args.results, now=now), end='')
+    elif args.command == 'listing':
+        print(json.dumps(listing_exchange(store, args.token, args.results, ids_only=args.ids_only, manual_part=args.manual_part), ensure_ascii=True))
     elif args.command == 'quiet-check':
         with lock_gate(store):
             require_lock(store, args.token)
@@ -1484,22 +2835,30 @@ def main(argv=None, *, now=None):
             except ValueError as error:
                 raise ValueError(str(config_path) + ': ' + str(error)) from error
             now = now or datetime.now(timezone.utc)
-            if args.observation is None:
+            if args.results is not None or (args.observation is None and all(f.get('provider') for f in config['accounts'].values())):
+                result = quiet_gateway(store, args.token, config, previous, args.results)
+                if isinstance(result, dict):
+                    print(json.dumps(result, ensure_ascii=True))
+                else:
+                    print(json.dumps(quiet_check(store, config, previous, result, args.scheduled, now), sort_keys=True))
+            elif args.observation is None:
                 reads = {}
                 for account, fields in config['accounts'].items():
-                    if fields.get('quiet_kind', 'ids') == 'history':
+                    if fields.get('quiet_kind', 'history' if fields.get('provider')=='gmail' else 'ids') == 'history':
                         reads[account] = {'read': 'Inbox arrivals since saved position and current position',
                                           'since': previous.get('_positions', {}).get(account)}
                         if reads[account]['since'] is None:
                             reads[account]['read'] = 'current position only'
                     else:
                         reads[account] = {'read': 'newest Inbox ids in newest-first order', 'limit': NEWEST_IDS}
+                for account in reads:
+                    reads[account].update(gateway_account(config, account))
                 print(json.dumps({'reads': reads}, sort_keys=True))
             else:
                 print(json.dumps(quiet_check(store, config, previous, args.observation, args.scheduled, now), sort_keys=True))
     else:
         sources = [getattr(args, n.replace('-', '_')) or store / (n + ('.md' if n == 'guardrails' else '.toml')) for n in ('config', 'rules', 'never-touch', 'guardrails')]
-        protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'numbers.json', 'reply.json', 'reply.txt', 'decisions.jsonl', 'history.log', 'run-message.md', 'quiet-observation.json', 'positions-observation.json', 'quiet-check.json', 'lock-exchange.json', 'lock-observation.json', 'lock-commit-observation.json', 'state-exchange.json', 'state-incoming', 'state-outgoing', 'state-observation.json', 'upload-observation.json', 'state-lock-observation.json', 'inbox.json', 'config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')}
+        protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'numbers.json', 'reply.json', 'reply.txt', 'decisions.jsonl', 'history.log', 'run-message.md', 'quiet-observation.json', 'positions-observation.json', 'quiet-check.json', 'lock-exchange.json', 'lock-observation.json', 'lock-commit-observation.json', 'state-exchange.json', 'finish-exchange.json', 'final-inbox.json', 'state-incoming', 'state-outgoing', 'state-observation.json', 'upload-observation.json', 'state-lock-observation.json', 'tool-paths.json', 'cases.toml', 'inbox.json', 'config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')}
         if args.command == 'reply':
             protected.add(Path(args.reply).resolve())
         protected = {p.resolve() for p in protected}
@@ -1517,15 +2876,7 @@ def main(argv=None, *, now=None):
             with lock_gate(store):
                 require_lock(store, args.token)
                 require_fetched(store, args.token)
-                texts = load_inputs(sources)
-                parsed = []
-                for name, text, parse in zip(('config', 'rules', 'never-touch'), texts, (tomllib.loads, parse_rules, lambda t: parse_rules(t, protection=True))):
-                    path = getattr(args, name.replace('-', '_')) or store / (name + '.toml')
-                    try:
-                        parsed.append(parse_toml(text, path) if name == 'config' else parse(text))
-                    except ValueError as error:
-                        raise ValueError(str(path) + ': ' + str(error)) from error
-                config, rules, holds = parsed
+                config, rules, holds = load_safety(sources)
                 try:
                     listing = json.loads(load_inputs([args.inbox])[0])
                 except ValueError as error:
@@ -1537,12 +2888,14 @@ def main(argv=None, *, now=None):
                     raise ValueError(str(state) + ': expected a JSON account-count object') from error
                 if not isinstance(previous, dict):
                     raise ValueError(str(state) + ': expected account keys and non-negative integer counts')
+                previous = recover_drafts(store, previous, args.token)
                 for account, count in previous.items():
-                    if account == '_positions':
+                    if account in {'version', '_positions', '_drafts'}:
                         continue
                     if type(count) is not int or count < 0:
                         raise ValueError(str(state) + ': state.json.' + account + ': expected a non-negative integer count')
-                stops = ['Missing state; use --first-run only for an explicit first run'] if not state.exists() and not args.first_run else []
+                first_run = not state.exists() and not any((store / name).exists() for name in ('numbers.json', *LOG_NAMES))
+                stops = ['Missing state; prior run records exist'] if not state.exists() and not first_run else []
                 try:
                     result = build_plan(listing, rules, holds, config, previous, stops)
                 except ValueError as error:
@@ -1571,9 +2924,17 @@ def main(argv=None, *, now=None):
                         import execute
                         execute.atomic(store / 'reply.json', dict(token=args.token, parts=parts))
                     except ValueError as error:
-                        result = build_plan(listing, [], holds, config, previous, ['Reply refused: ' + ' '.join(str(error).split())])
-                number_decisions(store, result, listing)
-                result['first_run'] = args.first_run
+                        refusal = str(error)
+                        result = build_plan(listing, [], holds, config, previous, ['Reply refused: ' + ' '.join(refusal.split())])
+                if args.command == 'plan' and config.get('calendars'):
+                    data = parse_json(load_inputs([args.calendar])[0], args.calendar) if args.calendar else {}
+                    result['calendar_section'] = calendar_section(data, config, now or datetime.now(timezone.utc))
+                if getattr(args, 'dry_run', False):
+                    result['dry_run'] = True
+                else:
+                    number_decisions(store, result, listing)
+                result['first_run'] = first_run
+                if args.scheduled: result['scheduled'] = True
                 report = render_report(result, listing, config.get('language', 'en'))
                 if args.scheduled and 'schedule' in config:
                     now = now or datetime.now(timezone.utc)
@@ -1595,7 +2956,7 @@ def main(argv=None, *, now=None):
                 outputs = []
                 temporary = []
                 try:
-                    for name, content in ((args.plan_out, payload), (args.report_out, report)):
+                    for name, content in ((args.plan_out, payload), (None if getattr(args, 'dry_run', False) else args.report_out, report)):
                         if name is None:
                             continue
                         destination = private_store(name, output=True)
@@ -1620,7 +2981,7 @@ def main(argv=None, *, now=None):
                     for source in temporary:
                         source.unlink(missing_ok=True)
         except Exception:
-            for name in (args.plan_out, args.report_out):
+            for name in (args.plan_out, None if getattr(args, 'dry_run', False) else args.report_out):
                 if name:
                     try:
                         destination = private_store(name, output=True)
@@ -1637,7 +2998,10 @@ def main(argv=None, *, now=None):
 
 if __name__ == '__main__':
     try:
-        main()
+        sys.exit(main())
+    except (AttributeError, IndexError, StopIteration) as error:
+        print('Refused: malformed input file: expected complete records with valid field types (' + type(error).__name__ + ')', file=sys.stderr)
+        sys.exit(1)
     except (ValueError, OSError, KeyError, TypeError, RecursionError) as error:
         print('Refused: ' + ' '.join(str(error).split()), file=sys.stderr)
         sys.exit(1)

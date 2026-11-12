@@ -9,6 +9,76 @@ git clone --quiet --no-hardlinks "$source_repo" "$scratch/clone"
 git -C "$source_repo" diff HEAD --binary > "$scratch/candidate.patch"
 git -C "$scratch/clone" apply --allow-empty "$scratch/candidate.patch"
 cd "$scratch/clone"
+# Scripted routine: quickstart commands only after setup and validate.
+WALK_STORE="$scratch/scripted" python3 - <<'PYSCRIPTED'
+import json, os, re, subprocess, sys
+from pathlib import Path
+sys.path.insert(0,'tests')
+from mock_provider import MockGateway
+store=Path(os.environ['WALK_STORE'])
+env={'PATH':os.environ['PATH'],'PIGEON_HOME':str(store)}
+def cli(*args):
+    p=subprocess.run(['python3',*args],env=env,capture_output=True,text=True)
+    assert p.returncode==0,(args,p.stderr)
+    return p.stdout.strip()
+cli('scripts/triage.py','setup')
+config={'accounts':{a:dict(provider=p,address='reader@example.org',quiet_kind=k,executor_app=a+'-mail',executor_account=a+'-example') for a,p,k in [('cedar','gmail','history'),('marble','outlook','ids')]}}
+(store/'config.toml').write_text('inbox_limit=200\n'+'\n'.join('[accounts.'+a+']\n'+'\n'.join(k+'='+json.dumps(v) for k,v in f.items()) for a,f in config['accounts'].items()))
+(store/'rules.toml').write_text('[[rules]]\nid="file"\naccounts=["cedar","marble"]\nsubject="Weekly"\naction="archive"\n')
+(store/'never-touch.toml').write_text('allow_empty=true\n')
+cli('scripts/triage.py','validate')
+text=Path('docs/quickstart.md').read_text()
+blocks=re.findall(r'```bash\n(.*?)\n```',text,re.S)
+def run(command,token=''):
+    command=command.replace('/absolute/private-store',str(store)).replace('TOKEN',token).replace(' --batch','').replace(' --scheduled','')
+    p=subprocess.run(['bash','-eu','-c',command],env={'PATH':os.environ['PATH']},capture_output=True,text=True)
+    assert p.returncode==0,(command,p.stderr)
+    return p.stdout.strip()
+listing=dict(accounts={'cedar':1000,'marble':1000},folders={a:[dict(id='reading',name='Reading')] for a in config['accounts']},messages=[])
+for a in config['accounts']:
+    for i in range(40):
+        m=dict(account=a,id='item-'+str(i),folder='Inbox',sender='reader@example.org',subject='Weekly' if i==0 else 'Question',date='2026-03-01T00:00:00+00:00',has_attachment=False)
+        if a=='cedar':m['unsubscribe_one_click']=False
+        listing['messages'].append(m)
+gateway=MockGateway(listing,config)
+token=run(blocks[0]); assert json.loads(run(blocks[2],token))['done']
+q=json.loads(run(blocks[5],token))
+while 'calls' in q:
+    (store/'gateway-results.json').write_text(json.dumps(gateway.batch(q['calls'])))
+    q=json.loads(run(blocks[5]+' --results /absolute/private-store/gateway-results.json',token))
+assert q['decision']=='full'
+commands=re.findall(r'`(PIGEON_HOME=[^`]*triage.py listing[^`]*)`',text)
+result=json.loads(run(commands[0],token))
+listing_exchanges=0
+while 'calls' in result:
+    listing_exchanges+=1
+    (store/'gateway-results.json').write_text(json.dumps(gateway.batch(result['calls'])))
+    result=json.loads(run(commands[1],token))
+assert result['counts']=={'cedar':40,'marble':40}
+assert listing_exchanges==2,listing_exchanges
+run(blocks[7],token)
+while True:
+    action=json.loads(run(blocks[8],token))
+    if 'final_reads' in action:
+        cmd=re.search(r'`(PIGEON_HOME=[^`]+execute.py final --token TOKEN --plan [^`]+)`',text).group(1)
+        result=json.loads(run(cmd,token))
+        while 'calls' in result:
+            (store/'gateway-results.json').write_text(json.dumps(gateway.batch(result['calls'])))
+            result=json.loads(run(cmd+' --results /absolute/private-store/gateway-results.json',token))
+        assert result['done']; break
+    if action.get('done'):break
+    listing['messages'][:]=[m for m in listing['messages'] if (m['account'],m['id'])!=(action['account'],action['id'])]
+    result=blocks[9].replace('{"outcome":"ok","inbox_ids":["id-2","id-3"]}','{"outcome":"ok","in_inbox":false}')
+    assert json.loads(run(result,token))['status']=='executed'
+run(blocks[10],token)
+message=run(blocks[11],token)
+assert '2 handled' in message and 'Still in Inbox' in message
+run(re.search(r'`(rm -f [^`]+run-message\.md)`',text).group(1),token)
+assert not (store/'run-message.md').exists()
+assert json.loads(run(blocks[12],token))['done']
+assert run(blocks[13],token)=='released'
+print('PASS: fresh-shell scripted routine from quickstart through final IDs, commit, message and release; two mixed-provider listing exchanges for 40 messages each')
+PYSCRIPTED
 export PIGEON_HOME="$PWD/private/demo"
 python3 - <<'PY' > "$scratch/quick-start.sh"
 from pathlib import Path
@@ -19,7 +89,129 @@ PY
 env -i PATH="$PATH" bash "$scratch/quick-start.sh" > "$scratch/output"
 cmp "$PIGEON_HOME/report.md" tests/fixtures/expected-report.md
 test ! -e "$PIGEON_HOME/run.lock"
-# Execute the published AGENTS command blocks in separate empty environments.
+# Routine fixture run reads commands only from the hosted quick start.
+WALK_STORE="$PWD/private/routine" python3 - <<'PYROUTINE'
+import json, os, re, subprocess
+from pathlib import Path
+store = Path(os.environ['WALK_STORE'])
+# Installation commands from README precede the routine run.
+for command in ('setup', 'validate'):
+    subprocess.run(['env', '-i', 'PATH='+os.environ['PATH'], 'PIGEON_HOME='+str(store),
+                    'python3', 'scripts/triage.py', command], check=True)
+blocks = re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)
+def run(index, token='', observation=None):
+    command = blocks[index].replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --batch', '').replace(' --scheduled', '')
+    if observation is not None:
+        command = command.replace('{"outcome":"ok","inbox_ids":["id-2","id-3"]}', json.dumps(observation))
+    result = subprocess.run(['env', '-i', 'PATH='+os.environ['PATH'], 'bash', '-eu', '-c', command], capture_output=True, text=True)
+    assert result.returncode == 0, (command, result.stderr)
+    return result.stdout.strip()
+token = run(0)
+assert json.loads(run(2, token)) == {'done': True}
+run(4)
+assert 'reads' in json.loads(run(5, token))
+(store/'quiet-observation.json').write_text(json.dumps({'cedar': {'outcome':'ok','ids':[]}, 'marble': {'outcome':'ok','ids':[]}}))
+command=blocks[6].replace('--results /absolute/private-store/gateway-results.json', '--observation /absolute/private-store/quiet-observation.json')
+blocks[6]=command
+assert json.loads(run(6, token))['decision'] == 'full'
+listing = json.loads(Path('tests/fixtures/inbox.json').read_text())
+(store/'inbox.json').write_text(json.dumps(listing))
+run(7, token)
+ids = {a:[m['id'] for m in listing['messages'] if m['account']==a] for a in listing['accounts']}
+while True:
+    call = json.loads(run(8, token))
+    if call.get('done'):
+        assert 'stop' not in call
+        break
+    assert call['action'] in ('trash','archive')
+    ids[call['account']].remove(call['id'])
+    assert json.loads(run(9, token, {'outcome':'ok','inbox_ids':ids[call['account']]}))['status'] == 'executed'
+run(10, token)
+message = run(11, token)
+assert '📬 Triage' in message and 'Still in Inbox (by account)' in message
+assert '2 handled' in message
+assert json.loads(run(12, token)) == {'done':True}
+assert run(13, token) == 'released'
+assert not (store/'run.lock').exists()
+print('PASS: routine quickstart only, fixtures, each command in a fresh shell, through final message and release')
+PYROUTINE
+# Batch drive routine: dry then real, every command in a fresh shell.
+WALK_STORE="$scratch/batch-walk" python3 - <<'PYBATCH'
+import json, os, re, subprocess, sys
+from pathlib import Path
+from datetime import datetime, timezone
+sys.path.insert(0, 'tests')
+from mock_provider import MockDrive
+store = Path(os.environ['WALK_STORE'])
+drive = MockDrive(datetime.now(timezone.utc).isoformat())
+for command in ('setup', 'validate'):
+    subprocess.run(['env', '-i', 'PATH='+os.environ['PATH'], 'PIGEON_HOME='+str(store), 'python3', 'scripts/triage.py', command], check=True, capture_output=True)
+with (store/'config.toml').open('a') as out:
+    out.write('\n[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n[state]\nkind="gdrive"\naccount="state-example"\nfolder="files-example"\n')
+text = Path('docs/quickstart.md').read_text()
+blocks = re.findall(r'```bash\n(.*?)\n```', text, re.S)
+
+def run(command, token=''):
+    command = command.replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --scheduled', '')
+    result = subprocess.run(['env', '-i', 'PATH='+os.environ['PATH'], 'bash', '-eu', '-c', command], capture_output=True, text=True)
+    assert result.returncode == 0, (command, result.stderr)
+    return result.stdout.strip()
+def observed(command, value, token='', name='lock-observation.json'):
+    (store/name).write_text(json.dumps(value))
+    return run(command, token)
+original = json.loads(Path('tests/fixtures/inbox.json').read_text())
+for dry in (True, False):
+    lock_calls = json.loads(run(blocks[0]))['calls']
+    token = observed(blocks[1], dict(create=drive.perform(lock_calls[0]), read=drive.perform(lock_calls[1])))
+    downloads = json.loads(run(blocks[2], token))['calls']
+    outcomes = {c['name']: drive.file_call(c)['status'] for c in downloads}
+    assert json.loads(observed(blocks[3], outcomes, token, 'state-observation.json'))['done']
+    (store/'inbox.json').write_text(json.dumps(original))
+    before = {n: (store/n).read_bytes() if (store/n).exists() else None for n in ('state.json','numbers.json','calls.jsonl','history.log','decisions.jsonl')}
+    run(blocks[7] + (' --dry-run' if dry else ''), token)
+    plan = json.loads((store/'plan.json').read_text())
+    assert plan['first_run']
+    if dry:
+        rehearsal = plan['actions']
+        message = run(blocks[11].split(' --results')[0], token)
+        assert message.startswith('Dry run') and 'would' in message
+        assert all(((store/n).read_bytes() if (store/n).exists() else None) == raw for n,raw in before.items())
+        call = json.loads(run(blocks[13], token))['call']
+        observed(blocks[13]+' --observation /absolute/private-store/lock-observation.json', drive.perform(call), token)
+        continue
+    assert plan['actions'] == rehearsal
+    remaining = json.loads(json.dumps(original))
+    while True:
+        call = json.loads(run(blocks[8], token))
+        if 'final_reads' in call:
+            (store/'final-inbox.json').write_text(json.dumps(remaining))
+            final = re.search(r'`(PIGEON_HOME=[^`]*execute.py final[^`]* --inbox [^`]*)`', text).group(1)
+            run(final, token)
+            break
+        if call.get('done'): break
+        remaining['messages'] = [m for m in remaining['messages'] if (m['account'],m['id']) != (call['account'],call['id'])]
+        result = blocks[9].replace('{"outcome":"ok","inbox_ids":["id-2","id-3"]}', '{"outcome":"ok","in_inbox":false}')
+        assert json.loads(run(result, token))['status'] == 'executed'
+    first = json.loads(run(blocks[10], token))
+    observed(blocks[10]+' --lock-observation /absolute/private-store/lock-commit-observation.json', drive.perform(first['call']), token, 'lock-commit-observation.json')
+    message = run(blocks[11], token)
+    assert '2 handled' in message and 'Still in Inbox' in message
+    run(re.search(r'`(rm -f [^`]+run-message\.md)`', text).group(1), token)
+    sending = json.loads(run(blocks[12], token))
+    if 'call' in sending and sending['call']['operation']=='read':
+        sending = json.loads(observed(blocks[12]+' --lock-observation /absolute/private-store/state-lock-observation.json', drive.perform(sending['call']), token, 'state-lock-observation.json'))
+    while 'call' in sending:
+        sending = json.loads(observed(blocks[12]+' --observation /absolute/private-store/upload-observation.json', drive.file_call(sending['call']), token, 'upload-observation.json'))
+    assert sending['done'] and not sending.get('failed')
+    release = json.loads(run(blocks[13], token))
+    observed(blocks[13]+' --observation /absolute/private-store/lock-observation.json', drive.perform(release['call']), token)
+    assert drive.item is None and not (store/'run.lock').exists()
+print('PASS: batch acquisition, dry then real first run, single-message verification, final Inbox, delivery before send and release; fresh shells, quickstart only after setup/validate')
+PYBATCH
+# Execute the published AGENTS command blocks in a separate fresh store.
+export PIGEON_HOME="$PWD/private/walk"
+env -i PATH="$PATH" PIGEON_HOME="$PIGEON_HOME" python3 scripts/triage.py setup
+env -i PATH="$PATH" PIGEON_HOME="$PIGEON_HOME" python3 scripts/triage.py validate
 env -i PATH="$PATH" TMPDIR="$scratch" PIGEON_HOME="$PIGEON_HOME" python3 - <<'PYCLI'
 import hashlib
 import hmac
@@ -30,12 +222,14 @@ import re
 import subprocess
 
 store = Path(os.environ['PIGEON_HOME'])
-blocks = re.findall(r'```bash\n(.*?)\n\s*```', Path('AGENTS.md').read_text(), re.S)
+qblocks = [c.replace(' --batch', '') for c in re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)]
+qblocks[6] = qblocks[6].replace('--results /absolute/private-store/gateway-results.json', '--observation /absolute/private-store/quiet-observation.json')
+reply = re.search(r'```bash\n([^\n]*triage.py reply [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
+observed = re.search(r'```bash\n([^\n]*execute.py observed [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
+blocks = [qblocks[i] for i in (0,5,6,7,8,9)] + [observed, qblocks[10], qblocks[13], qblocks[0], reply, qblocks[8], qblocks[9], qblocks[10], qblocks[13]]
 assert len(blocks) == 15
 def command(index, token='', observation=None, first=False):
-    text = blocks[index + (2 if index else 0)].replace('/absolute/private-store', str(store)).replace('TOKEN', token)
-    if first:
-        text += ' --first-run'
+    text = blocks[index + (2 if index else 0)].replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --batch', '')
     if observation is not None:
         text = text.replace('{"outcome":"ok","inbox_ids":["id-2","id-3"]}',
                             json.dumps(observation))
@@ -154,9 +348,16 @@ while True:
     assert json.loads(command(3, token, observation).stdout)['status'] == 'executed'
 assert set(verbs) == {'create-folder', 'move', 'trash', 'archive', 'spam', 'unsubscribe'}
 command(4, token)
+message_command = qblocks[11]
+message_command = message_command.replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --batch', '')
+final_message = subprocess.run(['env', '-i', 'PATH=' + os.environ['PATH'], 'bash', '-eu', '-c', message_command], check=True, text=True, capture_output=True).stdout
+assert '📬 Triage' in final_message and 'Still in Inbox (by account)' in final_message
+assert final_message.count('Keep this renewal?') == 1
+(store / 'final-message.txt').write_text(final_message)
+
 assert 'extra' in (store/'execution-report.md').read_text()
 command(5, token)
-assert json.loads((store/'state.json').read_text()) == {'cedar': 1, 'marble': 0}
+assert json.loads((store/'state.json').read_text()) == {'version': 1, 'cedar': 1, 'marble': 0}
 command(6, token)
 assert not (store/'run.lock').exists()
 
@@ -169,7 +370,7 @@ observation = {'cedar': dict(outcome='ok', position='100', arrivals=[]),
                'marble': dict(outcome='ok', ids=[])}
 listing = dict(accounts={'cedar': 10, 'marble': 10}, messages=[])
 def documented(index, token='', on_demand=False):
-    text = blocks[index].replace('/absolute/private-store', str(store)).replace('TOKEN', token)
+    text = blocks[index].replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --batch', '')
     if on_demand:
         text = text.replace(' --scheduled', '')
     return subprocess.run(['bash', '-eu', '-c', text], check=True, text=True,
@@ -269,9 +470,13 @@ from datetime import datetime, timedelta, timezone
 root = Path.cwd()
 base = Path(os.environ['WALK_STORE'])
 base.mkdir(parents=True, exist_ok=True)
-text = (root / 'AGENTS.md').read_text()
-blocks = re.findall(r'```bash\n(.*?)\n\s*```', text, re.S)
-inline = re.findall(r'`(PIGEON_HOME=/absolute/private-store python3 scripts/triage.py (?:lock|release) [^`]+)`', text)
+text = (root / 'docs/quickstart.md').read_text()
+qblocks = [c.replace(' --batch', '') for c in re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)]
+qblocks[6] = qblocks[6].replace('--results /absolute/private-store/gateway-results.json', '--observation /absolute/private-store/quiet-observation.json')
+reply = re.search(r'```bash\n([^\n]*triage.py reply [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
+observed = re.search(r'```bash\n([^\n]*execute.py observed [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
+blocks = [qblocks[i] for i in (0,5,6,7,8,9)] + [observed, qblocks[10], qblocks[13], qblocks[0], reply, qblocks[8], qblocks[9], qblocks[10], qblocks[13]]
+inline = [qblocks[1], qblocks[13] + ' --observation /absolute/private-store/lock-observation.json']
 now = datetime.now(timezone.utc)
 def prepare(label):
     store = base / label
@@ -285,7 +490,7 @@ def prepare(label):
     return store
 
 def run(store, command, token='', fail=False):
-    command = command.replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --scheduled', '')
+    command = command.replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --batch', '').replace(' --scheduled', '')
     result = subprocess.run(['env', '-i', 'PATH=' + os.environ['PATH'], 'bash', '-eu', '-c', command], text=True, capture_output=True)
     assert (result.returncode != 0) == fail, (command, result.stdout, result.stderr)
     return result.stdout.strip()
@@ -349,13 +554,17 @@ base = Path(os.environ['WALK_STORE'])
 base.mkdir()
 drive = base / 'drive'
 drive.mkdir()
-text = Path('AGENTS.md').read_text()
-blocks = re.findall(r'```bash\n(.*?)\n\s*```', text, re.S)
-inline = re.findall(r'`(PIGEON_HOME=/absolute/private-store python3 scripts/triage.py [^`]+)`', text)
+text = Path('docs/quickstart.md').read_text()
+qblocks = [c.replace(' --batch', '') for c in re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)]
+qblocks[6] = qblocks[6].replace('--results /absolute/private-store/gateway-results.json', '--observation /absolute/private-store/quiet-observation.json')
+reply = re.search(r'```bash\n([^\n]*triage.py reply [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
+observed = re.search(r'```bash\n([^\n]*execute.py observed [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
+blocks = [qblocks[i] for i in (0,5,6,7,8,9)] + [observed, qblocks[10], qblocks[13], qblocks[0], reply, qblocks[8], qblocks[9], qblocks[10], qblocks[13]]
+inline = [qblocks[1], qblocks[2], qblocks[3], qblocks[12], qblocks[12] + ' --lock-observation /absolute/private-store/state-lock-observation.json', qblocks[12] + ' --observation /absolute/private-store/upload-observation.json', qblocks[13] + ' --observation /absolute/private-store/lock-observation.json']
 def find(command, suffix=''):
     return next(c for c in inline if 'triage.py ' + command + ' --token TOKEN' in c and c.endswith(suffix or '--token TOKEN'))
 def run(store, command, token='', scheduled=False):
-    command = command.replace('/absolute/private-store', str(store)).replace('TOKEN', token)
+    command = command.replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --batch', '')
     if not scheduled: command = command.replace(' --scheduled', '')
     result = subprocess.run(['env', '-i', 'PATH=' + os.environ['PATH'], 'bash', '-eu', '-c', command], text=True, capture_output=True)
     assert result.returncode == 0, (command, result.stdout, result.stderr)
@@ -404,8 +613,10 @@ for iteration in (1, 2, 3, 4):
             (store/'reply.txt').write_text('1 yes')
             run(store, blocks[10], token)
         else:
-            run(store, blocks[3] + (' --first-run' if iteration == 1 else ''), token)
+            run(store, blocks[3], token)
         plan = json.loads((store/'plan.json').read_text())
+        if iteration == 1:
+            assert plan['first_run'] and not plan['reasons']
         assert json.loads(run(store, blocks[4], token)) == {'done':True}
         print('run', iteration, 'commit read pigeon-run-lock -> guardrails.example.md:9 lock exchange')
         assert json.loads(run(store, blocks[7], token))['call']['operation'] == 'read'
@@ -442,6 +653,44 @@ for iteration in (1, 2, 3, 4):
 print('PASS: fresh-shell drive state; two empty working stores preserve numbers/counts/positions; numbered reply answered; scheduled quiet skip uploads only history; failed upload warns first, no retry, conditional release')
 print('Gateway-to-guardrail: create/read/conditional delete pigeon-run-lock -> guardrails line 9 lock exchange; ten named downloads and changed uploads -> guardrails line 9 state exchange; identity/Inbox/history reads -> guardrails line 7 read-only mail calls. No gateway was contacted.')
 PYSTATE
+
+# Draft-only rule through fresh CLI processes; no gateway is contacted.
+WALK_STORE="$scratch/draft-walk" python3 - <<'PYDRAFT'
+import json, os, subprocess
+from pathlib import Path
+store = Path(os.environ['WALK_STORE'])
+store.mkdir()
+env = dict(os.environ, PIGEON_HOME=str(store))
+def run(script, *args):
+    return subprocess.run(['python3', 'scripts/'+script, *args], env=env, check=True, capture_output=True, text=True).stdout
+(store/'config.toml').write_text('[accounts.cedar]\n[calendars.oak]\nexecutor_app="oak-events"\nwins=true\n[calendars.elm]\nexecutor_app="elm-events"\n')
+from datetime import datetime, timezone, timedelta
+start = datetime.now(timezone.utc)
+event = dict(id='event-a', start=start.isoformat(), end=(start+timedelta(hours=1)).isoformat(), all_day=False, response='pending', cancelled=False, subject='Planning')
+(store/'calendar.json').write_text(json.dumps({'oak':[event], 'elm':[event]}))
+(store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
+(store/'never-touch.toml').write_text('allow_empty=true\n')
+(store/'rules.toml').write_text('[[rules]]\nid="d"\naccounts=["cedar"]\nsubject="Question"\naction="draft"\ndraft="reply"\ndraft_text="Owner prepared reply."\n')
+(store/'inbox.json').write_text(json.dumps(dict(accounts={'cedar':100},messages=[dict(account='cedar',id='original',folder='Inbox',sender='helper@example.org',subject='Question')])))
+token = run('triage.py','lock').strip()
+plan = str(store/'plan.json')
+run('triage.py','plan','--dry-run','--token',token,'--inbox',str(store/'inbox.json'),'--plan-out',plan,'--calendar',str(store/'calendar.json'))
+assert '**Calendar**' in run('triage.py','message','--token',token,'--plan',plan)
+assert not (store/'state.json').exists() and not (store/'numbers.json').exists()
+run('triage.py','plan','--token',token,'--inbox',str(store/'inbox.json'),'--plan-out',plan,'--calendar',str(store/'calendar.json'))
+assert 'oak stays' in '\n'.join(json.loads((store/'plan.json').read_text())['calendar_section'])
+call = json.loads(run('execute.py','next','--token',token,'--plan',plan))
+assert call['action']=='create-draft' and call['draft_text']=='Owner prepared reply.'
+assert json.loads(run('execute.py','result','--token',token,'--plan',plan,'--observation',json.dumps(dict(outcome='ok',draft_id='draft-a'))))['status']=='executed'
+assert json.loads(run('execute.py','next','--token',token,'--plan',plan))['done']
+run('triage.py','commit-state','--token',token,'--plan',plan)
+assert json.loads((store/'state.json').read_text())['cedar']==1
+message = run('triage.py','message','--token',token,'--plan',plan)
+assert 'Owner prepared reply.' in message and '**Calendar**' in message and 'oak stays' in message
+assert not any('calendar' in key for key in json.loads((store/'state.json').read_text()))
+run('triage.py','release','--token',token)
+print('PASS: draft rule creates once, preserves Inbox, saves id and shows whole text')
+PYDRAFT
 
 # Identity is fictional; the hook must refuse the private path, not bad content.
 git config user.name 'Kit Test'

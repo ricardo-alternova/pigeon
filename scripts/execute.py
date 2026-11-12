@@ -17,7 +17,9 @@ import unsubscribe
 
 
 def read(path):
-    return triage.parse_json(triage.load_inputs([path])[0], path)
+    value = triage.parse_json(triage.load_inputs([path])[0], path)
+    triage.known_keys(value, set(value) if isinstance(value, dict) else set(), str(path))
+    return value
 
 
 def atomic(path, value):
@@ -33,19 +35,30 @@ def atomic(path, value):
             temporary.unlink(missing_ok=True)
 
 
+CALL_KINDS = triage.PLAN_VERBS
+
+OUTSIDE_CHANGE = 'Inbox changed outside this run'
+
+
 class UncertainRequest(ValueError):
     pass
 
 
 class AssistantProvider:
-    """Transport observations, never a gateway connection."""
     def __init__(self, observation):
-        triage.known_keys(observation, {'outcome', 'inbox_ids', 'folder_id'}, 'observation')
+        triage.known_keys(observation, {'outcome', 'inbox_ids', 'in_inbox', 'folder_id', 'account', 'draft_id'}, 'observation')
         if observation.get('outcome') not in ('ok', 'error', 'unknown'):
-            raise ValueError('observation.outcome: expected ok, error or unknown (create-folder only)')
+            raise ValueError('observation.outcome: expected ok, error or unknown (creation only)')
         ids = observation.get('inbox_ids')
-        if not isinstance(ids, list) or any(not isinstance(i, str) for i in ids):
+        if 'in_inbox' in observation:
+            if type(observation['in_inbox']) is not bool or 'inbox_ids' in observation or 'folder_id' in observation:
+                raise ValueError('observation.in_inbox: expected boolean instead of inbox_ids')
+        elif 'draft_id' in observation or ids is None:
+            pass
+        elif not isinstance(ids, list) or any(not isinstance(i, str) for i in ids):
             raise ValueError('observation.inbox_ids: expected complete post-action Inbox id array for the issued account')
+        if 'account' in observation and not isinstance(observation['account'], str):
+            raise ValueError('observation.account: expected account handle string')
         self.observation = observation
 
     def perform(self, call):
@@ -65,6 +78,28 @@ class Execution:
             raise ValueError(str(plan_path) + ': expected a plan path distinct from execution outputs')
         triage.require_fetched(store, token)
         self.plan = read(self.plan_path)
+        if self.plan.get('dry_run'):
+            raise ValueError('dry-run plan: execution is refused; no call issued')
+        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled'}, str(self.plan_path))
+        for key in ('actions', 'decisions', 'reasons'):
+            if not isinstance(self.plan.get(key), list):
+                raise ValueError(str(self.plan_path) + '.' + key + ': expected an array')
+        if any(not isinstance(r, str) for r in self.plan['reasons']):
+            raise ValueError(str(self.plan_path) + '.reasons: expected strings')
+        triage.known_keys(self.plan.get('counts'), set(self.plan.get('counts', {})), str(self.plan_path) + '.counts')
+        creates = set()
+        for action in self.plan['actions']:
+            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to'}, str(self.plan_path) + '.actions')
+            if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action', 'rule')):
+                raise ValueError(str(self.plan_path) + '.actions: expected account, id, action and rule strings')
+            if 'target_path' in action:
+                if not isinstance(action['target_path'], str):
+                    raise ValueError(str(self.plan_path) + '.actions: expected target_path string')
+                key = action['account'], action['target_path']
+                if action['action'] == 'create-folder':
+                    creates.add(key)
+                elif action['action'] == 'move' and key not in creates:
+                    raise ValueError(str(self.plan_path) + ': malformed plan for account ' + action['account'] + ': expected preceding folder-creation action')
         self.signature = hashlib.sha256(json.dumps(self.plan, sort_keys=True).encode()).hexdigest()
         self.state = read(self.path) if self.path.exists() else dict(signature=self.signature, pending=None, results=[], failures={})
         self.validate_checkpoint()
@@ -79,9 +114,23 @@ class Execution:
 
     def validate_checkpoint(self):
         label = str(self.path)
-        triage.known_keys(self.state, {'signature', 'pending', 'results', 'failures'}, label)
+        triage.known_keys(self.state, {'signature', 'pending', 'results', 'failures', 'outside_change', 'single_reads', 'final_listing'}, label)
         if self.state.get('signature') != self.signature:
             raise ValueError(label + '.signature: expected unchanged plan during execution')
+        if 'single_reads' in self.state and self.state['single_reads'] is not True:
+            raise ValueError(label + '.single_reads: expected true')
+        if 'final_listing' in self.state:
+            config = triage.state_config(self.store)
+            triage.validate_inputs(self.state['final_listing'], config, {})
+            if set(self.state['final_listing']['accounts']) != set(self.plan['counts']):
+                raise ValueError(label + '.final_listing: expected every listed account')
+        change = self.state.get('outside_change')
+        if change is not None:
+            triage.known_keys(change, {'account', 'ids'}, label + '.outside_change')
+            if (change.get('account') not in self.plan['counts'] or not isinstance(change.get('ids'), list)
+                    or not change['ids'] or any(not isinstance(i, str) for i in change['ids'])
+                    or len(change['ids']) != len(set(change['ids']))):
+                raise ValueError(label + '.outside_change: expected account and unique missing ids')
         failures = self.state.get('failures')
         triage.known_keys(failures, triage.PLAN_VERBS, label + '.failures')
         for verb, count in failures.items():
@@ -93,11 +142,18 @@ class Execution:
         statuses = {'executed', 'failed', 'skipped', 'unexecuted', 'unsubscribe_not_executable', 'unsubscribe_not_attempted', 'issued_unknown'}
         for i, entry in enumerate(results):
             source = label + '.results.' + str(i)
-            triage.known_keys(entry, {'account', 'id', 'action', 'status', 'folder_id'}, source)
+            triage.known_keys(entry, {'account', 'id', 'action', 'status', 'folder_id', 'reason', 'draft_id', 'created'}, source)
+            if 'reason' in entry and entry['reason'] != OUTSIDE_CHANGE:
+                raise ValueError(source + '.reason: expected fixed outside-change reason')
             call = self.plan['actions'][i]
             if (any(entry.get(k) != call[k] for k in ('account', 'id', 'action'))
                     or not isinstance(entry.get('status'), str) or entry['status'] not in statuses):
                 raise ValueError(source + ': expected matching planned action and status ' + ', '.join(sorted(statuses)))
+            if call['action'] == 'create-draft':
+                if entry['status'] == 'executed' and not triage.message_id(entry.get('draft_id')):
+                    raise ValueError(source + '.draft_id: expected valid message id')
+                if 'created' in entry:
+                    triage.state_timestamp(entry['created'], source)
             if call['action'] == 'create-folder' and entry['status'] == 'executed':
                 self.validate_folder_id(entry.get('folder_id'), results[:i], source)
             elif 'folder_id' in entry:
@@ -106,7 +162,7 @@ class Execution:
             raise ValueError(label + '.pending: expected null or the next planned action')
         pending = self.state['pending']
         if pending is not None:
-            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path'}, label + '.pending')
+            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to'}, label + '.pending')
             if len(results) == len(self.plan['actions']) or pending != self.plan['actions'][len(results)]:
                 raise ValueError(label + '.pending: expected the next planned action unchanged')
 
@@ -117,10 +173,17 @@ class Execution:
         rules = triage.parse_rules(triage.load_inputs([self.store / 'rules.toml'])[0])
         holds = triage.parse_rules(triage.load_inputs([self.store / 'never-touch.toml'])[0], protection=True)
         previous = read(self.store / 'state.json') if (self.store / 'state.json').exists() else {}
+        previous = triage.recover_drafts(self.store, previous, self.token)
+        if '_drafts' in previous:
+            own = {(r['account'], r['id'], r.get('created')) for r in self.state['results'] if r['action'] == 'create-draft'}
+            if self.state['pending'] is not None and self.state['pending']['action'] == 'create-draft':
+                pending = self.state['pending']
+                own.add((pending['account'], pending['id'], triage.datetime.fromtimestamp(triage.read_lock(self.store).get('started', triage.read_lock(self.store)['created']), triage.timezone.utc).isoformat()))
+            previous['_drafts'] = [d for d in previous['_drafts'] if (d['account'], d['id'], d['created']) not in own]
         first_run = self.plan.get('first_run', False)
         if type(first_run) is not bool:
             raise ValueError(str(self.plan_path) + '.first_run: expected boolean')
-        stops = ['Missing state; use --first-run only for an explicit first run'] if not (self.store / 'state.json').exists() and not first_run else []
+        stops = ['Missing state; prior run records exist'] if not (self.store / 'state.json').exists() and not first_run else []
         if 'reply' in self.plan:
             saved = read(self.store / 'reply.json')
             if saved.get('token') != self.token:
@@ -134,6 +197,28 @@ class Execution:
             expected = triage.build_plan(listing, rules, holds, config, previous, stops)
         if self.plan['actions'] != expected['actions'] or self.plan['counts'] != expected['counts']:
             raise ValueError(str(self.plan_path) + '.actions: expected actions and counts from current private inputs and Inbox listing')
+
+    def stop_reason(self):
+        change = self.state.get('outside_change')
+        if not change: return None
+        departures = {change['account']: set(change['ids'])}
+        if 'final_listing' in self.state:
+            original = read(self.store / 'inbox.json')
+            for account in self.plan['counts']:
+                removed = {r['id'] for r in self.state['results'] if r['account'] == account and r['status'] == 'executed' and r['action'] in triage.REMOVALS}
+                expected = {m['id'] for m in original['messages'] if m['account'] == account} - removed
+                actual = {m['id'] for m in self.state['final_listing']['messages'] if m['account'] == account}
+                if expected - actual: departures.setdefault(account, set()).update(expected - actual)
+        return OUTSIDE_CHANGE + ': ' + '; '.join(f'{a} ({len(ids)} messages left the Inbox)' for a, ids in departures.items())
+
+    def current_listing(self, listing):
+        if 'final_listing' in self.state:
+            return self.state['final_listing']
+        change = self.state.get('outside_change')
+        if not change:
+            return listing
+        return dict(listing, messages=[m for m in listing['messages']
+                    if m['account'] != change['account'] or m['id'] not in change['ids']])
 
     def log(self, call, outcome):
         append_log(self.store, self.token, call, outcome)
@@ -193,7 +278,56 @@ class Execution:
             atomic(path, memory)
         return status
 
+    def remaining_items(self, listing, observed):
+        final = 'final_listing' in self.state
+        items = triage.remaining_items(self.plan, listing, observed, final=final)
+        if final:
+            holds = triage.parse_rules(triage.read_text(self.store / 'never-touch.toml'), protection=True)
+            messages = {(m['account'], m['id']): m for m in listing['messages']}
+            for item in items:
+                if any(triage.matches(messages[item['account'], item['id']], rule, protection=True) for rule in holds):
+                    item['reason'] = 'Protected by never-touch'
+                    item.pop('number', None)
+                    item.pop('question', None)
+        return items
+
+    def final(self, listing):
+        with triage.lock_gate(self.store):
+            triage.require_lock(self.store, self.token)
+            self.validate()
+            if self.state['pending'] is not None or len(self.state['results']) != len(self.plan['actions']):
+                raise ValueError('final: finish every action before the final reading')
+            if 'final_listing' in self.state:
+                raise ValueError('final: reading already recorded')
+            config = triage.state_config(self.store)
+            triage.validate_inputs(listing, config, {})
+            triage.build_plan(listing, [], [], config, {})
+            if set(listing['accounts']) != set(self.plan['counts']):
+                raise ValueError('final: expected every listed account')
+            original = read(self.store / 'inbox.json')
+            for account in self.plan['counts']:
+                removed = {r['id'] for r in self.state['results'] if r['account'] == account and r['status'] == 'executed' and r['action'] in {'trash', 'archive', 'move', 'spam'}}
+                expected = {m['id'] for m in original['messages'] if m['account'] == account} - removed
+                actual = {m['id'] for m in listing['messages'] if m['account'] == account}
+                if expected - actual and not self.stop_reason():
+                    self.state['outside_change'] = dict(account=account, ids=sorted(expected - actual))
+            self.state['final_listing'] = listing
+            self.save()
+            return dict(done=True, **({'status': 'stopped', 'stop': self.stop_reason()} if self.stop_reason() else {}))
+
+    def final_reads(self):
+        config = triage.state_config(self.store)
+        return {'done': False, 'final_reads': [dict(account=a, **triage.gateway_account(config, a)) for a in self.plan['counts']]}
+
     def step(self, provider=None, *, local=False):
+        result = self._step(provider, local=local)
+        if not result.get('stop'):
+            held = triage.read_lock(self.store)
+            if held['created'] + triage.STALE_SECONDS - time.time() < triage.REFRESH_MARGIN:
+                result['refresh_lock'] = True
+        return result
+
+    def _step(self, provider=None, *, local=False):
         with triage.lock_gate(self.store) as gate:
             try:
                 triage.require_lock(self.store, self.token)
@@ -205,6 +339,10 @@ class Execution:
             if self.path.exists():
                 self.state = read(self.path)
                 self.validate_checkpoint()
+            if self.stop_reason():
+                if self.state.get('single_reads') and 'final_listing' not in self.state:
+                    return self.final_reads()
+                return {'done': True, 'status': 'stopped', 'stop': self.stop_reason()}
             if self.plan['reasons']:
                 self.save()
                 return {'done': True}
@@ -233,6 +371,21 @@ class Execution:
                     raise ValueError('unsubscribe: expected local command, never a gateway observation')
                 if pending is None:
                     raise ValueError(str(self.path) + '.pending: expected an issued call before result')
+                if pending['action'] == 'create-draft':
+                    observation = provider.observation
+                    if observation.get('account', pending['account']) != pending['account']:
+                        raise ValueError('observation.account: expected issued draft account')
+                    status = 'failed' if observation['outcome'] == 'error' else 'executed' if observation['outcome'] == 'ok' and triage.message_id(observation.get('draft_id')) else 'issued_unknown'
+                    extra = {'created': triage.datetime.now(triage.timezone.utc).isoformat()}
+                    if status == 'executed':
+                        extra['draft_id'] = observation['draft_id']
+                    self.record(pending, status, **extra)
+                    self.state['pending'] = None
+                    self.log(pending, status)
+                    self.save()
+                    return {'status': status}
+                if isinstance(provider, AssistantProvider) and 'in_inbox' not in provider.observation and not isinstance(provider.observation.get('inbox_ids'), list):
+                    raise ValueError('observation.inbox_ids: expected complete post-action Inbox id array')
                 if pending['action'] == 'create-folder':
                     observation = provider.observation
                     if observation['outcome'] == 'ok':
@@ -241,12 +394,41 @@ class Execution:
                         raise ValueError('observation.folder_id: expected only on successful creation')
                 elif isinstance(provider, AssistantProvider) and (provider.observation['outcome'] == 'unknown' or 'folder_id' in provider.observation):
                     raise ValueError('observation: unknown and folder_id are for create-folder only')
-                if isinstance(provider, AssistantProvider):
-                    ids = provider.list_inbox_ids(pending['account'])
-                    removed = {e['id'] for e in self.state['results'] if e['account'] == pending['account'] and e['status'] == 'executed' and e['action'] in {'trash', 'archive', 'move', 'spam'}}
-                    required = {m['id'] for m in read(self.store / 'inbox.json')['messages'] if m['account'] == pending['account']} - removed - ({pending['id']} if pending['action'] != 'create-folder' else set())
-                    if len(ids) != len(set(ids)) or not required <= set(ids):
-                        raise ValueError('observation.inbox_ids: expected complete Inbox reading retaining other not-yet-removed ids for this account')
+                single = isinstance(provider, AssistantProvider) and 'in_inbox' in provider.observation
+                if single:
+                    if pending['action'] == 'create-folder' or provider.observation.get('account', pending['account']) != pending['account']:
+                        raise ValueError('observation.in_inbox: expected the issued message account, not folder creation')
+                    self.state['single_reads'] = True
+                    self.state.pop('final_listing', None)
+                if isinstance(provider, AssistantProvider) and not single:
+                    account = provider.observation.get('account', pending['account'])
+                    if account not in self.plan['counts']:
+                        raise ValueError('observation.account: expected a listed account')
+                    ids = provider.list_inbox_ids(account)
+                    removed = {e['id'] for e in self.state['results'] if e['account'] == account and e['status'] == 'executed' and e['action'] in {'trash', 'archive', 'move', 'spam'}}
+                    required = {m['id'] for m in read(self.store / 'inbox.json')['messages'] if m['account'] == account} - removed - ({pending['id']} if account == pending['account'] and pending['action'] != 'create-folder' else set())
+                    if len(ids) != len(set(ids)):
+                        raise ValueError('observation.inbox_ids: expected unique Inbox ids')
+                    missing = required - set(ids)
+                    if account == pending['account'] and pending['action'] != 'create-folder' and provider.observation['outcome'] == 'error' and pending['id'] not in ids:
+                        missing.add(pending['id'])
+                    if missing:
+                        if account == pending['account'] and pending['action'] != 'create-folder' and pending['id'] not in ids:
+                            missing.add(pending['id'])
+                        self.state['outside_change'] = dict(account=account, ids=sorted(missing))
+                        uncertain = account != pending['account'] or provider.observation['outcome'] != 'error' or pending['id'] not in ids
+                        self.record(pending, 'issued_unknown' if uncertain else 'unexecuted', reason=OUTSIDE_CHANGE)
+                        self.log(pending, self.state['results'][-1]['status'])
+                        self.state['pending'] = None
+                        for call in self.plan['actions'][len(self.state['results']):]:
+                            self.record(call, 'unexecuted', reason=OUTSIDE_CHANGE)
+                            self.log(call, 'unexecuted')
+                        self.save()
+                        if self.state.get('single_reads'):
+                            return self.final_reads() | {'status': 'stopped', 'stop': self.stop_reason()}
+                        return {'done': True, 'status': 'stopped', 'stop': self.stop_reason()}
+                    if account != pending['account']:
+                        raise ValueError('observation.account: expected the issued account to confirm its result')
                 outcome = provider.perform(pending)
                 if pending['action'] == 'create-folder':
                     status = {'ok': 'executed', 'error': 'failed', 'unknown': 'issued_unknown'}[outcome]
@@ -257,8 +439,8 @@ class Execution:
                     self.log(pending, status)
                     self.save()
                     return {'status': status}
-                absent = pending['id'] not in provider.list_inbox_ids(pending['account'])
-                status = 'executed' if outcome == 'ok' and absent else ('failed' if outcome == 'error' else 'unexecuted')
+                absent = not provider.observation['in_inbox'] if single else pending['id'] not in provider.list_inbox_ids(pending['account'])
+                status = 'executed' if outcome == 'ok' and absent else ('issued_unknown' if single and outcome == 'error' and absent else 'failed' if outcome == 'error' else 'unexecuted')
                 verb = pending['action']
                 self.state['failures'][verb] = 0 if status == 'executed' else self.state['failures'].get(verb, 0) + 1
                 self.record(pending, status)
@@ -271,8 +453,10 @@ class Execution:
             while len(self.state['results']) < len(self.plan['actions']):
                 call = self.plan['actions'][len(self.state['results'])]
                 if call['action'] == 'move' and 'target_path' in call:
-                    creation = next(e for a, e in zip(self.plan['actions'], self.state['results'])
-                                    if a['action'] == 'create-folder' and a['account'] == call['account'] and a['target_path'] == call['target_path'])
+                    creation = next((e for a, e in zip(self.plan['actions'], self.state['results'])
+                                    if a['action'] == 'create-folder' and a['account'] == call['account'] and a['target_path'] == call['target_path']), None)
+                    if creation is None:
+                        raise ValueError(str(self.plan_path) + ': malformed plan for account ' + call['account'] + ': expected folder-creation result')
                     if creation['status'] != 'executed':
                         self.record(call, 'unexecuted')
                         self.log(call, 'unexecuted')
@@ -290,11 +474,17 @@ class Execution:
                     # Carry the store so the command works in a fresh shell.
                     return {'run': ['env', 'PIGEON_HOME=' + str(self.store), 'python3', str(Path(__file__).resolve()), 'unsubscribe',
                                     '--token', self.token, '--plan', str(self.plan_path)]}
-                issued = dict(call)
+                config = triage.parse_toml(triage.read_text(self.store / 'config.toml'), 'config.toml')
+                routing = triage.gateway_account(config, call['account'])
+                issued = dict(call) | routing | triage.saved_tool(self.store, call['account'], call['action'])
                 if call['action'] == 'move' and 'target_path' in call:
                     issued['target'] = creation['folder_id']
-                return issued | {'verify': {'account': call['account'], 'read': 'complete Inbox ids; never re-read the old id'}}
+                if call['action'] == 'create-draft':
+                    return issued
+                return issued | {'verify': {'account': call['account'], 'read': 'post-action message Inbox membership, or complete Inbox ids', **routing, **triage.saved_tool(self.store, call['account'], 'message-read')}}
             self.save()
+            if self.state.get('single_reads') and 'final_listing' not in self.state:
+                return self.final_reads()
             return {'done': True}
 
 
@@ -360,6 +550,7 @@ def append_log(store, token, call, outcome):
     sequence = len(triage.read_text(path).splitlines()) + 1 if path.exists() else 1
     entry = dict(sequence=sequence, time=time.time(), run=token, account=call['account'], id=call['id'],
                  verb=call['action'], outcome=outcome)
+    entry.update(triage.saved_tool(store, call['account'], call['action']))
     # JSON quoting escapes controls; Markdown rendering additionally uses safe_text.
     with path.open('a', encoding='utf-8') as out:
         out.write(json.dumps(entry, ensure_ascii=True) + '\n')
@@ -369,11 +560,14 @@ def append_log(store, token, call, outcome):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('next', 'result', 'observed', 'unsubscribe'):
+    for name in ('next', 'result', 'observed', 'unsubscribe', 'final'):
         command = sub.add_parser(name, allow_abbrev=False)
         command.add_argument('--token', required=True)
         if name != 'observed':
             command.add_argument('--plan', required=True)
+        if name == 'final':
+            command.add_argument('--inbox')
+            command.add_argument('--results')
         if name == 'result':
             command.add_argument('--observation', required=True, help='JSON object: outcome (ok/error for removals; ok/error/unknown for creation), inbox_ids, and folder_id only for successful creation')
         if name == 'observed':
@@ -392,6 +586,15 @@ def main():
         print(json.dumps({'recorded': True}))
     else:
         execution = Execution(store, args.token, args.plan)
+        if args.command == 'final':
+            if args.inbox:
+                print(json.dumps(execution.final(read(args.inbox))))
+            else:
+                response = triage.listing_exchange(store, args.token, args.results, ids_only=True, accounts=list(execution.plan['counts']))
+                if response.get('failed'):
+                    raise ValueError('final: failed account reads; finish with a fresh whole Inbox reading')
+                print(json.dumps(execution.final(read(store/'final-inbox.json')) if response.get('done') else response))
+            return
         provider = None
         if args.command == 'result':
             try:
@@ -405,6 +608,9 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except (AttributeError, IndexError, StopIteration) as error:
+        print('Refused: malformed input file: expected complete records with valid field types (' + type(error).__name__ + ')', file=sys.stderr)
+        sys.exit(1)
     except (ValueError, OSError, KeyError, TypeError) as error:
         print('Refused: ' + ' '.join(str(error).split()), file=sys.stderr)
         sys.exit(1)

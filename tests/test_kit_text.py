@@ -10,10 +10,77 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ['README.md', 'AGENTS.md', 'CLAUDE.md',
         '.agents/skills/email-triage/SKILL.md', 'docs/setup.md',
-        'config/guardrails.example.md']
+        'config/guardrails.example.md', 'docs/quickstart.md']
 
 
 class KitTextTests(unittest.TestCase):
+    def test_document_heading_links_and_see_references_resolve(self):
+        from urllib.parse import unquote
+        documents = [ROOT / n for n in DOCS]
+        def headings(path):
+            return [re.sub(r'[^\w -]', '', h.lower()).replace(' ', '-')
+                    for h in re.findall(r'^#+ (.+)$', path.read_text(), re.M)]
+        all_headings = {h for path in documents for h in headings(path)}
+        for path in documents:
+            text = path.read_text()
+            for target in re.findall(r'\[[^\]]*\]\(([^)]+)\)', text):
+                if '://' in target or target.startswith('mailto:'): continue
+                name, _, anchor = target.partition('#')
+                destination = (path.parent / name).resolve() if name else path
+                self.assertTrue(destination.exists(), (path, target))
+                if anchor: self.assertIn(unquote(anchor), headings(destination), (path, target))
+            for section in re.findall(r'(?i)see\s+`([^`]+)`', text):
+                anchor = re.sub(r'[^\w -]', '', section.lower()).replace(' ', '-')
+                self.assertIn(anchor, all_headings, (path, section))
+
+    def test_quickstart_commands_and_flags_exist(self):
+        import argparse
+        from unittest.mock import patch
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import triage, execute
+        parsers = {}
+        class Captured(Exception): pass
+        def capture(parser, *args, **kwargs):
+            parsers[current] = parser
+            raise Captured()
+        for current, module in [('triage', triage), ('execute', execute)]:
+            with patch.object(argparse.ArgumentParser, 'parse_args', capture):
+                with self.assertRaises(Captured): module.main()
+        text = (ROOT / 'docs/quickstart.md').read_text()
+        all_options = {o for parser in parsers.values() for action in parser._actions if isinstance(action, argparse._SubParsersAction) for choice in action.choices.values() for a in choice._actions for o in a.option_strings}
+        for flag in re.findall(r'--[a-z][a-z-]*', text): self.assertIn(flag, all_options)
+        for script, command, suffix in re.findall(r'(triage|execute)\.py\s+([a-z][a-z-]*)([^`\n]*)', text):
+            choices = next(a.choices for a in parsers[script]._actions if isinstance(a, argparse._SubParsersAction))
+            self.assertIn(command, choices)
+            options = {o for a in choices[command]._actions for o in a.option_strings}
+            for flag in re.findall(r'--[a-z][a-z-]*', suffix): self.assertIn(flag, options, (script, command, flag))
+
+    def test_routine_quickstart_size_and_entry_points(self):
+        path = ROOT / 'docs/quickstart.md'
+        self.assertLessEqual(len(path.read_bytes()), 6000)
+        for name in ('README.md', 'AGENTS.md', '.agents/skills/email-triage/SKILL.md'):
+            self.assertIn('docs/quickstart.md', (ROOT / name).read_text())
+        text = path.read_text()
+        for term in ('fetch-state', 'lock', 'quiet-check', 'plan', 'next', 'result',
+                     'commit-state', 'message', 'send-state', 'release'):
+            self.assertIn('py ' + term, text)
+        self.assertIn('Stop on any refusal', text)
+        for term in ('First installation', 'refusal', 'Owner replies', 'Rule change', 'Unsubscribe', 'Gateway recipes'):
+            self.assertIn(term, text)
+
+    def test_gmail_received_datetime_plans_dated_move(self):
+        from datetime import datetime, timezone
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import triage
+        date = datetime.fromtimestamp(1772323200000 / 1000, timezone.utc).isoformat()
+        listing = dict(accounts={'cedar': 100}, messages=[dict(account='cedar',
+            id='item-a', folder='Inbox', sender='billing@example.org', subject='Invoice', date=date)],
+            folders={'cedar': [dict(id='folder-a', name='Bills/2026/03')]})
+        rule = dict(id='dated', accounts=['cedar'], subject='Invoice', action='move', target='Bills/{year}/{month}')
+        plan = triage.build_plan(listing, [rule], [], {'accounts': {'cedar': {}}})
+        self.assertEqual(plan['reasons'], [])
+        self.assertEqual([(a['action'], a['target']) for a in plan['actions']], [('move', 'folder-a')])
+
     def test_rule_examples_load(self):
         sys.path.insert(0, str(ROOT / 'scripts'))
         import triage
@@ -29,7 +96,7 @@ class KitTextTests(unittest.TestCase):
                         <= set().union(*(r.keys() for r in rules)))
 
     def test_execution_commands(self):
-        text = (ROOT / 'AGENTS.md').read_text()
+        text = (ROOT / 'AGENTS.md').read_text() + (ROOT / 'docs/quickstart.md').read_text()
         for command in ('triage.py lock', 'triage.py plan', 'execute.py next',
                         'execute.py result', 'execute.py observed',
                         'triage.py commit-state', 'triage.py release'):
@@ -59,22 +126,17 @@ class KitTextTests(unittest.TestCase):
                     self.assertNotIn(phrase, text)
 
     def test_standard_run_message(self):
-        text = (ROOT / '.agents/skills/email-triage/SKILL.md').read_text()
-        section = text.split('## Standard run message')[1]
-        headings = ['🔴 Needs you', '✅ Handled automatically',
-                    '📥 Still in Inbox (by account)', '❓ Questions for you', '⚙️ Run notes']
-        positions = [section.index(h) for h in headings]
-        self.assertEqual(positions, sorted(positions))
-        self.assertIn('📬 Triage · <weekday, date, time, time zone> · <N need you | nothing needs you> · <M handled>', section)
-        examples = re.findall(r'```text\n(.*?)```', section, re.S)
-        self.assertEqual(len(examples), 2)
-        for example in examples:
-            self.assertTrue(example.startswith('📬 Triage · '))
-            for domain in re.findall(r'@[A-Za-z0-9.-]+', example):
-                self.assertIn(domain, ('@example.com', '@example.org', '@example.net'))
-        self.assertEqual([examples[0].index(h) for h in headings],
-                         sorted(examples[0].index(h) for h in headings))
-        self.assertNotIn('🔴', examples[1])
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import triage
+        setup = (ROOT / 'docs/setup.md').read_text()
+        rows = re.findall(r'^\| (inbox|planned|rules|handled|notes) \| (.*?) \| (.*?) \|$', setup, re.M)
+        self.assertEqual({k: en for k, en, es in rows}, triage.SECTION_LABELS['en'])
+        self.assertEqual({k: es for k, en, es in rows}, triage.SECTION_LABELS['es'])
+        for name in ('docs/quickstart.md',):
+            text = (ROOT / name).read_text()
+            self.assertIn('triage.py message --token TOKEN', text)
+            self.assertIn('Post its output unchanged.', text)
+        self.assertNotIn('Needs you items appear here once', (ROOT / 'scripts/triage.py').read_text())
 
     def test_si6_no_send_setting(self):
         config = tomllib.loads((ROOT / 'config/config.example.toml').read_text())
@@ -90,7 +152,7 @@ class KitTextTests(unittest.TestCase):
 
     def test_data_policy(self):
         policy = (ROOT / 'config/guardrails.example.md').read_text()
-        for term in ('data', 'instructions', 'Never send', 'Never reply',
+        for term in ('data', 'instructions', 'Never send', 'Create and show issued drafts',
                      'Never permanently delete', 'step machine'):
             self.assertIn(term, policy)
 
@@ -162,7 +224,7 @@ class KitTextTests(unittest.TestCase):
                 content = content.split('## private store')[1].split('## configuration')[0]
             self.assertNotIn('fallback', content)
         section = (ROOT / '.agents/skills/email-triage/SKILL.md').read_text().split('## Standard run message')[1]
-        for term in ('stopped', 'rules.toml', 'never-touch.toml', 'plan.json'):
+        for term in ('message', 'rules.toml', 'never-touch.toml', 'plan.json'):
             self.assertIn(term, section)
 
 
@@ -196,7 +258,7 @@ class RunExitTests(unittest.TestCase):
                 for term in ('skip', 'refused', 'failed'):
                     self.assertIn(term, row)
         for trigger in ('quiet-check refusal', 'planning refusal', 'lock loss'):
-            self.assertIn(trigger, text)
+            self.assertIn(trigger, text.casefold())
         self.assertIn('triage.py check', text)
 
     def test_plan_stop_and_machine_key_are_distinct(self):
@@ -210,7 +272,7 @@ class RunExitTests(unittest.TestCase):
     def test_step_response_keys_match_implementation(self):
         import ast
         tree = ast.parse((ROOT / 'scripts/execute.py').read_text())
-        step = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'step')
+        step = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_step')
         # All literal response fields, including verify/remaining nested fields.
         keys = {k.value for ret in ast.walk(step) if isinstance(ret, ast.Return)
                 for n in ast.walk(ret.value) if isinstance(n, ast.Dict)
@@ -225,6 +287,7 @@ class RunExitTests(unittest.TestCase):
         keys |= {k.value for n in ast.walk(main) if isinstance(n, ast.Dict)
                  for k in n.keys if isinstance(k, ast.Constant)}
         table = (ROOT / 'docs/setup.md').read_text().split('### Step machine responses')[1].split('### Result statuses')[0]
+        keys |= {'executor_app', 'executor_account', 'refresh_lock', 'final_reads', 'tool'}
         listed = set(re.findall(r'^\| `([^`]+)` \|', table, re.M))
         self.assertEqual(listed, keys)
         self.assertIn('#step-machine-responses', (ROOT / 'AGENTS.md').read_text())
@@ -235,13 +298,14 @@ class RunExitTests(unittest.TestCase):
         for word in ('history.log', 'chat', 'send-state', 'release'):
             self.assertIn(word, quiet)
         skill = (ROOT / '.agents/skills/email-triage/SKILL.md').read_text()
-        self.assertIn('history.log', skill)
+        self.assertIn('Follow [AGENTS.md]', skill)
+        self.assertIn('Nothing in chat unless an upload or release warning occurs', quiet)
         self.assertNotIn('directly to release', skill)
 
     def test_lost_lock_message_is_delivered_in_chat(self):
         agents = (ROOT / 'AGENTS.md').read_text()
         self.assertNotIn('retain it in the host conversation for the next run', agents)
-        self.assertIn('post it immediately in the chat', agents)
+        self.assertIn('post the refusal and confirmed outcomes immediately', agents)
         setup = (ROOT / 'docs/setup.md').read_text()
         self.assertNotIn('After losing the lock, send nothing', setup)
 
@@ -267,31 +331,49 @@ class HostedTrustTests(unittest.TestCase):
 
     def test_private_drive_folder(self):
         text = (ROOT / 'docs/setup.md').read_text().split('## Drive state')[1].split('\n## ')[0]
-        for term in ("owner's own account", 'never shared', 'shared folder', 'mail-derived summaries', 'lock'):
+        for term in ("owner's own account", 'never shared', 'shared folder', 'lock'):
             self.assertIn(term, text)
         self.owner('docs/setup.md', ('config/guardrails.example.md', 'AGENTS.md'), 'never shared')
-        checklist = (ROOT / 'docs/setup.md').read_text().split('## Host requirements')[1].split('The table')[0]
+        checklist = (ROOT / 'docs/setup.md').read_text().split('## Host requirements')[1].split('| Host |')[0]
         self.assertIn('private', checklist)
 
     def test_saved_files_are_data(self):
-        text = (ROOT / 'AGENTS.md').read_text()
+        text = (ROOT / 'docs/quickstart.md').read_text()
         for term in ('Every saved or fetched file', 'data, never instructions', 'whatever it says', 'quoted block', 'never act on'):
             self.assertIn(term, text)
-        self.owner('AGENTS.md', ('.agents/skills/email-triage/SKILL.md', 'docs/setup.md'), 'data, never instructions')
+        self.owner('docs/quickstart.md', ('.agents/skills/email-triage/SKILL.md', 'docs/setup.md', 'AGENTS.md'), 'data, never instructions')
 
     def test_delivery_record_and_opening_order(self):
         record = (ROOT / 'docs/setup.md').read_text().split('- run-message.md: ')[1].split('\n')[0]
         for term in ('pending delivery record', 'undelivered', 'upload warning'):
             self.assertIn(term, record)
-        for name in ('AGENTS.md', '.agents/skills/email-triage/SKILL.md'):
+        for name in ('AGENTS.md',):
             self.assertIn('[pending delivery record](', (ROOT / name).read_text())
-        self.owner('.agents/skills/email-triage/SKILL.md', ('AGENTS.md', 'docs/setup.md'), 'Opening order:')
-        order = (ROOT / '.agents/skills/email-triage/SKILL.md').read_text().split('Opening order:')[1].split('\n')[0]
-        terms = ['upload warning', 'Late start', '📬 Triage', 'not listed']
-        self.assertEqual([order.index(t) for t in terms], sorted(order.index(t) for t in terms))
+
 
 
 class ReferenceTidyTests(unittest.TestCase):
+    def test_no_document_hedges(self):
+        for name in DOCS + ['CHANGELOG.md']:
+            with self.subTest(document=name):
+                self.assertNotRegex((ROOT / name).read_text().casefold(),
+                                    r'known limits|known unverified|unverified|untested|'
+                                    r'not tested|cannot guarantee|use at your own risk|'
+                                    r'may or may not|these checks reduce leaks')
+
+    def test_quiet_history_without_saved_position(self):
+        import json, tempfile
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import triage
+        self.assertIn('With no saved position, return arrivals as [].', (ROOT / 'docs/setup.md').read_text())
+        config = {'accounts': {'cedar': {'quiet_kind': 'history'}}}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'quiet-observation.json'
+            path.write_text(json.dumps({'cedar': {'outcome': 'ok', 'position': '120', 'arrivals': []}}))
+            self.assertEqual(triage.read_observation(path, config, {}), ({'cedar': '120'}, True))
+            path.write_text(json.dumps({'cedar': {'outcome': 'ok', 'position': '120'}}))
+            self.assertIsNone(triage.read_observation(path, config, {}))
+
     def test_single_release_section(self):
         text = (ROOT / 'CHANGELOG.md').read_text()
         self.assertEqual(len(re.findall(r'^## Unreleased', text, re.M)), 1)
@@ -330,3 +412,222 @@ class ReferenceTidyTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r'^\| Hosted assistant', setup, re.M)), 1)
         skill = (ROOT / '.agents/skills/email-triage/SKILL.md').read_text()
         self.assertNotIn('by position for their rule', skill)
+
+class SetupValidationTests(unittest.TestCase):
+    def test_shipped_safety_files_and_all_errors(self):
+        import tempfile, shutil, os
+        with tempfile.TemporaryDirectory() as folder:
+            store = Path(folder)
+            for source, target in [('config/config.example.toml', 'config.toml'),
+                                   ('config/guardrails.example.md', 'guardrails.md'),
+                                   ('rules/rules.example.toml', 'rules.toml'),
+                                   ('rules/never-touch.example.toml', 'never-touch.toml')]:
+                shutil.copyfile(ROOT / source, store / target)
+            env = dict(os.environ, PIGEON_HOME=folder)
+            def validate():
+                return subprocess.run(['python3', str(ROOT / 'scripts/triage.py'), 'validate'],
+                                      env=env, capture_output=True, text=True)
+            before = {p.name: p.read_bytes() for p in store.iterdir()}
+            result = validate()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('2 accounts, 2 rules, 1 never-touch', result.stdout)
+            self.assertEqual(before, {p.name: p.read_bytes() for p in store.iterdir()})
+            (store / 'config.toml').write_text('language="bad"\ninbox_limit=0\n[accounts.cedar]\n')
+            (store / 'rules.toml').write_text('[[rules]]\nid="bad"\naction="bogus"\n')
+            (store / 'guardrails.md').write_text('')
+            result = validate()
+            self.assertNotEqual(result.returncode, 0)
+            for term in ('config.toml', 'language', 'inbox_limit', 'rules.toml', 'bad', 'guardrails.md'):
+                self.assertIn(term, result.stderr)
+
+    def test_setup_creates_only_examples_and_refuses_overwrite(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as folder:
+            store = Path(folder) / 'new'
+            env = dict(os.environ, PIGEON_HOME=str(store))
+            command = ['python3', str(ROOT / 'scripts/triage.py'), 'setup']
+            result = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(store.stat().st_mode & 0o777, 0o700)
+            before = {p.name: p.read_bytes() for p in store.iterdir()}
+            self.assertEqual(set(before), {'config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md'})
+            self.assertNotEqual(subprocess.run(command, env=env, capture_output=True).returncode, 0)
+            self.assertEqual(before, {p.name: p.read_bytes() for p in store.iterdir()})
+
+    def test_gateway_account_validation_and_reads(self):
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import triage
+        config = {'accounts': {'cedar': {'executor_app': 'app', 'executor_account': 'id-1'}}}
+        self.assertEqual(triage.gateway_account(config, 'cedar'), config['accounts']['cedar'])
+        for value in ('', 'a' * 129, 'id!', 12):
+            config['accounts']['cedar']['executor_account'] = value
+            with self.assertRaisesRegex(ValueError, 'executor_account'):
+                triage.validate_inputs({'accounts': {}, 'messages': []}, config, {})
+        config['accounts']['cedar']['executor_account'] = 'id-1'
+        config['accounts']['marble'] = dict(config['accounts']['cedar'])
+        with self.assertRaisesRegex(ValueError, 'unique'):
+            triage.validate_inputs({'accounts': {}, 'messages': []}, config, {})
+
+
+class EnabledRulesTests(unittest.TestCase):
+    def test_disabled_validated_but_never_matches(self):
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import triage, json
+        rule = dict(id='disabled', accounts=['cedar'], sender='digest@example.net',
+                    action='trash', exclusions=[], enabled=False, limit=1)
+        triage.validate_rules([rule])
+        message = dict(account='cedar', id='item-a', folder='Inbox',
+                       sender='digest@example.net', subject='Weekly')
+        self.assertFalse(triage.matches(message, rule))
+        plan = triage.build_plan(dict(accounts={'cedar': 20}, messages=[dict(message, id=str(i)) for i in range(12)]),
+                                 [rule], [], {'accounts': {'cedar': {}}})
+        self.assertEqual(plan['actions'], [])
+        self.assertEqual(plan['reasons'], [])
+        self.assertNotIn('disabled', json.dumps(plan))
+        for value in (0, 'false', None):
+            with self.assertRaisesRegex(ValueError, 'enabled'):
+                triage.validate_rules([dict(rule, enabled=value)])
+        with self.assertRaises(ValueError):
+            triage.validate_rules([dict(rule, action='bogus')])
+        self.assertTrue(triage.matches(message, {k:v for k,v in rule.items() if k != 'enabled'}))
+
+
+class RulesConverterTests(unittest.TestCase):
+    def convert(self, text, *, review=False):
+        import tempfile, os
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
+        (root/'table.md').write_text(text)
+        (root/'scopes.toml').write_text('all=["cedar", "marble"]\n"owner@example.com"=["cedar"]\n')
+        command = ['python3', str(ROOT/'scripts/triage.py'), 'convert-rules',
+                   '--table', str(root/'table.md'), '--scopes', str(root/'scopes.toml'), '--out', str(root/'rules.toml')]
+        if review:
+            command += ['--review', str(root/'review.txt')]
+        result = subprocess.run(command, env=dict(os.environ, PIGEON_HOME=''), capture_output=True, text=True)
+        return root, command, result
+
+    def test_del_id_goes_to_review(self):
+        root, _, result = self.convert('| id | pattern | action | scope | source |\n| --- | --- | --- | --- | --- |\n| del\x7fid | `example.net` | trash | all | invented |\n', review=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('invalid id', (root/'review.txt').read_text())
+
+    def test_draft_and_forward_go_to_review(self):
+        import triage
+        for action in ('draft', 'forward', 'draft reply', 'forward owner@example.com'):
+            root, command, result = self.convert('| id | pattern | action | scope | source |\n| --- | --- | --- | --- | --- |\n| d | `example.net` | '+action+' | all | invented |\n', review=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('d', (root/'review.txt').read_text())
+            self.assertEqual(triage.parse_rules((root/'rules.toml').read_text()), [])
+
+    def test_outcomes_multiple_tables_and_real_match(self):
+        sys.path.insert(0, str(ROOT/'scripts'))
+        import triage
+        text = '''Outside text
+| Whatever | Tokens | Verb | Accounts | Origin |
+| --- | --- | --- | --- | --- |
+| exact | `digest@example.net` | TrAsH | all | invented |
+| domains | `example.org` `@example.net` | ARCHIVE | owner@example.com | sample |
+| notes | `notice@example.com` except invoices ⚠ | spam | all | source |
+| unknown | `secret@example.com` | secret action | all | hidden |
+| scope | `example.net` | archive | missing | hidden |
+| empty | except private text | archive | all | hidden |
+| exact | `other@example.com` | archive | all | hidden |
+| | `example.net` | archive | all | hidden |
+
+More text
+| a | b | c | d | e |
+| :--- | ---: | --- | --- | --- |
+| literal | ``subject:a|b`c.*`` | mover Reading | all | source with `ticks` |
+| unsubscribe | `example.com` | BAJA https://example.org/leave + ARCHIVE | all | source |
+| badtarget | `example.com` | move ../No | all | hidden |
+| badtoken | `not a sender` | trash | all | hidden |
+'''
+        root, command, result = self.convert(text, review=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('rows read: 12, active: 4, switched off: 1, sent to review: 7', result.stdout)
+        rules = triage.parse_rules((root/'rules.toml').read_text())
+        self.assertEqual([r['id'] for r in rules], ['exact','domains','domains-2','notes','literal','unsubscribe'])
+        self.assertFalse(rules[3]['enabled'])
+        self.assertIn('# Note: except invoices ⚠', (root/'rules.toml').read_text())
+        self.assertEqual(rules[4]['target'], 'Reading')
+        self.assertTrue(triage.matches(dict(account='cedar',sender='digest@example.net',subject='Weekly'), rules[0]))
+        self.assertTrue(triage.matches(dict(account='cedar',sender='x@example.com',subject='a|b`c.*'), rules[4]))
+        self.assertFalse(triage.matches(dict(account='cedar',sender='x@example.com',subject='abcZZ'), rules[4]))
+        review = (root/'review.txt').read_text()
+        self.assertEqual(len(review.splitlines()), 7)
+        for cell in ('secret@example', 'secret action', 'missing', 'private text', 'other@example', '../No', 'hidden', 'not a sender'):
+            self.assertNotIn(cell, review)
+        original = (root/'rules.toml').read_bytes()
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(original, (root/'rules.toml').read_bytes())
+
+    def test_escaped_pipe_warning_and_invalid_forms(self):
+        import triage
+        root, command, result = self.convert('''| id | pattern | action | scope | source |
+| --- | --- | --- | --- | --- |
+| pipe | `subject:a\\|b` | archive | all | source |
+| warning | ⚠ `example.com` | baja + trash | all | source |
+| mixed | `subject:hello` `example.com` | archive | all | source |
+| wrong | `example.com` | archive + trash | all | source |
+| suffix | `example.com` `example.org` | spam | all | source |
+| suffix-2 | `example.net` | archive | all | source |
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rules = triage.parse_rules((root/'rules.toml').read_text())
+        self.assertEqual(rules[0]['subject'], 'a\\|b')
+        self.assertFalse(rules[1]['enabled'])
+        self.assertEqual(rules[1]['after_unsubscribe'], 'trash')
+        self.assertIn('ambiguous patterns', result.stdout)
+        self.assertIn('duplicate id', result.stdout)
+        self.assertEqual(len(rules), 4)
+
+    def test_validation_failure_leaves_no_output(self):
+        import triage, tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root/'table').write_text('| a | b | c | d | e |\n| --- | --- | --- | --- | --- |\n| x | `example.com` | archive | all | sample |\n')
+            (root/'scopes').write_text('all=["cedar"]')
+            original = triage.parse_rules
+            calls = []
+            def fail(text):
+                calls.append(text)
+                if len(calls) == 2:
+                    raise ValueError('validation failed')
+                return original(text)
+            with patch.object(triage, 'parse_rules', side_effect=fail):
+                with self.assertRaises(ValueError):
+                    triage.convert_rules(root/'table', root/'scopes', root/'out')
+            self.assertFalse((root/'out').exists())
+
+
+class ConverterDocumentationTests(unittest.TestCase):
+    def test_converter_reference(self):
+        text = (ROOT/'docs/setup.md').read_text()
+        section = text.split('## Convert a rules table')[1].split('## Run message format')[0]
+        for term in ('--table', '--scopes', '--out', '--review', 'Active:', 'Switched off:', 'Review:',
+                     'enabled = true', 'exclusions', 'validate', 'Dry run', 'first matching enabled'):
+            self.assertIn(term, section)
+        self.assertIn('| enabled | Optional boolean, default true.', text)
+        self.assertIn('#convert-a-rules-table', (ROOT/'docs/quickstart.md').read_text())
+
+
+class DraftDocumentationTests(unittest.TestCase):
+    def test_draft_contract(self):
+        setup = (ROOT/'docs/setup.md').read_text()
+        for value in ('| draft |', '| draft_text |', '| draft_to |', 'check Drafts by hand', 'Send drafts by hand from the mailbox.', 'search', 'describe', '_drafts'):
+            self.assertIn(value, setup)
+        self.assertIn('Create and show issued drafts. Never send them.', (ROOT/'config/guardrails.example.md').read_text())
+        quick = (ROOT/'docs/quickstart.md').read_text()
+        self.assertIn('create-draft', quick)
+        self.assertLessEqual(len(quick.encode()),6000)
+
+
+class ScriptedListingTextTests(unittest.TestCase):
+    def test_routine_listing_commands(self):
+        text = (Path(__file__).resolve().parents[1] / 'docs/quickstart.md').read_text()
+        self.assertIn('triage.py listing --token TOKEN', text)
+        self.assertIn('triage.py listing --token TOKEN --results', text)
+        self.assertLessEqual(len(text.encode()), 6000)

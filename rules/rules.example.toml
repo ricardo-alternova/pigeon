@@ -16,14 +16,14 @@ domain = "example.org"
 has_attachment = true
 action = "archive"
 
-# Body rule example (invented):
+# Body rule example:
 # [[rules]]
 # id = "delivery-notices"
 # accounts = ["cedar"]
 # body = "colis livré"
 # action = "archive"
 
-# Question rule example (invented):
+# Question rule example:
 # [[rules]]
 # id = "renewal-question"
 # accounts = ["cedar"]
@@ -31,7 +31,7 @@ action = "archive"
 # action = "report"
 # question = "Keep this renewal notice?"
 
-# Dated folder and per-rule limit example (invented):
+# Dated folder and per-rule limit example:
 # [[rules]]
 # id = "monthly-invoices"
 # accounts = ["cedar"]
@@ -40,7 +40,7 @@ action = "archive"
 # target = "Invoices/{year}/{month}"
 # limit = 20
 
-# Fixed folder move (requires an existing unique path):
+# Fixed folder move:
 # [[rules]]
 # id = "reading"
 # accounts = ["cedar"]
@@ -48,17 +48,26 @@ action = "archive"
 # action = "move"
 # target = "Reading"
 
-# Spam moves to Junk without reporting or blocking:
+# Spam:
 # [[rules]]
 # id = "junk"
 # accounts = ["cedar"]
 # sender = "offers@example.invalid"
 # action = "spam"
 
-# Unsubscribe and a companion removal (two actions per matching message):
+# Unsubscribe with archive:
 # [[rules]]
 # id = "unsubscribe-digest"
 # accounts = ["cedar"]
 # sender = "news@example.net"
 # action = "unsubscribe"
 # after_unsubscribe = "archive"
+
+
+# [[rules]]
+# id = "reply-draft-example"
+# accounts = ["cedar"]
+# subject = "Draft example only"
+# action = "draft"
+# draft = "reply"
+# draft_text = "Thank you. I will review this."

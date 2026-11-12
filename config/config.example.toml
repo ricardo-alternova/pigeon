@@ -1,6 +1,8 @@
+version = 1
 # Key reference: docs/setup.md#configuration
 language = "en"
-# Time zone for the assistant’s run message.
+relist_inbox = "all"
+# Time zone for schedule slots and the run message.
 timezone = "UTC"
 # Maximum Inbox messages across all accounts before the planner stops.
 inbox_limit = 100
@@ -24,12 +26,33 @@ inbox_limit = 100
 # account = "drive-example"
 # folder = "state-example"
 
+# Set provider to gmail or outlook to enable scripted listing.
+# provider belongs inside each account table.
 [accounts.cedar]
+# provider = "gmail"
 quiet_kind = "history" # Mailbox supports change history.
 executor_app = "cedar-mail"
+executor_account = "mailbox-example-1"
 address = "reader@example.com"
 
 [accounts.marble]
+# provider = "outlook"
 quiet_kind = "ids" # No change history; newest 10 Inbox IDs.
 executor_app = "marble-mail"
+executor_account = "mailbox-example-2"
 address = "reader@example.org"
+
+# Optional read-only calendars: docs/setup.md#calendar-input
+# [calendar]
+# days = 3
+# work_start = "09:00"
+# work_end = "17:00"
+# quiet_start = "12:00"
+# quiet_end = "13:00"
+# [calendars.oak]
+# executor_app = "oak-events"
+# executor_account = "calendar-example-1"
+# wins = true
+# [calendars.elm]
+# executor_app = "elm-events"
+# executor_account = "calendar-example-2"

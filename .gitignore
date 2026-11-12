@@ -37,6 +37,7 @@ tests/fixtures/*
 !.agents/skills/email-triage/SKILL.md
 !.claude/skills
 !docs/setup.md
+!docs/quickstart.md
 !config/config.example.toml
 !config/guardrails.example.md
 !rules/rules.example.toml

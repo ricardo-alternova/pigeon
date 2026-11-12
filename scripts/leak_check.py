@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 """Fail closed on unreviewed paths and private-looking values. Python 3.11+."""
-# Known limits: zero-width and full-width characters, URL-encoded values, and
-# values split across lines need the deny-list scan and publication audit.
-# Commit messages are first checked at push time.
 import argparse
 import ipaddress
 from pathlib import Path
@@ -11,7 +8,7 @@ import subprocess
 import sys
 
 ALLOWLIST = set('''CHANGELOG.md README.md LICENSE AGENTS.md CLAUDE.md .gitignore
-.agents/skills/email-triage/SKILL.md .claude/skills docs/setup.md
+.agents/skills/email-triage/SKILL.md .claude/skills docs/setup.md docs/quickstart.md
 config/config.example.toml config/guardrails.example.md
 rules/rules.example.toml rules/never-touch.example.toml
 scripts/unsubscribe.py tests/test_unsubscribe.py scripts/triage.py scripts/execute.py tests/mock_provider.py tests/test_execute.py scripts/leak_check.py hooks/pre-commit hooks/pre-push

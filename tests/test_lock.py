@@ -11,6 +11,7 @@ import unittest
 from test_matcher import ROOT, triage
 
 sys.path.insert(0, str(ROOT / 'scripts'))
+import execute
 
 
 class LockTests(unittest.TestCase):
@@ -141,14 +142,15 @@ class LockTests(unittest.TestCase):
                     machine.step(MockProvider(['b'], outcome='error' if status == 'failed' else 'ok', remove=False))
                 result = self.run_commit(store, token, '--results', str(store / 'results.json'))
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads((store / 'state.json').read_text()), {'cedar': 1, 'marble': 7})
+                self.assertEqual(json.loads((store / 'state.json').read_text()), {'version': 1, 'cedar': 1, 'marble': 7})
 
-    def test_no_results_saves_observed(self):
+    def test_default_results_saves_observed(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
             token, _ = self.two_trash(store)
+            execute.Execution(store, token, store / 'plan.json').step()
             self.assertEqual(self.run_commit(store, token).returncode, 0)
-            self.assertEqual(json.loads((store / 'state.json').read_text()), {'cedar': 2, 'marble': 7})
+            self.assertEqual(json.loads((store / 'state.json').read_text()), {'version': 1, 'cedar': 2, 'marble': 7})
 
     def test_stopped_commit_keeps_observed_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -158,9 +160,10 @@ class LockTests(unittest.TestCase):
             plan = json.loads(path.read_text())
             plan['reasons'] = ['Stopped before execution']
             path.write_text(json.dumps(plan))
+            execute.Execution(store, token, store / 'plan.json').step()
             result = self.run_commit(store, token)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads((store / 'state.json').read_text()), {'cedar': 2, 'marble': 7})
+            self.assertEqual(json.loads((store / 'state.json').read_text()), {'version': 1, 'cedar': 2, 'marble': 7})
 
     def test_executed_nonremoval_never_decrements(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -220,25 +223,40 @@ class LockTests(unittest.TestCase):
                 self.assertIn(b'run.lock', result.stderr)
                 self.assertEqual((store / 'state.json').read_bytes(), before)
 
+
     def test_missing_state_first_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
             self.prepare(store)
             (store / 'state.json').unlink()
             token = triage.acquire(store)
-            result = self.run_plan(store, token)
+            result = self.run_plan(store, token, '--plan-out', str(store / 'plan.json'))
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('Missing state', result.stdout.decode())
-            self.assertIn('"actions": []', result.stdout.decode())
-            self.assertFalse((store / 'state.json').exists())
-            result = self.run_plan(store, token, '--first-run')
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse((store / 'state.json').exists())
-            result = self.run_plan(store, token, '--first-run', '--plan-out', str(store / 'plan.json'))
-            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads((store / 'plan.json').read_text())
+            self.assertTrue(plan['first_run'])
+            self.assertTrue(plan['actions'])
+            self.assertFalse(plan['reasons'])
+            execute.Execution(store, token, store / 'plan.json').step()
             self.assertEqual(self.run_commit(store, token).returncode, 0)
-            self.assertTrue((store / 'state.json').exists())
             triage.release(store, token)
+            token = triage.acquire(store)
+            result = self.run_plan(store, token, '--plan-out', str(store / 'plan.json'))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(json.loads((store / 'plan.json').read_text())['first_run'])
+            triage.release(store, token)
+            (store / 'state.json').unlink()
+            for name in ('numbers.json', 'history.log', 'calls.jsonl', 'decisions.jsonl'):
+                with self.subTest(name=name):
+                    # Check each prior-record sentinel independently.
+                    for other in ('numbers.json', 'history.log', 'calls.jsonl', 'decisions.jsonl'):
+                        (store / other).unlink(missing_ok=True)
+                    (store / name).write_text('{"next":1,"items":[]}' if name == 'numbers.json' else '')
+                    token = triage.acquire(store)
+                    result = self.run_plan(store, token)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('Missing state', result.stdout.decode())
+                    self.assertIn('"actions": []', result.stdout.decode())
+                    triage.release(store, token)
 
     def test_malformed_state_even_first_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -247,7 +265,7 @@ class LockTests(unittest.TestCase):
             for text in ('{', '[]', 'null', '{"cedar": true}', '{"cedar": -4}', '{"cedar": NaN}', '{"cedar": "3"}'):
                 (store / 'state.json').write_text(text)
                 token = triage.acquire(store)
-                result = self.run_plan(store, token, '--first-run')
+                result = self.run_plan(store, token)
                 self.assertNotEqual(result.returncode, 0, text)
                 self.assertEqual(result.stdout, b'')
                 self.assertFalse((store / 'run.lock').exists())
@@ -293,6 +311,20 @@ class LockTests(unittest.TestCase):
                 result = self.run_plan(store, token)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, b'')
+
+    def test_local_refresh_clock_and_wrong_holder(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            shutil.copyfile(ROOT / 'config/config.example.toml', store / 'config.toml')
+            with patch.object(triage.time, 'time', return_value=10000):
+                token = triage.acquire(store)
+            with self.assertRaises(ValueError):
+                triage.refresh(store, 'wrong', now=datetime.fromtimestamp(12000, timezone.utc))
+            triage.refresh(store, token, now=datetime.fromtimestamp(12000, timezone.utc))
+            triage.require_lock(store, token, now=14000)
+            with self.assertRaises(ValueError):
+                triage.refresh(store, token, now=datetime.fromtimestamp(14701, timezone.utc))
 
     def test_expiry_boundary(self):
         from unittest.mock import patch
@@ -351,7 +383,7 @@ class LockTests(unittest.TestCase):
             token = triage.acquire(store)
             result = self.run_plan(store, token, encoding='latin-1')
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('Needs you', result.stdout.decode('utf-8'))
+            self.assertIn('Still in Inbox (by account)', result.stdout.decode('utf-8'))
             triage.release(store, token)
 
     def test_invalid_lock_held(self):
@@ -371,6 +403,7 @@ class LockTests(unittest.TestCase):
             token = triage.acquire(store)
             plan = store / 'plan.json'
             self.assertEqual(self.run_plan(store, token, '--plan-out', str(plan)).returncode, 0)
+            execute.Execution(store, token, plan).step()
             before = (store / 'state.json').read_bytes()
             with patch.dict(os.environ, PIGEON_HOME=tmp), patch.object(Path, 'replace', side_effect=OSError('Injected state publication failure')):
                 with self.assertRaises(OSError):
@@ -430,8 +463,9 @@ class LockTests(unittest.TestCase):
             result = self.run_plan(store, token, '--inbox', str(store / 'extra.json'), '--plan-out', str(store / 'plan.json'))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(json.loads((store / 'plan.json').read_text())['reasons'])
+            execute.Execution(store, token, store / 'plan.json').step()
             self.assertEqual(self.run_commit(store, token).returncode, 0)
-            self.assertEqual(set(json.loads((store / 'state.json').read_text())), {'cedar', 'marble'})
+            self.assertEqual(set(json.loads((store / 'state.json').read_text())), {'version', 'cedar', 'marble'})
             self.assertEqual(self.run_plan(store, token).returncode, 0)
 
     def test_invalid_regex_cli_refusal(self):
@@ -461,8 +495,9 @@ class LockTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 plan = json.loads((store / 'plan.json').read_text())
                 self.assertEqual(bool(plan['reasons']), stopped)
+                execute.Execution(store, token, store / 'plan.json').step()
                 self.assertEqual(self.run_commit(store, token).returncode, 0)
-                self.assertEqual(json.loads((store / 'state.json').read_text()), {'cedar': 0, 'marble': 0})
+                self.assertEqual(json.loads((store / 'state.json').read_text()), {'version': 1, 'cedar': 0, 'marble': 0})
                 triage.release(store, token)
 
     def test_unlisted_account_keeps_saved_count(self):
@@ -595,6 +630,49 @@ class QuietTests(unittest.TestCase):
     def decide(self, scheduled=True):
         self.obs.write_text(json.dumps(self.data))
         return triage.quiet_check(self.store, self.config, self.previous, self.obs, scheduled, self.now)['decision']
+
+    def test_gateway_ids_and_loud_invalid_fields(self):
+        import contextlib, io, copy
+        ident = 'AAMk+abc/def=='
+        self.previous['_positions']['marble'] = [ident]
+        self.data['marble']['ids'] = [ident]
+        self.assertEqual(self.decide(), 'skip')
+        self.data['cedar']['arrivals'] = [ident]
+        self.assertEqual(self.decide(), 'full')
+        self.data['cedar']['arrivals'] = []
+        original = copy.deepcopy(self.data)
+        for account, field, value in [('marble', 'ids', [x]) for x in
+                ('bad id', 'bad\x01id', 'é', 'x' * 513)] + [
+                ('cedar', 'arrivals', ['bad id']), ('cedar', 'position', 'bad'),
+                ('cedar', 'outcome', 'expired')]:
+            self.data = copy.deepcopy(original)
+            self.data[account][field] = value
+            (self.store / 'state.json').write_text(json.dumps(self.previous))
+            before = (self.store / 'state.json').read_bytes()
+            out = io.StringIO()
+            with contextlib.redirect_stderr(out):
+                self.assertEqual(self.decide(), 'full')
+            self.assertIn(account, out.getvalue())
+            self.assertIn(field, out.getvalue())
+            self.assertEqual(before, (self.store / 'state.json').read_bytes())
+        for raw, field in [(None, 'observation'), ('{', 'observation'),
+                           (' ' * (triage.OBSERVATION_LIMIT + 1), 'observation'),
+                           ('{}', 'accounts')]:
+            self.obs.unlink(missing_ok=True)
+            if raw is not None: self.obs.write_text(raw)
+            out = io.StringIO()
+            with contextlib.redirect_stderr(out):
+                self.assertIsNone(triage.read_observation(self.obs, self.config, {}))
+            self.assertIn('cedar', out.getvalue())
+            self.assertIn(field, out.getvalue())
+        self.obs.write_text(json.dumps(original))
+        self.obs.chmod(0)
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            self.assertIsNone(triage.read_observation(self.obs, self.config, {}))
+        self.assertIn('cedar', out.getvalue())
+        self.assertIn('observation', out.getvalue())
+        self.obs.chmod(0o600)
 
     def test_skip_history_and_ids_unchanged(self):
         self.assertEqual(self.decide(), 'skip')
@@ -952,6 +1030,76 @@ class DriveLockTests(unittest.TestCase):
         self.assertFalse(any(c['operation'] == 'delete' for c in self.drive.calls))
         with self.assertRaises(ValueError): self.start()
         with self.assertRaises(ValueError): self.observe(data)
+
+    def test_drive_dry_commit_issues_no_read(self):
+        from unittest.mock import patch
+        token = self.acquire()
+        path = self.store / 'plan.json'
+        execute.atomic(path, dict(dry_run=True))
+        with patch.object(triage, 'private_store', return_value=self.store), patch.object(triage, 'drive_lock', side_effect=AssertionError('drive call')):
+            with self.assertRaisesRegex(ValueError, 'dry-run'):
+                triage.main(['commit-state', '--token', token, '--plan', str(path)])
+            with self.assertRaisesRegex(ValueError, 'dry-run'):
+                triage.finish_run(self.store, token, path, now=self.now)
+
+    def test_batch_acquisition_interleaved_exclusion(self):
+        other = self.store / 'other'
+        other.mkdir()
+        shutil.copyfile(self.store / 'config.toml', other / 'config.toml')
+        calls_a = triage.batch_lock(self.store, now=self.now)['calls']
+        calls_b = triage.batch_lock(other, now=self.now)['calls']
+        a = self.drive.perform(calls_a[0])
+        b = self.drive.perform(calls_b[0])
+        read_a = self.drive.perform(calls_a[1])
+        read_b = self.drive.perform(calls_b[1])
+        token = triage.batch_lock(self.store, dict(create=a, read=read_a), now=self.now)
+        self.check(token)
+        with self.assertRaisesRegex(ValueError, 'busy'):
+            triage.batch_lock(other, dict(create=b, read=read_b), now=self.now)
+        self.assertFalse((other / 'run.lock').exists())
+
+    def test_finish_batches_uploads_then_conditional_release(self):
+        token = self.acquire()
+        (self.store / 'rules.toml').write_text('rules=[]\n')
+        (self.store / 'never-touch.toml').write_text('allow_empty=true\n')
+        listing = execute.read(self.store / 'inbox.json')
+        plan = triage.build_plan(listing, [], [], triage.state_config(self.store), {})
+        execute.atomic(self.store / 'plan.json', plan)
+        execute.Execution(self.store, token, self.store / 'plan.json').step()
+        first = triage.finish_run(self.store, token, self.store / 'plan.json', now=self.now)
+        self.assertEqual(first['call']['operation'], 'read')
+        second = triage.finish_run(self.store, token, self.store / 'plan.json', self.drive.perform(first['call']), now=self.now)
+        self.assertEqual(second['calls'][-1]['operation'], 'delete')
+        result = triage.finish_run(self.store, token, self.store / 'plan.json', dict(uploads={}, release=self.drive.perform(second['calls'][-1])), now=self.now)
+        self.assertTrue(result['done'])
+        self.assertIn('Triage', result['message'])
+        self.assertFalse((self.store / 'run.lock').exists())
+
+    def test_refresh_keeps_token_and_replaces_lease(self):
+        from datetime import timedelta
+        token = self.acquire()
+        old = triage.read_lock(self.store)
+        self.now += timedelta(minutes=40)
+        self.drive.created = self.now.isoformat()
+        result = self.start('refresh', token)
+        with self.assertRaises(ValueError):
+            self.check(token)
+        for operation in ('delete', 'create', 'read'):
+            self.assertEqual(result['call']['operation'], operation)
+            result = self.observe(self.drive.perform(result['call']), 'refresh', token)
+        self.assertEqual(result, token)
+        self.assertGreater(triage.read_lock(self.store, now=self.now.timestamp())['created'], old['created'])
+        self.assertEqual(triage.read_lock(self.store, now=self.now.timestamp())['started'], old['created'])
+        self.check(token)
+
+    def test_refresh_lost_condition_stops(self):
+        token = self.acquire()
+        result = self.start('refresh', token)
+        self.drive.item['etag'] = 'other'
+        with self.assertRaises(ValueError):
+            self.observe(self.drive.perform(result['call']), 'refresh', token)
+        with self.assertRaises(ValueError):
+            self.check(token)
 
     def test_confirmation_deterministic_without_process_or_network(self):
         from unittest.mock import patch
@@ -1433,6 +1581,7 @@ class DriveStateTests(unittest.TestCase):
     acquire = DriveLockTests.acquire
 
     def configured(self, kind='gdrive'):
+        self.drive.files['state.json'] = (self.store / 'state.json').read_bytes()
         with (self.store / 'config.toml').open('a') as out:
             out.write('\n[state]\nkind="' + kind + '"\naccount="state-example"\nfolder="files-example"\n')
         self.token = self.acquire()
@@ -1463,6 +1612,55 @@ class DriveStateTests(unittest.TestCase):
             observation = failure if failure is not None else self.drive.file_call(call)
             result = self.exchange('send', observation)
         return names, result
+
+    def test_empty_drive_preserves_local_records(self):
+        self.configured()
+        self.drive.files.clear()
+        (self.store / 'numbers.json').write_text('{"next":8,"items":[]}')
+        before = (self.store / 'numbers.json').read_bytes()
+        with self.assertRaisesRegex(ValueError, 'drive store empty but local records exist'):
+            self.fetch()
+        self.assertEqual((self.store / 'numbers.json').read_bytes(), before)
+
+    def test_finish_drive_state_batch(self):
+        token = self.configured()
+        self.fetch()
+        (self.store / 'rules.toml').write_text('rules=[]\n')
+        (self.store / 'never-touch.toml').write_text('allow_empty=true\n')
+        listing = execute.read(self.store / 'inbox.json')
+        plan = triage.build_plan(listing, [], [], triage.state_config(self.store), {})
+        path = self.store / 'plan.json'
+        execute.atomic(path, plan)
+        execute.Execution(self.store, token, path).step()
+        first = triage.finish_run(self.store, token, path, now=self.now)
+        second = triage.finish_run(self.store, token, path, self.drive.perform(first['call']), now=self.now)
+        uploads = second['calls'][:-1]
+        self.assertGreater(len(uploads), 1)
+        self.assertEqual(uploads[-1]['name'], 'state.json')
+        outcomes = {c['name']: self.drive.file_call(c) for c in uploads}
+        released = self.drive.perform(second['calls'][-1])
+        done = triage.finish_run(self.store, token, path, dict(uploads=outcomes, release=released), now=self.now)
+        self.assertTrue(done['done'])
+        self.assertEqual(done['failed'], [])
+        with self.assertRaises(ValueError):
+            triage.finish_run(self.store, token, path, dict(uploads=outcomes, release=released), now=self.now)
+        self.assertIsNone(self.drive.item)
+        self.assertEqual(json.loads(self.drive.files['state.json'])['cedar'], sum(m['account'] == 'cedar' for m in listing['messages']))
+
+    def test_finish_failed_upload_warns_and_releases(self):
+        token = self.configured()
+        self.fetch()
+        first = triage.finish_run(self.store, token, now=self.now)
+        second = triage.finish_run(self.store, token, observation=self.drive.perform(first['call']), now=self.now)
+        uploads = second['calls'][:-1]
+        self.assertTrue(uploads)
+        outcomes = {c['name']: dict(status='failed') for c in uploads}
+        released = self.drive.perform(second['calls'][-1])
+        done = triage.finish_run(self.store, token, observation=dict(uploads=outcomes, release=released), now=self.now)
+        self.assertEqual(set(done['failed']), set(outcomes))
+        self.assertTrue(done['message'].startswith('Saved files on the drive are out of date:'))
+        self.assertIsNone(self.drive.item)
+        self.assertTrue((self.store / 'run-message.md').exists())
 
     def test_incoming_cleanup_refuses_links_and_subfolders(self):
         self.configured()
@@ -1559,6 +1757,8 @@ class DriveStateTests(unittest.TestCase):
 
     def test_empty_folder_and_two_stores_reproduce(self):
         self.configured('onedrive')
+        self.drive.files.clear()
+        (self.store / 'state.json').unlink()
         self.assertEqual(self.fetch(), {'done': True})
         self.assertFalse((self.store / 'state.json').exists())
         self.assertTrue((self.store / 'rules.toml').exists())
@@ -1590,7 +1790,7 @@ class DriveStateTests(unittest.TestCase):
         self.configured()
         result = self.exchange('fetch')
         self.assertTrue(all(c['kind'] == 'gdrive' for c in result['calls']))
-        self.assertEqual(tuple(c['name'] for c in result['calls']), ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json', 'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md', 'rules.toml', 'never-touch.toml', 'state.json'))
+        self.assertEqual(tuple(c['name'] for c in result['calls']), ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json', 'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md', 'rules.toml', 'never-touch.toml', 'tool-paths.json', 'state.json'))
 
     def test_state_config_refusals(self):
         for value in (None, [], {}, {'kind': 'typo'}, {'kind': 'local', 'account': 'a'},
@@ -1752,8 +1952,9 @@ class DriveStateTests(unittest.TestCase):
         listing = dict(accounts={'cedar': 100}, messages=[dict(account='cedar', id='x', folder='Inbox', sender='helper@example.org', subject='Question')])
         (self.store / 'inbox.json').write_text(json.dumps(listing))
         (self.store / 'numbers.json').write_text(json.dumps(dict(next=2, items=[dict(number=1, account='cedar', id='x')])))
+        (self.store / 'state.json').write_text('{"cedar":1}')
         (self.store / 'reply.txt').write_text('1 trash')
-        self.plan_command('reply', '--token', self.token, '--inbox', str(self.store / 'inbox.json'), '--reply', str(self.store / 'reply.txt'), '--first-run', '--plan-out', str(self.store / 'plan.json'))
+        self.plan_command('reply', '--token', self.token, '--inbox', str(self.store / 'inbox.json'), '--reply', str(self.store / 'reply.txt'), '--plan-out', str(self.store / 'plan.json'))
         machine = execute.Execution(self.store, self.token, self.store / 'plan.json')
         self.assertEqual(machine.step()['action'], 'trash')
         self.assertEqual(machine.step(execute.AssistantProvider(dict(outcome='ok', inbox_ids=[])))['status'], 'executed')
@@ -1806,6 +2007,7 @@ class DriveStateTests(unittest.TestCase):
         (self.store / 'state-incoming' / 'unexpected').write_text('x')
         self.exchange('fetch')
         self.assertFalse((self.store / 'state-incoming' / 'unexpected').exists())
+        (self.store / 'state.json').unlink(missing_ok=True)
         self.exchange('fetch', dict.fromkeys(triage.STATE_FILES, 'absent'))
         with self.assertRaises(ValueError): self.exchange('fetch', dict.fromkeys(triage.STATE_FILES, 'absent'))
         for value in ('[]', '{', '{}' + ' ' * 4097):
@@ -1920,7 +2122,7 @@ class DriveStateTests(unittest.TestCase):
         self.commit()
         names, _ = self.send()
         self.assertEqual(set(names), {'numbers.json', 'state.json'})
-        self.assertEqual(json.loads(self.drive.files['state.json']), {'cedar': 0})
+        self.assertEqual(json.loads(self.drive.files['state.json']), {'version': 1, 'cedar': 0})
 
     def test_lost_lock_fetch_no_download_issued(self):
         self.configured()
@@ -2221,7 +2423,7 @@ class ParserRefusalTests(unittest.TestCase):
                 with self.subTest(raw=raw):
                     (store / 'reply.txt').write_bytes(raw)
                     result = subprocess.run([shutil.which('python3'), 'scripts/triage.py', 'reply', '--token', token,
-                                             '--first-run', '--inbox', str(store / 'inbox.json'), '--reply', str(store / 'reply.txt'),
+                                             '--inbox', str(store / 'inbox.json'), '--reply', str(store / 'reply.txt'),
                                              '--plan-out', str(store / 'plan.json'), '--report-out', str(store / 'report.md')],
                                             cwd=ROOT, env={'PATH': os.environ['PATH'], 'PIGEON_HOME': tmp}, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
