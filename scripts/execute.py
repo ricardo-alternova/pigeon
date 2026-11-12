@@ -11,14 +11,13 @@ from pathlib import Path
 import sys
 import tempfile
 import time
-import tomllib
 
 import triage
 import unsubscribe
 
 
 def read(path):
-    return json.loads(triage.load_inputs([path])[0])
+    return triage.parse_json(triage.load_inputs([path])[0], path)
 
 
 def atomic(path, value):
@@ -64,6 +63,7 @@ class Execution:
         outputs = {store / n for n in ('results.json', 'execution-report.md', 'calls.jsonl')}
         if self.plan_path in outputs or self.plan_path == self.path:
             raise ValueError(str(plan_path) + ': expected a plan path distinct from execution outputs')
+        triage.require_fetched(store, token)
         self.plan = read(self.plan_path)
         self.signature = hashlib.sha256(json.dumps(self.plan, sort_keys=True).encode()).hexdigest()
         self.state = read(self.path) if self.path.exists() else dict(signature=self.signature, pending=None, results=[], failures={})
@@ -113,7 +113,7 @@ class Execution:
     def validate(self):
         listing = read(self.store / 'inbox.json')
         triage.validate_actions(self.plan['actions'], listing)
-        config = tomllib.loads(triage.load_inputs([self.store / 'config.toml'])[0])
+        config = triage.parse_toml(triage.load_inputs([self.store / 'config.toml'])[0], self.store / 'config.toml')
         rules = triage.parse_rules(triage.load_inputs([self.store / 'rules.toml'])[0])
         holds = triage.parse_rules(triage.load_inputs([self.store / 'never-touch.toml'])[0], protection=True)
         previous = read(self.store / 'state.json') if (self.store / 'state.json').exists() else {}
@@ -121,7 +121,17 @@ class Execution:
         if type(first_run) is not bool:
             raise ValueError(str(self.plan_path) + '.first_run: expected boolean')
         stops = ['Missing state; use --first-run only for an explicit first run'] if not (self.store / 'state.json').exists() and not first_run else []
-        expected = triage.build_plan(listing, rules, holds, config, previous, stops)
+        if 'reply' in self.plan:
+            saved = read(self.store / 'reply.json')
+            if saved.get('token') != self.token:
+                raise ValueError('reply.json: expected current token')
+            expected = triage.reply_plan(self.store, listing, holds, config, previous, saved['parts'], stops)
+            if self.plan['reply'] != expected['reply']:
+                raise ValueError('reply: expected saved user selections')
+        elif self.plan['reasons'] and self.plan['reasons'][0].startswith('Reply refused:'):
+            expected = triage.build_plan(listing, [], holds, config, previous, self.plan['reasons'])
+        else:
+            expected = triage.build_plan(listing, rules, holds, config, previous, stops)
         if self.plan['actions'] != expected['actions'] or self.plan['counts'] != expected['counts']:
             raise ValueError(str(self.plan_path) + '.actions: expected actions and counts from current private inputs and Inbox listing')
 
@@ -142,13 +152,7 @@ class Execution:
     def unsubscribe(self, call, gate):
         path = self.store / 'unsubscribe-failures.json'
         memory = read(path) if path.exists() else {'senders': []}
-        triage.known_keys(memory, {'version', 'senders'}, path.name)
-        if 'version' in memory and (type(memory['version']) is not int or memory['version'] != 2):
-            raise ValueError(path.name + '.version: expected 2')
-        if (not isinstance(memory.get('senders'), list)
-                or any(not isinstance(x, str) or len(x) != 64 or any(c not in '0123456789abcdef' for c in x) for x in memory['senders'])
-                or len(set(memory['senders'])) != len(memory['senders'])):
-            raise ValueError(path.name + '.senders: expected unique lowercase 64-character digest strings')
+        triage.validate_unsubscribe_memory(memory)
         message = next(m for m in read(self.store / 'inbox.json')['messages']
                        if (m['account'], m['id']) == (call['account'], call['id']))
         secret = self.store / 'unsubscribe-secret'
@@ -162,7 +166,7 @@ class Execution:
                 raise ValueError(secret.name + ': expected existing secret for keyed memory')
             with open(secret, 'x', encoding='ascii', opener=lambda name, flags: os.open(name, flags, 0o600)) as out:
                 out.write(secrets.token_hex(32))
-        key_text = secret.read_text(encoding='ascii')
+        key_text = triage.read_text(secret, encoding='ascii')
         if len(key_text) != 64 or any(c not in '0123456789abcdef' for c in key_text):
             raise ValueError(secret.name + ': expected 32-byte lowercase hex secret')
         sender = hmac.new(bytes.fromhex(key_text), (call['account'] + '\0' + triage.normalize_sender(message['sender'])).encode(), hashlib.sha256).hexdigest()
@@ -336,7 +340,7 @@ def render_summary(store, token, signature=None, plan_path=None):
     lines += instructions or ['none']
     lines += ['', '**Unplanned calls**', '']
     log = store / 'calls.jsonl'
-    unplanned = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    unplanned = [triage.parse_json(line, log) for line in triage.read_text(log).splitlines()] if log.exists() else []
     lines += [triage.safe_text(json.dumps(e, ensure_ascii=True)) for e in unplanned
               if e['run'] == token and e['outcome'] == 'unplanned'] or ['none']
     atomic_text(store / 'execution-report.md', '\n'.join(lines) + '\n')
@@ -353,7 +357,7 @@ def atomic_text(path, text):
 
 def append_log(store, token, call, outcome):
     path = store / 'calls.jsonl'
-    sequence = len(path.read_text(encoding='utf-8').splitlines()) + 1 if path.exists() else 1
+    sequence = len(triage.read_text(path).splitlines()) + 1 if path.exists() else 1
     entry = dict(sequence=sequence, time=time.time(), run=token, account=call['account'], id=call['id'],
                  verb=call['action'], outcome=outcome)
     # JSON quoting escapes controls; Markdown rendering additionally uses safe_text.
@@ -393,7 +397,7 @@ def main():
             try:
                 observation = json.loads(args.observation)
             except ValueError as error:
-                raise ValueError('observation: expected a JSON object with outcome and inbox_ids; ' + str(error)) from error
+                raise ValueError('--observation: expected a JSON object with outcome and inbox_ids') from error
             provider = AssistantProvider(observation)
         print(json.dumps(execution.step(provider, local=args.command == 'unsubscribe'), ensure_ascii=True))
 

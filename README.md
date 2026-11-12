@@ -10,7 +10,11 @@ See the four [host requirements](docs/setup.md#host-requirements). The scripts n
 
 ## Quick start
 
-Clone https://github.com/ricardo-alternova/pigeon and enter that folder, or use your existing checkout. Run the following in Bash. This runs on sample mail in private/demo and overwrites its sample settings. No mail is touched. This also enables the repository’s commit hooks. A private store is the folder holding your local settings and reports.
+Give your always-on hosted assistant this repository and one entry instruction: follow [AGENTS.md](AGENTS.md). It runs on its own schedule, posts the run message in its chat, and accepts your numbered replies there. Use the ordered [hosted setup](docs/setup.md#hosted-setup) to reach your first attended run using the [storage choice](docs/setup.md#storage-choice) for your host.
+
+### Developer machine
+
+A local folder is also supported. Clone https://github.com/ricardo-alternova/pigeon and enter the checkout. This Bash demo uses sample mail only and overwrites private/demo settings; it enables commit hooks. For real mail use [setup](docs/setup.md).
 
 <!-- quick-start -->
 ```bash
@@ -48,7 +52,7 @@ Before contributing, enable the hooks as above, use invented examples on example
 
 While the assistant carries the calls, the scripts cannot physically stop a call they did not issue. They log every issued call and result; the report flags any unplanned call disclosed by the assistant. See the [lock policy](docs/setup.md#private-store) for the run deadline. User subject regular expressions can be slow. Sender addresses can be forged. See the [local unsubscribe policy](docs/setup.md#local-unsubscribe-client). See [setup](docs/setup.md) for unverified integrations.
 
-See [CHANGELOG](CHANGELOG.md) for upgrade instructions.
+See [CHANGELOG](CHANGELOG.md) for release history.
 
 ## License
 

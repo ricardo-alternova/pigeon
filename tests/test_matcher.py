@@ -2,11 +2,13 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts'))
 spec = importlib.util.spec_from_file_location('triage', ROOT / 'scripts/triage.py')
 triage = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(triage)
@@ -208,6 +210,8 @@ class MatcherTests(unittest.TestCase):
 
     def test_report_fixture_and_language(self):
         result = self.plan()
+        with tempfile.TemporaryDirectory() as tmp:
+            triage.number_decisions(Path(tmp), result, self.listing)
         self.assertEqual(triage.render_report(result, self.listing), (ROOT / 'tests/fixtures/expected-report.md').read_text())
         self.assertIn('Requiere tu decisión', triage.render_report(result, self.listing, 'es'))
         self.assertEqual([a['id'] for a in result['actions']], ['m1', 'm4'])
@@ -265,7 +269,10 @@ class MatcherTests(unittest.TestCase):
 
     def test_f7_numbering(self):
         self.batch(1, verb='report')
-        report = triage.render_report(self.plan(), self.listing)
+        plan = self.plan()
+        with tempfile.TemporaryDirectory() as tmp:
+            triage.number_decisions(Path(tmp), plan, self.listing)
+        report = triage.render_report(plan, self.listing)
         self.assertIn('1. cedar:', report)
         self.assertNotIn('3. cedar:', report)
 

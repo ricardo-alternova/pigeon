@@ -5,10 +5,31 @@ timezone = "UTC"
 # Maximum Inbox messages across all accounts before the planner stops.
 inbox_limit = 100
 
+# Optional schedule: local times in timezone; both day lists are required.
+# [schedule]
+# weekdays = ["08:20", "13:40", "18:10"]
+# weekends = ["10:30", "17:50"]
+# always_full = ["18:10", "17:50"]
+
+# Storage choice: docs/setup.md#storage-choice
+# Optional cross-machine lock (omit for the local file lock).
+# [lock]
+# kind = "onedrive"
+# account = "drive-example"
+# folder = "locks-example"
+
+# Optional durable state; requires the OneDrive lock above.
+# [state]
+# kind = "gdrive" # or "onedrive"
+# account = "drive-example"
+# folder = "state-example"
+
 [accounts.cedar]
+quiet_kind = "history" # Mailbox supports change history.
 executor_app = "cedar-mail"
 address = "reader@example.com"
 
 [accounts.marble]
+quiet_kind = "ids" # No change history; newest 10 Inbox IDs.
 executor_app = "marble-mail"
 address = "reader@example.org"

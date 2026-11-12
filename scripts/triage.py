@@ -5,7 +5,9 @@ commit-state saves Inbox counts after a run. Pass results.json written by
 execute.py; hand-written files are refused. expected_counts is a forecast,
 never saved state. See docs/setup.md for result formats and statuses.
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import hashlib
+import stat
 import argparse
 import ipaddress
 from urllib.parse import urlsplit
@@ -35,6 +37,57 @@ RULE_LIMIT_CAP = 50
 BODY_LIMIT = 2000
 QUESTION_LIMIT = 500
 STALE_SECONDS = 45 * 60
+TAKEOVER_MARGIN = 10 * 60
+LOG_TAIL_BYTES = 256 * 1024
+LOG_NAMES = ('calls.jsonl', 'history.log', 'decisions.jsonl')
+
+
+def read_text(path, encoding='utf-8'):
+    try:
+        return Path(path).read_text(encoding=encoding)
+    except UnicodeError as error:
+        raise ValueError(str(path) + ': expected valid ' + encoding + ' text') from error
+
+
+def state_timestamp(value, source):
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError) as error:
+        raise ValueError(str(source) + ': expected an ISO 8601 UTC timestamp') from error
+
+
+def parse_json(text, source):
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError) as error:
+        raise ValueError(str(source) + ': expected valid JSON') from error
+
+
+def parse_toml(text, source):
+    try:
+        return tomllib.loads(text)
+    except ValueError as error:
+        raise ValueError(str(source) + ': expected valid TOML') from error
+
+
+def trim_logs(store):
+    # Only at acquisition or completed fetch, before this run can append records.
+    import execute
+    for name in LOG_NAMES:
+        path = store / name
+        if not path.exists():
+            continue
+        raw = state_bytes(path)
+        if len(raw) > LOG_TAIL_BYTES:
+            lines = raw.splitlines(keepends=True)
+            tail = []
+            size = 0
+            for line in reversed(lines):
+                if size + len(line) > LOG_TAIL_BYTES:
+                    break
+                tail.append(line)
+                size += len(line)
+            execute.atomic_text(path, b''.join(reversed(tail)).decode('utf-8'))
 
 
 def private_store(path=None, *, output=False):
@@ -67,16 +120,24 @@ def lock_gate(store):
         yield gate
 
 
-def read_lock(store):
+def read_lock(store, *, now=None):
+    clock = time.time() if now is None else now
     try:
         path = store / 'run.lock'
         if not path.stat().st_mode & 0o444:
             raise ValueError('Run lock is unreadable and held')
-        held = json.loads(path.read_text(encoding='utf-8'))
-        known_keys(held, {'token', 'created'}, 'run.lock')
+        held = parse_json(read_text(path), path)
+        known_keys(held, {'token', 'created', 'backend', 'id', 'etag', 'drive_created', 'lost'}, 'run.lock')
+        if 'lost' in held and held['lost'] is not True:
+            raise ValueError('invalid loss flag')
+        if 'backend' in held:
+            if lock_setting({'lock': held['backend']})['kind'] != 'onedrive':
+                raise ValueError('invalid backend')
+            lock_item(dict(status='ok', id=held['id'], etag=held['etag'], name=LOCK_NAME,
+                           created=datetime.fromtimestamp(held['drive_created'], timezone.utc).isoformat()), clock)
         if (not isinstance(held['token'], str) or not held['token']
                 or type(held['created']) not in (int, float)
-                or not math.isfinite(held['created']) or held['created'] > time.time()):
+                or not math.isfinite(held['created']) or held['created'] > clock):
             raise ValueError('Run lock is invalid and held')
         return held
     except (KeyError, TypeError, ValueError) as error:
@@ -90,9 +151,10 @@ def acquire(store):
         except FileNotFoundError:
             held = None
         if held is not None:
-            if time.time() - held['created'] <= STALE_SECONDS:
-                raise ValueError(str(store / 'run.lock') + ': Run lock is busy until ' + time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(held['created'] + STALE_SECONDS)) + '; another run holds it. Wait for release or expiry.')
+            if time.time() - held['created'] <= STALE_SECONDS + TAKEOVER_MARGIN:
+                raise ValueError(str(store / 'run.lock') + ': Run lock is busy until ' + time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(held['created'] + STALE_SECONDS + TAKEOVER_MARGIN)) + '; another run holds it. Wait for release or expiry.')
             (store / 'run.lock').unlink()
+        trim_logs(store)
         token = secrets.token_hex(24)
         with (store / 'run.lock').open('x', encoding='utf-8') as out:
             json.dump({'token': token, 'created': time.time()}, out)
@@ -100,16 +162,22 @@ def acquire(store):
         return token
 
 
-def require_lock(store, token):
+def require_lock(store, token, *, now=None):
     try:
-        held = read_lock(store)
+        held = read_lock(store, now=now)
     except FileNotFoundError as error:
         raise ValueError(str(store / 'run.lock') + ': expected a lock held by this token, but no lock exists; stop writes') from error
-    if not secrets.compare_digest(held['token'], token) or time.time() - held['created'] > STALE_SECONDS:
+    if held.get('lost'):
+        raise ValueError('run.lock: drive lock ownership was lost; stop writes')
+    if store_lock_setting(store) != held.get('backend', {'kind': 'local'}):
+        raise ValueError('run.lock: configured backend differs; stop writes')
+    if not secrets.compare_digest(held['token'], token) or (time.time() if now is None else now) - held['created'] > STALE_SECONDS:
         raise ValueError(str(store / 'run.lock') + ': token expected to match the holder and be unexpired; stop writes')
 
 
 def release(store, token):
+    if store_lock_setting(store)['kind'] == 'onedrive':
+        raise ValueError('run.lock: release requires the conditional drive exchange')
     with lock_gate(store):
         try:
             held = read_lock(store)
@@ -119,6 +187,452 @@ def release(store, token):
             raise ValueError(str(store / 'run.lock') + ': token expected to match the holder; only the holder may release the lock')
         (store / 'run.lock').unlink()
         return 'released'
+
+
+LOCK_NAME = 'pigeon-run-lock'
+LOCK_OBSERVATION_LIMIT = 4096
+LOCK_FUTURE_TOLERANCE = 5
+
+
+def lock_setting(config):
+    value = config.get('lock', {'kind': 'local'})
+    known_keys(value, {'kind', 'account', 'folder'}, 'config.lock')
+    kind = value.get('kind')
+    if kind == 'local':
+        if set(value) != {'kind'}:
+            raise ValueError('config.lock: local expects only kind')
+    elif kind != 'onedrive':
+        raise ValueError('config.lock.kind: that drive cannot hold the lock; expected local or onedrive')
+    else:
+        if set(value) != {'kind', 'account', 'folder'}:
+            raise ValueError('config.lock: expected kind, account and folder')
+        for key in ('account', 'folder'):
+            if not lock_text(value[key], 512):
+                raise ValueError('config.lock.' + key + ': expected 1 to 512 ASCII letters, digits, underscore, hyphen, dot, colon or exclamation mark')
+    return value
+
+
+def store_lock_setting(store):
+    path = store / 'config.toml'
+    if not path.exists():
+        raise ValueError('config.toml: copy config/config.example.toml into the working folder and configure it before taking the lock')
+    return lock_setting(parse_toml(load_inputs([path])[0], path))
+
+
+def lock_text(value, limit):
+    return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_!.:-]{1,' + str(limit) + '}', value) is not None
+
+
+def lock_item(data, clock):
+    if set(data) != {'status', 'id', 'etag', 'created', 'name'}:
+        raise ValueError('lock observation: expected status, id, etag, created and name; not held')
+    if not lock_text(data['id'], 512) or not isinstance(data['etag'], str) or not re.fullmatch(r'[A-Za-z0-9_!.,:{}"-]{1,512}', data['etag']):
+        raise ValueError('lock observation: invalid id or etag; not held')
+    if data['name'] != LOCK_NAME:
+        raise ValueError('lock observation: wrong name; not held')
+    value = data['created']
+    if not isinstance(value, str) or len(value) > 40 or not re.fullmatch(r'[0-9T:.+Z-]{20,40}', value):
+        raise ValueError('lock observation: invalid creation time; not held')
+    try:
+        date = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if date.utcoffset() != timedelta(0):
+            raise ValueError('UTC required')
+        created = date.timestamp()
+    except (ValueError, OverflowError):
+        raise ValueError('lock observation: invalid UTC creation time; not held') from None
+    if created > clock + LOCK_FUTURE_TOLERANCE:
+        raise ValueError('lock observation: future creation time; not held')
+    return dict(id=data['id'], etag=data['etag'], drive_created=created)
+
+
+def lock_observation(path):
+    try:
+        path = Path(path)
+        if not path.is_file() or not path.stat().st_mode & 0o444:
+            raise ValueError()
+        with path.open('rb') as stream:
+            raw = stream.read(LOCK_OBSERVATION_LIMIT + 1)
+        if len(raw) > LOCK_OBSERVATION_LIMIT:
+            raise ValueError()
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get('status'), str):
+            raise ValueError()
+        return data
+    except (OSError, ValueError, TypeError, RecursionError):
+        raise ValueError(str(path) + ': lock observation: expected bounded valid JSON; not held') from None
+
+
+def drive_lock(store, operation, token=None, observation=None, *, now=None):
+    # Pure local decisions: the assistant transports exactly one issued call.
+    import execute
+    clock = time.time() if now is None else now.timestamp()
+    setting = store_lock_setting(store)
+    if setting['kind'] != 'onedrive':
+        raise ValueError('config.lock: expected onedrive')
+    path = store / 'lock-exchange.json'
+    with lock_gate(store):
+        def issue(phase, *, created_item=None, **extra):
+            call = dict(account=setting['account'], folder=setting['folder'], name=LOCK_NAME,
+                        operation='create' if phase in ('create', 'recreate') else 'delete' if phase in ('takeover', 'release') else 'read')
+            if call['operation'] == 'create':
+                call['conflict'] = 'fail'
+            call.update(extra)
+            record = dict(operation=operation, phase=phase, token=token, setting=setting, call=call,
+                          started=pending['started'] if observation is not None else clock)
+            if created_item is not None:
+                record['created_item'] = created_item
+            execute.atomic(path, record)
+            return {'call': call}
+        if observation is None:
+            if path.exists():
+                abandoned = parse_json(read_text(path), path)
+                if operation != 'acquire' or clock - abandoned['started'] <= STALE_SECONDS:
+                    raise ValueError('lock exchange: pending or uncertain call; never retry in this run')
+                trim_logs(store)
+                with (store / 'history.log').open('a', encoding='utf-8') as out:
+                    out.write(datetime.fromtimestamp(clock, timezone.utc).isoformat() + ' abandoned: earlier lock exchange\n')
+                path.unlink()
+            if operation == 'acquire':
+                if (store / 'run.lock').exists():
+                    held = read_lock(store, now=clock)
+                    if held.get('backend') != setting or clock - held['created'] <= STALE_SECONDS:
+                        raise ValueError('run.lock: existing local record; do not bypass it')
+                    (store / 'run.lock').unlink()
+                token = secrets.token_hex(24)
+                return issue('create')
+            require_lock(store, token, now=clock)
+            held = read_lock(store, now=clock)
+            if operation == 'release':
+                return issue('release', if_match=held['etag'])
+            return issue('verify')
+        if not path.exists():
+            raise ValueError('lock exchange: no issued call; not held')
+        pending = parse_json(read_text(path), path)
+        if (pending['operation'] != operation or pending['setting'] != setting
+                or (operation != 'acquire' and pending['token'] != token)):
+            raise ValueError('lock exchange: observation does not match issued call; not held')
+        # Consume before parsing. Uncertain writes can never be issued again.
+        execute.atomic(path, pending | {'phase': 'uncertain'})
+        token = pending['token']
+        phase = pending['phase']
+        try:
+            data = lock_observation(observation)
+            status = data['status']
+            if phase in ('create', 'recreate') and status == 'created':
+                item = lock_item(data, clock)
+                if clock - item['drive_created'] > STALE_SECONDS:
+                    raise ValueError('lock observation: created item already expired; not held')
+                return issue('confirm', created_item={k: item[k] for k in ('id', 'drive_created')})
+            if phase == 'confirm' and status == 'ok':
+                item = lock_item(data, clock)
+                if any(item[k] != pending['created_item'][k] for k in ('id', 'drive_created')):
+                    raise ValueError('lock observation: created item changed; not held')
+                if clock - item['drive_created'] > STALE_SECONDS:
+                    raise ValueError('lock observation: created item already expired; not held')
+                trim_logs(store)
+                execute.atomic(store / 'run.lock', dict(token=token, created=min(clock, item['drive_created']), backend=setting, **item))
+                path.unlink()
+                (store / 'execution-report.md').unlink(missing_ok=True)
+                return token
+            if phase == 'create' and data == {'status': 'conflict'}:
+                return issue('read')
+            if phase == 'read' and status == 'ok':
+                item = lock_item(data, clock)
+                if clock - item['drive_created'] <= STALE_SECONDS + TAKEOVER_MARGIN:
+                    # A definite busy read leaves no pending call, so it must not block later runs.
+                    path.unlink()
+                    raise ValueError('Run lock is busy; not held')
+                return issue('takeover', if_match=item['etag'])
+            if phase in ('takeover', 'release') and data == {'status': 'deleted'}:
+                if pending['call'].get('operation') != 'delete' or not pending['call'].get('if_match'):
+                    raise ValueError('lock exchange: conditional delete was not issued; not held')
+                if phase == 'takeover':
+                    return issue('recreate')
+                require_lock(store, token, now=clock)
+                if pending['call']['if_match'] != read_lock(store, now=clock)['etag']:
+                    raise ValueError('lock exchange: changed holder; lost lock')
+                (store / 'run.lock').unlink()
+                path.unlink()
+                return 'released'
+            if phase == 'verify' and status == 'ok':
+                item = lock_item(data, clock)
+                require_lock(store, token, now=clock)
+                held = read_lock(store, now=clock)
+                if item != {k: held[k] for k in item}:
+                    raise ValueError('lock observation: changed holder; lost lock')
+                path.unlink()
+                return 'verified'
+            raise ValueError('lock observation: failed, uncertain or lost lock; not held')
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            if phase == 'confirm':
+                raise ValueError('lock confirmation: not held; no delete issued; leave item to expire after 45 minutes: ' + str(error)) from None
+            if operation != 'acquire' and (store / 'run.lock').exists():
+                held = parse_json(read_text(store / 'run.lock'), store / 'run.lock')
+                execute.atomic(store / 'run.lock', held | {'lost': True})
+            raise
+
+
+# Fixed durable set, also the upload order. Run-local plans and checkpoints stay local.
+STATE_FILES = ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json',
+               'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md',
+               'rules.toml', 'never-touch.toml', 'state.json')
+STATE_LIMIT = 4 * 1024 * 1024
+
+
+def state_setting(config):
+    value = config.get('state', {'kind': 'local'})
+    if not isinstance(value, dict):
+        raise ValueError('config.state: expected table')
+    kind = value.get('kind')
+    if kind == 'local':
+        if set(value) != {'kind'}:
+            raise ValueError('config.state: local expects only kind')
+    elif kind not in ('onedrive', 'gdrive'):
+        raise ValueError('config.state.kind: expected local, onedrive or gdrive')
+    else:
+        if set(value) != {'kind', 'account', 'folder'}:
+            raise ValueError('config.state: expected kind, account and folder')
+        for key in ('account', 'folder'):
+            if not lock_text(value[key], 512):
+                raise ValueError('config.state.' + key + ': expected 1 to 512 ASCII handle characters')
+        if lock_setting(config)['kind'] != 'onedrive':
+            raise ValueError('config.state: drive state requires the OneDrive lock')
+    return value
+
+
+def state_config(store):
+    return parse_toml(load_inputs([store / 'config.toml'])[0], store / 'config.toml')
+
+
+def require_fetched(store, token):
+    setting = state_setting(state_config(store))
+    if setting['kind'] != 'local':
+        path = store / 'state-exchange.json'
+        data = parse_json(read_text(path), path) if path.exists() else {}
+        if data.get('token') != token or data.get('phase') != 'ready' or data.get('setting') != setting:
+            raise ValueError('state-exchange.json: planning requires a completed fetch in the ready phase for this token and configuration; release lock')
+
+
+def state_bytes(path):
+    # lstat prevents following links and opening pipes/devices.
+    mode = path.lstat().st_mode
+    if not stat.S_ISREG(mode) or not mode & 0o444:
+        raise ValueError(str(path) + ': state file: expected readable regular file, no symlink')
+    with path.open('rb') as stream:
+        raw = stream.read(STATE_LIMIT + 1)
+    if len(raw) > STATE_LIMIT:
+        raise ValueError(str(path) + ': state file: exceeds 4194304 bytes')
+    try:
+        raw.decode('utf-8')
+    except UnicodeError as error:
+        raise ValueError(str(path) + ': expected UTF-8 text') from error
+    return raw
+
+
+def validate_state_file(name, raw, config, folder):
+    text = raw.decode('utf-8')
+    if name in ('rules.toml', 'never-touch.toml'):
+        try:
+            entries = parse_rules(text, protection=name == 'never-touch.toml')
+        except ValueError as error:
+            raise ValueError(str(folder / name) + ': ' + str(error)) from None
+        if any(a not in config['accounts'] for r in entries for a in r.get('accounts', [])):
+            raise ValueError(str(folder / name) + ': unconfigured account')
+    elif name == 'state.json':
+        validate_inputs({'accounts': {}, 'messages': []}, config, parse_json(text, folder / name))
+    elif name == 'numbers.json':
+        read_numbers(folder)
+    elif name == 'unsubscribe-secret':
+        if not re.fullmatch('[0-9a-f]{64}', text):
+            raise ValueError('unsubscribe-secret: expected 64 lowercase hex characters')
+    elif name == 'unsubscribe-failures.json':
+        validate_unsubscribe_memory(parse_json(text, folder / name))
+    elif name in ('decisions.jsonl', 'calls.jsonl'):
+        for line in text.splitlines():
+            data = parse_json(line, folder / name)
+            if name == 'decisions.jsonl':
+                if not isinstance(data, dict) or set(data) != {'run', 'time', 'parts'} or not lock_text(data['run'], 512):
+                    raise ValueError(name + ': invalid batch')
+                stamp = state_timestamp(data['time'], folder / name)
+                if stamp.utcoffset() != timedelta(0) or not isinstance(data['parts'], list):
+                    raise ValueError(name + ': expected UTC time and parts')
+                for part in data['parts']:
+                    if (not isinstance(part, dict) or set(part) != {'number', 'account', 'id', 'verb', 'target', 'outcome'}
+                            or type(part['number']) is not int or part['number'] < 1
+                            or part['account'] not in config['accounts'] or not isinstance(part['id'], str)
+                            or part['verb'] not in {'trash', 'archive', 'spam', 'move', 'leave', 'yes', 'no'}
+                            or part['outcome'] not in {'executed', 'failed', 'skipped', 'unexecuted', 'issued_unknown', 'answered'}):
+                        raise ValueError(name + ': invalid decision')
+                    if part['target'] is not None:
+                        folder_path(part['target'])
+            else:
+                if (not isinstance(data, dict) or set(data) != {'sequence', 'time', 'run', 'account', 'id', 'verb', 'outcome'}
+                        or type(data['sequence']) is not int or data['sequence'] < 1
+                        or type(data['time']) not in (int, float) or not math.isfinite(data['time'])
+                        or any(not isinstance(data[k], str) for k in ('run', 'account', 'id', 'verb', 'outcome'))):
+                    raise ValueError(name + ': invalid call log')
+    elif name == 'history.log':
+        for line in text.splitlines():
+            if not re.fullmatch(r'[0-9T:.+Z-]{20,40} (?:skipped: no new mail|abandoned: earlier lock exchange)', line):
+                raise ValueError('history.log: invalid skip line')
+            if state_timestamp(line.split(' ')[0], folder / name).utcoffset() != timedelta(0):
+                raise ValueError('history.log: expected UTC')
+    elif name == 'run-message.md':
+        if (text and not text.strip()) or any(unicodedata.category(c) in {'Cc', 'Cs'} and c not in '\n\t' for c in text):
+            raise ValueError('run-message.md: expected nonempty UTF-8 message without controls')
+
+
+def validate_unsubscribe_memory(memory):
+    known_keys(memory, {'version', 'senders'}, 'unsubscribe-failures.json')
+    if 'version' in memory and (type(memory['version']) is not int or memory['version'] != 2):
+        raise ValueError('unsubscribe-failures.json.version: expected 2')
+    values = memory.get('senders')
+    if (not isinstance(values, list) or any(not isinstance(x, str) or not re.fullmatch('[0-9a-f]{64}', x) for x in values)
+            or len(set(values)) != len(values)):
+        raise ValueError('unsubscribe-failures.json.senders: expected unique lowercase digests')
+
+
+def drive_state(store, operation, token, observation=None, *, lock_observation=None, now=None):
+    """In-process decisions only: no subprocess or network; assistant transports calls."""
+    import execute
+    config = state_config(store)
+    setting = state_setting(config)
+    if setting['kind'] == 'local':
+        return {'done': True}
+    path = store / 'state-exchange.json'
+    incoming = store / 'state-incoming'
+    outgoing = store / 'state-outgoing'
+    if operation == 'send' and observation is None:
+        require_fetched(store, token)
+        result = drive_lock(store, 'state-send', token, lock_observation, now=now)
+        if isinstance(result, dict):
+            return result
+    with lock_gate(store):
+        require_lock(store, token, now=now.timestamp() if now else None)
+        data = parse_json(read_text(path), path) if path.exists() else {}
+        def save():
+            execute.atomic(path, data)
+        def issue(name, verb):
+            return dict(operation=verb, kind=setting['kind'], account=setting['account'],
+                        folder=setting['folder'], name=name,
+                        path=str((incoming if verb == 'download' else outgoing) / name))
+        if operation == 'fetch' and observation is None:
+            if data.get('token') == token:
+                raise ValueError('state fetch: already issued; never retry; release lock')
+            incoming.mkdir(mode=0o700, exist_ok=True)
+            if incoming.is_symlink():
+                raise ValueError('state incoming: expected real folder; release lock')
+            leftovers = list(incoming.iterdir())
+            if any(not stat.S_ISREG(p.lstat().st_mode) for p in leftovers):
+                raise ValueError('state incoming: expected only regular files directly in folder; release lock')
+            for p in leftovers:
+                p.unlink()
+            data = dict(token=token, setting=setting, phase='fetch')
+            save()
+            return {'calls': [issue(n, 'download') for n in STATE_FILES]}
+        if data.get('token') != token or data.get('setting') != setting:
+            raise ValueError('state exchange: expected matching token and settings; release lock')
+        if operation == 'fetch':
+            if data['phase'] != 'fetch':
+                raise ValueError('state fetch: no pending fetch; release lock')
+            data['phase'] = 'refused'
+            save()
+            observed = state_observation(observation)
+            if set(observed) != set(STATE_FILES):
+                raise ValueError('state fetch: expected exactly the fixed names; release lock')
+            if any(v not in ('fetched', 'absent') for v in observed.values()):
+                raise ValueError('state fetch: failed or uncertain download; release lock')
+            expected = {n for n in STATE_FILES if observed[n] == 'fetched'}
+            if {p.name for p in incoming.iterdir()} != expected:
+                raise ValueError('state incoming: unexpected or missing file; release lock')
+            contents = {n: state_bytes(incoming / n) for n in STATE_FILES if n in expected}
+            for n, raw in contents.items():
+                validate_state_file(n, raw, config, incoming)
+            # Validate the entire batch before changing any destination; roll back I/O failures.
+            original = {n: state_bytes(store / n) if (store / n).exists() else None for n in STATE_FILES}
+            # Acquisition can record recovery before remote history is fetched.
+            # Merge only those fixed-format local evidence lines, then trim at this boundary.
+            fetched_hashes = {n: hashlib.sha256(contents[n]).hexdigest() if n in contents else None for n in STATE_FILES}
+            prior_history = (original['history.log'] or b'').decode('utf-8').splitlines()
+            history = contents.get('history.log', b'').decode('utf-8').splitlines()
+            for line in prior_history:
+                if (re.fullmatch(r'[0-9T:.+Z-]{20,40} abandoned: earlier lock exchange', line)
+                        and line not in history):
+                    history.append(line)
+            if history:
+                contents['history.log'] = ('\n'.join(history) + '\n').encode('utf-8')
+            try:
+                for n in STATE_FILES:
+                    if n in contents and not (n == 'run-message.md' and contents[n] == b''):
+                        execute.atomic_text(store / n, contents[n].decode('utf-8'))
+                    elif n not in ('rules.toml', 'never-touch.toml'):
+                        (store / n).unlink(missing_ok=True)
+            except OSError:
+                for n, raw in original.items():
+                    if raw is None:
+                        (store / n).unlink(missing_ok=True)
+                    else:
+                        execute.atomic_text(store / n, raw.decode('utf-8'))
+                raise
+            for n in expected:
+                (incoming / n).unlink()
+            trim_logs(store)
+            data.update(phase='ready', hashes=fetched_hashes)
+            save()
+            return {'done': True}
+        if observation is None:
+            contents = {n: state_bytes(store / n) for n in STATE_FILES if (store / n).exists()}
+            for n, raw in contents.items():
+                validate_state_file(n, raw, config, store)
+            if 'run-message.md' not in contents and data['hashes']['run-message.md'] is not None:
+                contents['run-message.md'] = b''
+            outgoing.mkdir(mode=0o700, exist_ok=True)
+            if outgoing.is_symlink():
+                raise ValueError('state outgoing: expected real folder')
+            names = [n for n in STATE_FILES if n in contents and hashlib.sha256(contents[n]).hexdigest() != data['hashes'][n]]
+            for n in names:
+                execute.atomic_text(outgoing / n, contents[n].decode('utf-8'))
+            data.update(phase='send', names=names, sizes={n: len(contents[n]) for n in names},
+                        sent_hashes={n: hashlib.sha256(contents[n]).hexdigest() for n in names}, failed=[], index=0)
+        else:
+            if data['phase'] != 'send' or data['index'] >= len(data['names']):
+                raise ValueError('state send: no pending upload; never retry')
+            name = data['names'][data['index']]
+            # Consume before parsing: a bad observation is an uncertain upload, never replayed.
+            data['index'] += 1
+            data['failed'].append(name)
+            save()
+            try:
+                observed = state_observation(observation)
+                if (set(observed) == {'status', 'size'} and observed['status'] == 'done'
+                        and type(observed['size']) is int and observed['size'] == data['sizes'][name]):
+                    data['failed'].remove(name)
+                    data['hashes'][name] = data['sent_hashes'][name]
+            except (ValueError, OSError, TypeError):
+                pass
+        if data['index'] < len(data['names']):
+            save()
+            return {'call': issue(data['names'][data['index']], 'upload')}
+        data['phase'] = 'sent' if data['failed'] else 'ready'
+        save()
+        result = {'done': True, 'failed': data['failed']}
+        if data['failed']:
+            warning = 'Saved files on the drive are out of date: ' + ', '.join(data['failed'])
+            message = store / 'run-message.md'
+            execute.atomic_text(message, warning + '\n' + (read_text(message) if message.exists() else ''))
+            result['warning'] = warning
+        return result
+
+
+def state_observation(path):
+    # Bounded JSON observations; all fields are checked against issued operations.
+    raw = state_bytes(Path(path))
+    if len(raw) > LOCK_OBSERVATION_LIMIT:
+        raise ValueError(str(path) + ': state observation: exceeds 4096 bytes')
+    value = parse_json(raw, path)
+    if not isinstance(value, dict):
+        raise ValueError(str(path) + ': state observation: expected object')
+    return value
 
 
 def validate_holds(holds):
@@ -157,7 +671,7 @@ def validate_predicate(rule):
 
 
 def parse_rules(text, *, protection=False):
-    data = tomllib.loads(text)
+    data = parse_toml(text, 'never-touch.toml' if protection else 'rules.toml')
     known_keys(data, {'rules', 'allow_empty'} if protection else {'rules'}, 'rule file')
     if 'allow_empty' in data and type(data['allow_empty']) is not bool:
         raise ValueError('allow_empty: expected boolean')
@@ -277,8 +791,119 @@ def known_keys(data, allowed, label):
         raise ValueError(label + '.' + str(sorted(unknown)[0]) + ': expected keys ' + ', '.join(sorted(allowed)))
 
 
+NEWEST_IDS = 10
+OBSERVATION_LIMIT = 65536
+
+
+
+def schedule_slot(config, now):
+    local = now.astimezone(ZoneInfo(config.get('timezone', 'UTC')))
+    candidates = []
+    for days in (0, 1, 2):
+        day = local.date() - timedelta(days=days)
+        for slot in config['schedule']['weekdays' if day.weekday() < 5 else 'weekends']:
+            hour, minute = map(int, slot.split(':'))
+            for fold in (0, 1):
+                start = datetime(day.year, day.month, day.day, hour, minute, tzinfo=local.tzinfo, fold=fold)
+                # Nonexistent wall times are not occurrences of a slot.
+                if (datetime.fromtimestamp(start.timestamp(), local.tzinfo).replace(fold=fold) == start
+                        and start.timestamp() <= now.timestamp()):
+                    candidates.append(start)
+    return max(candidates, key=lambda d: d.timestamp())
+
+
+def validate_positions(positions, config):
+    known_keys(positions, set(config['accounts']), 'state.json._positions')
+    for account, value in positions.items():
+        kind = config['accounts'][account].get('quiet_kind', 'ids')
+        if kind == 'history':
+            if not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,128}', value):
+                raise ValueError('state.json._positions.' + account + ': expected 1 to 128 plain digits')
+        elif (not isinstance(value, list) or len(value) > NEWEST_IDS or
+              any(not isinstance(i, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,512}', i) for i in value)
+              or len(value) != len(set(value))):
+            raise ValueError('state.json._positions.' + account + ': expected up to 10 unique ASCII ids (1 to 512 letters, digits, underscore or hyphen)')
+
+
+def read_observation(path, config, saved):
+    # Bounded, in-process parser; gateway data is never a call or report template.
+    try:
+        path = Path(path)
+        if not path.is_file():
+            return None
+        with path.open('rb') as stream:
+            raw = stream.read(OBSERVATION_LIMIT + 1)
+        if len(raw) > OBSERVATION_LIMIT:
+            return None
+        data = json.loads(raw)
+        if not isinstance(data, dict) or set(data) != set(config['accounts']):
+            return None
+        positions = {}
+        quiet = True
+        for account, fields in config['accounts'].items():
+            entry = data[account]
+            kind = fields.get('quiet_kind', 'ids')
+            known_keys(entry, {'outcome', 'position', 'arrivals'} if kind == 'history' else {'outcome', 'ids'}, 'observation')
+            if entry.get('outcome') != 'ok':
+                return None
+            if kind == 'history':
+                positions[account] = entry.get('position')
+                arrivals = entry.get('arrivals')
+                if (not isinstance(arrivals, list) or len(arrivals) > 1000 or
+                        any(not isinstance(i, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,512}', i) for i in arrivals)):
+                    return None
+                quiet = quiet and not arrivals
+            else:
+                positions[account] = entry.get('ids')
+        validate_positions(positions, config)
+        for account, value in positions.items():
+            if config['accounts'][account].get('quiet_kind', 'ids') == 'history':
+                if account in saved and int(value) < int(saved[account]):
+                    return None
+            else:
+                quiet = quiet and value == saved.get(account)
+        return positions, quiet
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        return None
+
+
+def quiet_check(store, config, previous, observation, scheduled, now):
+    import execute
+    path = store / 'quiet-check.json'
+    token = read_lock(store)['token'] if (store / 'run.lock').exists() else None
+    if token is not None and path.exists():
+        cached = parse_json(read_text(path), path)
+        if cached['token'] == token:
+            return cached['decision']
+    saved = previous.get('_positions', {})
+    observed = read_observation(observation, config, saved) if observation is not None else None
+    if 'schedule' not in config:
+        decision = {'decision': 'full', 'reason': 'no schedule'}
+    elif not scheduled:
+        decision = {'decision': 'full', 'reason': 'on demand'}
+    elif schedule_slot(config, now).strftime('%H:%M') in config['schedule']['always_full']:
+        decision = {'decision': 'full', 'reason': 'always-full slot'}
+    elif (store / 'run-message.md').exists():
+        decision = {'decision': 'full', 'reason': 'undelivered message'}
+    elif set(saved) != set(config['accounts']):
+        decision = {'decision': 'full', 'reason': 'missing saved positions'}
+    elif observed is None:
+        decision = {'decision': 'full', 'reason': 'invalid or unavailable observation'}
+    elif not observed[1]:
+        decision = {'decision': 'full', 'reason': 'arrival or changed ids'}
+    else:
+        with (store / 'history.log').open('a', encoding='utf-8') as out:
+            out.write(now.astimezone(timezone.utc).isoformat() + ' skipped: no new mail\n')
+        decision = {'decision': 'skip', 'reason': 'no new mail'}
+    if token is not None:
+        execute.atomic(path, dict(token=token, decision=decision, positions=observed[0] if observed else None))
+    return decision
+
+
 def validate_inputs(listing, config, previous):
-    known_keys(config, {'accounts', 'language', 'inbox_limit', 'timezone'}, 'config')
+    known_keys(config, {'accounts', 'language', 'inbox_limit', 'timezone', 'schedule', 'lock', 'state'}, 'config')
+    lock_setting(config)
+    state_setting(config)
     if not isinstance(config.get('language', 'en'), str) or config.get('language', 'en') not in STRINGS:
         raise ValueError('config.language: expected en or es')
     if type(config.get('inbox_limit', 100)) is not int or config.get('inbox_limit', 100) <= 0:
@@ -289,14 +914,30 @@ def validate_inputs(listing, config, previous):
         ZoneInfo(config.get('timezone', 'UTC'))
     except (ZoneInfoNotFoundError, ValueError) as error:
         raise ValueError('config.timezone: expected a known IANA time zone, such as UTC') from error
+    if 'schedule' in config:
+        schedule = config['schedule']
+        known_keys(schedule, {'weekdays', 'weekends', 'always_full'}, 'config.schedule')
+        for key in ('weekdays', 'weekends', 'always_full'):
+            times = schedule.get(key)
+            if (not isinstance(times, list) or any(not isinstance(t, str) or
+                    not re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]', t) for t in times)
+                    or len(times) != len(set(times))
+                    or (key != 'always_full' and not times)):
+                raise ValueError('config.schedule.' + key + ': expected unique HH:MM times (nonempty day slots)')
+        if not set(schedule['always_full']) <= set(schedule['weekdays'] + schedule['weekends']):
+            raise ValueError('config.schedule.always_full: expected configured slot times')
     accounts = config.get('accounts')
     if not isinstance(accounts, dict) or not accounts:
         raise ValueError('config.accounts: expected a non-empty table')
     for account, fields in accounts.items():
-        known_keys(fields, {'address', 'executor_app'}, 'config.accounts.' + account)
+        if account == '_positions':
+            raise ValueError('config.accounts._positions: reserved state key')
+        known_keys(fields, {'address', 'executor_app', 'quiet_kind'}, 'config.accounts.' + account)
         for key, value in fields.items():
             if not isinstance(value, str) or not value.strip():
                 raise ValueError('config.accounts.' + account + '.' + key + ': expected a non-empty string')
+        if fields.get('quiet_kind', 'ids') not in ('history', 'ids'):
+            raise ValueError('config.accounts.' + account + '.quiet_kind: expected history or ids')
     known_keys(listing, {'accounts', 'messages', 'folders'}, 'Inbox')
     if not isinstance(listing.get('accounts'), dict):
         raise ValueError('Inbox.accounts: expected account totals object')
@@ -325,12 +966,14 @@ def validate_inputs(listing, config, previous):
             known_keys(folder, {'id', 'name'}, 'Inbox.folders.' + account)
             if any(not isinstance(folder.get(k), str) for k in ('id', 'name')):
                 raise ValueError('Inbox.folders.' + account + ': expected id and name strings')
-    known_keys(previous, set(accounts), 'state.json')
-    if any(type(n) is not int or n < 0 for n in previous.values()):
+    known_keys(previous, set(accounts) | {'_positions'}, 'state.json')
+    if '_positions' in previous:
+        validate_positions(previous['_positions'], config)
+    if any(type(n) is not int or n < 0 for a, n in previous.items() if a != '_positions'):
         raise ValueError('state.json: expected non-negative integer counts')
 
 
-def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=()):
+def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=(), *, selections=None):
     validate_inputs(listing, config, previous if previous is not None else {})
     validate_rules(rules)
     validate_holds(never_touch)
@@ -359,7 +1002,6 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         if totals[account] < count:
             raise ValueError('Inbox.accounts.' + account + ': Account total is smaller than Inbox count; expected an all-folder total at least ' + str(count))
     actions, decisions, hits = [], [], {}
-    creates = set()
     for original in messages:
         sender = normalize_sender(original.get('sender'))
         message = dict(original, sender=sender)
@@ -370,8 +1012,9 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         elif any(matches(message, hold, protection=True) for hold in never_touch):
             reason = 'Protected by never-touch'
         else:
-            for rule in rules:
-                if not matches(message, rule):
+            candidates = rules if selections is None else [selections[(message["account"], message["id"])]] if (message["account"], message["id"]) in selections else []
+            for rule in candidates:
+                if selections is None and not matches(message, rule):
                     continue
                 key = (rule['id'], message['account'])
                 if 'question' not in rule:
@@ -404,10 +1047,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                         action['target'] = folders[0]['id']
                     elif '{year}' in rule['target'] or '{month}' in rule['target']:
                         action['target_path'] = folder_path(target)
-                        folder_key = (message['account'], target)
-                        if folder_key not in creates:
-                            actions.append(action | {'action': 'create-folder'})
-                            creates.add(folder_key)
+                        actions.append(action | {'action': 'create-folder'})
                     else:
                         reason = 'Move target is ambiguous or missing'
                         break
@@ -428,6 +1068,27 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                 break
         if reason:
             decisions.append({'account': message['account'], 'id': message['id'], 'reason': reason, **question})
+    # Choose spelling by rule order, independently of Inbox ordering.
+    rank = {r['id']: i for i, r in enumerate(rules)}
+    paths = {}
+    for action in actions:
+        if 'target_path' in action:
+            key = (action['account'], action['target_path'].casefold())
+            if key not in paths or rank[action['rule']] < rank[paths[key]['rule']]:
+                paths[key] = action
+    names = {key: action['target_path'] for key, action in paths.items()}
+    creates = set()
+    unique = []
+    for action in actions:
+        if 'target_path' in action:
+            key = (action['account'], action['target_path'].casefold())
+            action['target_path'] = names[key]
+            if action['action'] == 'create-folder':
+                if key in creates:
+                    continue
+                creates.add(key)
+        unique.append(action)
+    actions = unique
     if sum(a['action'] in {'trash', 'move', 'archive', 'spam'} for a in actions) > 50:
         reasons.append('Destructive action limit exceeded')
     for rule in rules:
@@ -448,6 +1109,106 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
             expected[action['account']] -= 1
     return {'actions': actions, 'decisions': decisions, 'reasons': reasons, 'counts': counts,
             'expected_counts': expected, 'not_listed': not_listed}
+
+
+REPLY_LIMIT = 2000
+
+
+def read_numbers(store):
+    path = store / 'numbers.json'
+    data = parse_json(read_text(path), path) if path.exists() else {'next': 1, 'items': []}
+    known_keys(data, {'next', 'items'}, 'numbers.json')
+    if type(data.get('next')) is not int or data['next'] < 1 or not isinstance(data.get('items'), list):
+        raise ValueError('numbers.json: expected next positive integer and items array')
+    seen, keys = set(), set()
+    for item in data['items']:
+        known_keys(item, {'number', 'account', 'id'}, 'numbers.json.items')
+        n = item.get('number')
+        if (type(n) is not int or not 0 < n < data['next'] or n in seen
+                or any(not isinstance(item.get(k), str) for k in ('account', 'id'))):
+            raise ValueError('numbers.json: expected unique saved numbers and account/id strings')
+        key = (item['account'], item['id'])
+        if key in keys:
+            raise ValueError('numbers.json: duplicate message')
+        seen.add(n)
+        keys.add(key)
+    return data
+
+
+def number_decisions(store, plan, listing):
+    import execute
+    data = read_numbers(store)
+    protected = {(i['account'], i['id']) for i in plan['decisions'] if i['reason'] == 'Protected by never-touch'}
+    present = {(i['account'], i['id']) for i in plan['decisions'] + plan.get('reply', [])} - protected
+    data['items'] = [i for i in data['items'] if i['account'] not in listing['accounts'] or (i['account'], i['id']) in present]
+    lookup = {(i['account'], i['id']): i['number'] for i in data['items']}
+    for item in plan['decisions']:
+        if item['reason'] == 'Protected by never-touch':
+            continue
+        key = (item['account'], item['id'])
+        if key not in lookup:
+            lookup[key] = data['next']
+            data['items'].append(dict(number=data['next'], account=key[0], id=key[1]))
+            data['next'] += 1
+        item['number'] = lookup[key]
+    execute.atomic(store / 'numbers.json', data)
+
+
+def parse_reply(text):
+    # Bounded linear scans; no backtracking, unbounded integer conversion or clock.
+    if not text.strip() or len(text) > REPLY_LIMIT:
+        raise ValueError('Reply must contain 1 to 2000 characters')
+    if any(unicodedata.category(c) in {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'} and c != '\n' for c in text):
+        raise ValueError('Reply contains control characters')
+    parts, seen = [], set()
+    for raw in text.replace(';', ',').replace('\n', ',').split(','):
+        words = raw.strip().split(maxsplit=1)
+        if len(words) != 2 or not words[0].isascii() or not words[0].isdigit() or len(words[0]) > 9:
+            raise ValueError('Expected number and trash, archive, spam, move to <folder>, leave, yes or no')
+        number = int(words[0])
+        if number in seen:
+            raise ValueError('Same number appears twice')
+        seen.add(number)
+        command = words[1].strip()
+        verb, target = command.casefold(), None
+        fields = command.split(maxsplit=2)
+        if len(fields) == 3 and fields[0].casefold() == 'move' and fields[1].casefold() == 'to':
+            verb, target = 'move', folder_path(fields[2].strip())
+        elif verb not in {'trash', 'archive', 'spam', 'leave', 'yes', 'no'}:
+            raise ValueError('Unknown reply verb or malformed part')
+        parts.append(dict(number=number, verb=verb, target=target))
+    return parts
+
+
+def reply_plan(store, listing, holds, config, previous, parts, stops=()):
+    # Reuse listing validation, never-touch precedence, ceilings and brakes.
+    numbers = {i['number']: i for i in read_numbers(store)['items']}
+    messages = {(m['account'], m['id']): m for m in listing['messages']}
+    selections, entries = {}, []
+    for part in parts:
+        item = numbers.get(part['number'])
+        if item is None:
+            raise ValueError('Unknown number')
+        key = (item['account'], item['id'])
+        if key not in messages:
+            raise ValueError('Number is not in the fresh Inbox for its saved account')
+        message = dict(messages[key], sender=normalize_sender(messages[key]['sender']))
+        if message['sender'] is None or any(matches(message, h, protection=True) for h in holds):
+            raise ValueError('Number is protected by never-touch or has an invalid sender')
+        entry = dict(part, account=key[0], id=key[1])
+        entries.append(entry)
+        if part['verb'] in {'leave', 'yes', 'no'}:
+            continue
+        selections[key] = dict(id='numbered-reply', accounts=[key[0]], sender=message['sender'], action=part['verb'], exclusions=[], **({'target': part['target']} if part['target'] is not None else {}))
+    # One reply batch has the existing default per-rule limit of ten.
+    ceiling_rule = dict(id='numbered-reply', accounts=list(config['accounts']), subject='reply', action='report')
+    result = build_plan(listing, [ceiling_rule], holds, config, previous, stops, selections=selections)
+    if len(result['actions']) != len(selections) and not result['reasons']:
+        raise ValueError('Reply action could not be planned')
+    if result['reasons']:
+        raise ValueError('; '.join(result['reasons']))
+    result['reply'] = entries
+    return result
 
 
 STRINGS = {
@@ -514,7 +1275,7 @@ def render_report(plan, listing, language='en'):
             unsafe.append(a | {'reason': 'Unsafe unsubscribe'})
         else:
             hosts[a['account'], a['id']] = host
-    lines += [str(i) + '. ' + describe(a) + ' (' + safe_text(a['reason']) + ')' + (' | ' + safe_text(a['question']) if 'question' in a else '') for i, a in enumerate(plan['decisions'] + unsafe, 1)] or [empty]
+    lines += [(str(a['number']) + '. ' if 'number' in a else '- ') + describe(a) + ' (' + safe_text(a['reason']) + ')' + (' | ' + safe_text(a['question']) if 'question' in a else '') for i, a in enumerate(plan['decisions'] + unsafe, 1)] or [empty]
     lines += ['', '**' + planned + '**', '']
     lines += ['- ' + a['action'] + ': ' + describe(a) + (' | ' + code_path(a['target_path']) if 'target_path' in a else '') + (' | ' + safe_text(hosts.get((a['account'], a['id']), '')) if 'url' in a else '') for a in plan['actions'] if a['action'] != 'unsubscribe' or (a['account'], a['id']) in hosts] or [empty]
     lines += ['', '**' + new + '**', '', empty, '']
@@ -532,6 +1293,8 @@ def load_inputs(paths):
             if not p.is_file() or not p.stat().st_mode & 0o444:
                 raise ValueError(str(p) + ': expected a readable file')
             content = p.read_text(encoding='utf-8')
+        except UnicodeError as error:
+            raise ValueError(str(p) + ': expected UTF-8 text') from error
         except OSError as error:
             raise OSError(str(p) + ': expected a readable file') from error
         if not content.strip():
@@ -540,16 +1303,18 @@ def load_inputs(paths):
     return result
 
 
-def commit_state(store, token, plan_path, results_path=None):
+def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_verified=False):
     with lock_gate(store):
         require_lock(store, token)
+        if store_lock_setting(store)['kind'] == 'onedrive' and not lock_verified:
+            raise ValueError('run.lock: fresh drive read required before commit')
         def read(path):
             try:
-                return json.loads(load_inputs([path])[0])
+                return parse_json(load_inputs([path])[0], path)
             except ValueError as error:
                 raise ValueError(str(path) + ': ' + str(error)) from error
         plan = read(plan_path)
-        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'first_run'}, str(plan_path))
+        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'first_run', 'reply'}, str(plan_path))
         for key in ('actions', 'reasons', 'not_listed'):
             if not isinstance(plan.get(key), list):
                 raise ValueError(str(plan_path) + '.' + key + ': expected an array')
@@ -597,7 +1362,7 @@ def commit_state(store, token, plan_path, results_path=None):
             raise ValueError(str(results_path) + ': expected results recorded by the step machine for this token and plan')
         config_path = store / 'config.toml'
         try:
-            config = tomllib.loads(load_inputs([config_path])[0])
+            config = parse_toml(load_inputs([config_path])[0], config_path)
         except ValueError as error:
             raise ValueError(str(config_path) + ': expected valid TOML: ' + str(error)) from error
         state = store / 'state.json'
@@ -615,52 +1380,129 @@ def commit_state(store, token, plan_path, results_path=None):
                     counts[account] -= 1
         if any(n < 0 for n in counts.values()):
             raise ValueError(str(plan_path) + '.counts: expected at least as many observed messages as executed removals')
+        if not plan.get('reply'):
+            previous.pop('_positions', None)
+        path = store / 'quiet-check.json'
+        cached = read(path) if path.exists() else {}
+        positions = cached.get('positions') if cached.get('token') == token else None
+        if (not plan.get('reply') and not plan['reasons'] and positions is not None and counts.keys() == config['accounts'].keys()
+                and execution.path.exists()
+                and len(execution.state['results']) == len(plan['actions'])):
+            validate_positions(positions, config)
+            previous['_positions'] = positions
+        if plan.get('reply') and not plan['reasons']:
+            log = store / 'decisions.jsonl'
+            batches = [parse_json(line, log) for line in read_text(log).splitlines()] if log.exists() else []
+            if not any(b['run'] == token for b in batches):
+                statuses = {(e['account'], e['id']): e['status'] for e in execution.state['results']}
+                pending = execution.state['pending']
+                if pending is not None:
+                    statuses[pending['account'], pending['id']] = 'issued_unknown'
+                batch = dict(run=token, time=(now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
+                             parts=[e | {'outcome': statuses.get((e['account'], e['id']), 'answered' if e['verb'] in {'leave', 'yes', 'no'} else 'unexecuted')} for e in plan['reply']])
+                with log.open('a', encoding='utf-8') as out:
+                    out.write(json.dumps(batch, ensure_ascii=True) + '\n')
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=store, delete=False) as out:
                 temporary = Path(out.name)
-                json.dump({**previous, **counts}, out)
+                json.dump({**previous, **counts}, out, sort_keys=True)
             temporary.replace(state)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
 
-def main(argv=None):
+def main(argv=None, *, now=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest='command', required=True)
-    sub.add_parser('lock')
+    lock = sub.add_parser('lock', allow_abbrev=False)
+    lock.add_argument('--observation')
     for name in ('release', 'check'):
         command = sub.add_parser(name)
         command.add_argument('--token', required=True)
+        if name == 'release':
+            command.add_argument('--observation')
+    for name in ('fetch-state', 'send-state'):
+        command = sub.add_parser(name, allow_abbrev=False)
+        command.add_argument('--token', required=True)
+        command.add_argument('--observation')
+        command.add_argument('--lock-observation')
     commit = sub.add_parser('commit-state', allow_abbrev=False)
     commit.add_argument('--token', required=True)
     commit.add_argument('--plan', required=True)
     commit.add_argument('--results')
-    plan = sub.add_parser('plan', allow_abbrev=False)
-    plan.add_argument('--token', required=True)
-    plan.add_argument('--inbox', required=True)
-    plan.add_argument('--first-run', action='store_true', help='Allow a missing state file on the first run')
-    for name in ('config', 'rules', 'never-touch', 'guardrails', 'plan-out', 'report-out'):
-        plan.add_argument('--' + name)
+    commit.add_argument('--lock-observation')
+    quiet = sub.add_parser('quiet-check', allow_abbrev=False)
+    quiet.add_argument('--token', required=True)
+    quiet.add_argument('--observation')
+    quiet.add_argument('--scheduled', action='store_true')
+    for command_name in ('plan', 'reply'):
+        plan = sub.add_parser(command_name, allow_abbrev=False)
+        if command_name == 'reply':
+            plan.add_argument('--reply', required=True)
+        plan.add_argument('--token', required=True)
+        plan.add_argument('--inbox', required=True)
+        plan.add_argument('--scheduled', action='store_true')
+        plan.add_argument('--first-run', action='store_true', help='Allow a missing state file on the first run')
+        for name in ('config', 'rules', 'never-touch', 'guardrails', 'plan-out', 'report-out'):
+            plan.add_argument('--' + name)
     args = parser.parse_args(argv)
-    for name in ('inbox', 'config', 'rules', 'never_touch', 'guardrails', 'plan_out', 'report_out', 'plan', 'results'):
+    for name in ('inbox', 'config', 'rules', 'never_touch', 'guardrails', 'plan_out', 'report_out', 'plan', 'results', 'reply'):
         if getattr(args, name, None) == '':
             raise ValueError('--' + name.replace('_', '-') + ': expected a non-empty path')
     store = private_store()
     if args.command == 'lock':
-        print(acquire(store))
+        result = drive_lock(store, 'acquire', observation=args.observation, now=now) if store_lock_setting(store)['kind'] == 'onedrive' else acquire(store)
+        print(json.dumps(result, sort_keys=True) if isinstance(result, dict) else result)
     elif args.command == 'release':
-        print(release(store, args.token))
+        result = drive_lock(store, 'release', args.token, args.observation, now=now) if store_lock_setting(store)['kind'] == 'onedrive' else release(store, args.token)
+        print(json.dumps(result, sort_keys=True) if isinstance(result, dict) else result)
     elif args.command == 'check':
         with lock_gate(store):
             require_lock(store, args.token)
         print('Lock is held and unexpired')
+    elif args.command in ('fetch-state', 'send-state'):
+        print(json.dumps(drive_state(store, 'fetch' if args.command == 'fetch-state' else 'send', args.token, args.observation, lock_observation=args.lock_observation, now=now), sort_keys=True))
     elif args.command == 'commit-state':
-        commit_state(store, args.token, args.plan, args.results)
+        if store_lock_setting(store)['kind'] == 'onedrive':
+            result = drive_lock(store, 'commit', args.token, args.lock_observation, now=now)
+            if isinstance(result, dict):
+                print(json.dumps(result, sort_keys=True))
+                return
+        commit_state(store, args.token, args.plan, args.results, now=now, lock_verified=True)
+    elif args.command == 'quiet-check':
+        with lock_gate(store):
+            require_lock(store, args.token)
+            require_fetched(store, args.token)
+            config_path = store / 'config.toml'
+            config = parse_toml(load_inputs([config_path])[0], config_path)
+            state = store / 'state.json'
+            previous = parse_json(load_inputs([state])[0], state) if state.exists() else {}
+            try:
+                validate_inputs({'accounts': {}, 'messages': []}, config, previous)
+            except ValueError as error:
+                raise ValueError(str(config_path) + ': ' + str(error)) from error
+            now = now or datetime.now(timezone.utc)
+            if args.observation is None:
+                reads = {}
+                for account, fields in config['accounts'].items():
+                    if fields.get('quiet_kind', 'ids') == 'history':
+                        reads[account] = {'read': 'Inbox arrivals since saved position and current position',
+                                          'since': previous.get('_positions', {}).get(account)}
+                        if reads[account]['since'] is None:
+                            reads[account]['read'] = 'current position only'
+                    else:
+                        reads[account] = {'read': 'newest Inbox ids in newest-first order', 'limit': NEWEST_IDS}
+                print(json.dumps({'reads': reads}, sort_keys=True))
+            else:
+                print(json.dumps(quiet_check(store, config, previous, args.observation, args.scheduled, now), sort_keys=True))
     else:
         sources = [getattr(args, n.replace('-', '_')) or store / (n + ('.md' if n == 'guardrails' else '.toml')) for n in ('config', 'rules', 'never-touch', 'guardrails')]
-        protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'inbox.json', 'config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')}
+        protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'numbers.json', 'reply.json', 'reply.txt', 'decisions.jsonl', 'history.log', 'run-message.md', 'quiet-observation.json', 'positions-observation.json', 'quiet-check.json', 'lock-exchange.json', 'lock-observation.json', 'lock-commit-observation.json', 'state-exchange.json', 'state-incoming', 'state-outgoing', 'state-observation.json', 'upload-observation.json', 'state-lock-observation.json', 'inbox.json', 'config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')}
+        if args.command == 'reply':
+            protected.add(Path(args.reply).resolve())
+        protected = {p.resolve() for p in protected}
         protected |= {p.resolve() for p in store.glob('execution-*.json')}
         for name in (args.plan_out, args.report_out):
             if name:
@@ -674,12 +1516,13 @@ def main(argv=None):
                     raise ValueError(flag + ': expected a path other than an input, state or lock file')
             with lock_gate(store):
                 require_lock(store, args.token)
+                require_fetched(store, args.token)
                 texts = load_inputs(sources)
                 parsed = []
                 for name, text, parse in zip(('config', 'rules', 'never-touch'), texts, (tomllib.loads, parse_rules, lambda t: parse_rules(t, protection=True))):
                     path = getattr(args, name.replace('-', '_')) or store / (name + '.toml')
                     try:
-                        parsed.append(parse(text))
+                        parsed.append(parse_toml(text, path) if name == 'config' else parse(text))
                     except ValueError as error:
                         raise ValueError(str(path) + ': ' + str(error)) from error
                 config, rules, holds = parsed
@@ -689,12 +1532,14 @@ def main(argv=None):
                     raise ValueError(str(args.inbox) + ': expected a JSON Inbox object') from error
                 state = store / 'state.json'
                 try:
-                    previous = json.loads(state.read_text(encoding='utf-8')) if state.exists() else {}
+                    previous = json.loads(read_text(state)) if state.exists() else {}
                 except ValueError as error:
                     raise ValueError(str(state) + ': expected a JSON account-count object') from error
                 if not isinstance(previous, dict):
                     raise ValueError(str(state) + ': expected account keys and non-negative integer counts')
                 for account, count in previous.items():
+                    if account == '_positions':
+                        continue
                     if type(count) is not int or count < 0:
                         raise ValueError(str(state) + ': state.json.' + account + ': expected a non-negative integer count')
                 stops = ['Missing state; use --first-run only for an explicit first run'] if not state.exists() and not args.first_run else []
@@ -712,10 +1557,41 @@ def main(argv=None):
                     else:
                         source = args.inbox
                     raise ValueError(str(source) + ': ' + message.strip()) from error
+                if args.command == 'reply':
+                    try:
+                        if args.scheduled:
+                            raise ValueError('Replies require a user-initiated run')
+                        try:
+                            with Path(args.reply).open(encoding='utf-8') as stream:
+                                reply_text = stream.read(REPLY_LIMIT + 1)
+                        except UnicodeError:
+                            raise ValueError('--reply: expected UTF-8 text') from None
+                        parts = parse_reply(reply_text)
+                        result = reply_plan(store, listing, holds, config, previous, parts, stops)
+                        import execute
+                        execute.atomic(store / 'reply.json', dict(token=args.token, parts=parts))
+                    except ValueError as error:
+                        result = build_plan(listing, [], holds, config, previous, ['Reply refused: ' + ' '.join(str(error).split())])
+                number_decisions(store, result, listing)
                 result['first_run'] = args.first_run
                 report = render_report(result, listing, config.get('language', 'en'))
-                payload = json.dumps(result, ensure_ascii=True, indent=2) + '\n'
+                if args.scheduled and 'schedule' in config:
+                    now = now or datetime.now(timezone.utc)
+                    slot = schedule_slot(config, now)
+                    delay = int((now.timestamp() - slot.timestamp()) // 60)
+                    if now.timestamp() - slot.timestamp() > 15 * 60:
+                        report = 'Late start: slot ' + slot.strftime('%Y-%m-%d %H:%M %Z') + ', delay ' + str(delay) + ' minutes\n' + report
                 sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
+                if args.command == 'reply':
+                    lookup = {(m['account'], m['id']): m for m in listing['messages']}
+                    if result['reasons']:
+                        print(safe_text(result['reasons'][0]) + ' Type each listed number once followed by trash, archive, spam, move to <existing folder>, leave, yes or no; separate parts with commas. For a stale, protected or unavailable item, request a fresh run and use an eligible listed number. Next: execute.py next, then commit-state, send-state and release under this lock.')
+                    for entry in result.get('reply', []):
+                        if entry['verb'] in {'leave', 'yes', 'no'}:
+                            continue
+                        m = lookup[entry['account'], entry['id']]
+                        print(str(entry['number']) + '. [' + safe_text(entry['account']) + '] ' + safe_text(m['sender']) + ': "' + safe_text(m['subject']) + '" ' + entry['verb'])
+                payload = json.dumps(result, ensure_ascii=True, indent=2) + '\n'
                 outputs = []
                 temporary = []
                 try:
@@ -762,6 +1638,6 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, OSError, KeyError, TypeError) as error:
+    except (ValueError, OSError, KeyError, TypeError, RecursionError) as error:
         print('Refused: ' + ' '.join(str(error).split()), file=sys.stderr)
         sys.exit(1)
