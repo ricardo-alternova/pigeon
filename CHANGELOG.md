@@ -1,5 +1,7 @@
 # Changelog
 
+- Handle empty gateway lists, normalise app paths, retry and explain skipped accounts, and retain quiet positions per account.
+
 - Complete scripted final arrivals and merge body-rule accounts through --manual-part.
 - Version configuration and saved state; print the version during validation.
 - Save gateway tool paths and include them on issued calls.

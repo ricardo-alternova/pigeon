@@ -30,6 +30,428 @@ class ExecuteTests(unittest.TestCase):
         execute.atomic(self.path, self.plan)
 
 
+    def batch_fixture(self, count=4):
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="mailbox-example"\n')
+        (self.store / 'rules.toml').write_text('[[rules]]\nid="t"\naccounts=["cedar"]\nsubject="trash"\naction="trash"\nexclusions=[]\n')
+        self.listing['messages'] = [dict(account='cedar', id=str(i), folder='Inbox', sender='a@example.net', subject='trash') for i in range(count)]
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        config = triage.state_config(self.store)
+        self.plan = triage.build_plan(self.listing, triage.parse_rules((self.store / 'rules.toml').read_text()), [], config)
+        self.plan['first_run'] = True
+        execute.atomic(self.path, self.plan)
+
+    def test_embedded_provider_failure_never_confirms_batch(self):
+        bodies = [{'error': {'code': 404}}, {'error': {'code': 'ErrorAccessDenied'}},
+                  {'code': '403'}, {'status': 503}, {'statusCode': 700}]
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertTrue(triage.provider_failed(dict(ok=True, value=body)))
+        self.assertEqual(triage.provider_error(dict(ok=True, value={'statusCode':700})), 'provider error (700)')
+        self.assertFalse(triage.provider_failed(dict(ok=True, value={})))
+        self.batch_fixture()
+        batch = self.machine().step()
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={'error': {'code': 403}}) for c in batch['calls']])
+        self.machine().batch_result(path)
+        self.machine().final(dict(self.listing, messages=[]))
+        self.assertTrue(all(r['status'] == 'failed' for r in self.machine().state['results']))
+        self.assertTrue(all(r['reason'] == 'provider error (403)' for r in self.machine().state['results']))
+
+    def test_final_failed_account_keeps_actions_unconfirmed(self):
+        self.batch_fixture()
+        batch = self.machine().step()
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={}) for c in batch['calls']])
+        self.machine().batch_result(path)
+        self.machine().final(dict(accounts={}, messages=[], skipped={'cedar': 'provider error (503)'}))
+        self.assertTrue(all(r['status'] == 'unconfirmed' for r in self.machine().state['results']))
+        self.assertTrue(all(r['reason'] == 'provider error (503)' for r in self.machine().state['results']))
+        self.assertFalse(self.machine().stop_reason())
+
+    def test_final_failure_commits_healthy_account(self):
+        self.batch_fixture(3)
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n[accounts.marble]\nprovider="outlook"\nexecutor_app="marble"\nexecutor_account="marble-example"\n')
+        p = self.store / 'rules.toml'
+        p.write_text(p.read_text().replace('["cedar"]', '["cedar","marble"]'))
+        self.listing['accounts']['marble'] = 100
+        self.listing['messages'] += [dict(m, account='marble') for m in list(self.listing['messages'])]
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        self.plan = triage.build_plan(self.listing, triage.parse_rules(p.read_text()), [], triage.state_config(self.store))
+        self.plan['first_run'] = True
+        execute.atomic(self.path, self.plan)
+        path = self.store / 'gateway.json'
+        for _ in range(2):
+            batch = self.machine().step()
+            execute.atomic(path, [dict(ok=True, value={}) for c in batch['calls']])
+            self.machine().batch_result(path)
+        execute.atomic(self.store/'state.json', {'cedar':3,'marble':3,'_positions':{'cedar':'100','marble':[]}})
+        execute.atomic(self.store/'quiet-check.json', dict(token=self.token, positions={'cedar':'120','marble':['new']}, decision={'decision':'full'}))
+        self.machine().final(dict(accounts={'marble':100}, messages=[], skipped={'cedar':'provider error (503)'}))
+        triage.commit_state(self.store, self.token, self.path)
+        state = json.loads((self.store / 'state.json').read_text())
+        self.assertEqual(state['marble'], 0)
+        self.assertEqual(state['cedar'], 3)
+        self.assertEqual(state['_positions'], {'marble':['new']})
+        self.assertEqual([r['status'] for r in self.machine().state['results']], ['unconfirmed']*3 + ['executed']*3)
+        message = triage.render_message(self.store, self.token, self.path, None)
+        self.assertIn('provider error (503)', message)
+        for text in (message, (self.store / 'report.md').read_text()):
+            self.assertNotIn('cedar: 0', text)
+            self.assertIn('marble: 0', text)
+
+    def test_provider_account_without_gateway_ids_keeps_recipe_calls(self):
+        self.batch_fixture()
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\n')
+        batch = self.machine().step()
+        self.assertEqual([c['id'] for c in batch['calls']], ['0', '1', '2', '3'])
+        self.assertTrue(all('path' not in c and 'input' not in c for c in batch['calls']))
+
+    def test_recovered_refusal_cleared_by_commit(self):
+        self.batch_fixture()
+        batch = self.machine().step()
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={}) for c in batch['calls']])
+        execute.atomic(self.store / 'run-refusal.json', dict(token=self.token, stage='result', refusal='gateway results: expected a JSON array'))
+        self.machine().batch_result(path)
+        self.machine().final(dict(self.listing, messages=[]))
+        triage.commit_state(self.store, self.token, self.path)
+        message = triage.render_message(self.store, self.token, self.path, None)
+        self.assertNotIn('Run failed', message)
+        self.assertIn('4 handled', message)
+
+    def test_current_refusal_overrides_stale_plan_and_commit_message(self):
+        execute.atomic(self.store / 'run-refusal.json', dict(token=self.token, stage='listing', refusal='listing: unknown skipped account'))
+        message = triage.render_message(self.store, self.token, self.path, None)
+        self.assertTrue(message.startswith('📬 Triage · '))
+        self.assertIn('Run failed at listing: listing: unknown skipped account', message)
+        execute.atomic(self.store / 'run-refusal.json', dict(token=self.token, stage='commit-state', refusal='state.json: expected valid JSON'))
+        self.assertIn('Run failed at commit-state: state.json: expected valid JSON', triage.render_message(self.store, self.token, self.path, None))
+        execute.atomic(self.store / 'run-refusal.json', dict(token='earlier-token', stage='listing', refusal='stale refusal'))
+        self.assertNotIn('stale refusal', triage.render_message(self.store, self.token, self.path, None))
+
+    def test_dry_run_names_skipped_accounts(self):
+        (self.store / 'guardrails.md').write_text('Fixture guardrails')
+        (self.store / 'config.toml').write_text('[accounts.cedar]\n[accounts.marble]\n')
+        self.listing['skipped'] = {'marble':'provider error (503)'}
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        self.plan = triage.build_plan(self.listing, triage.parse_rules((self.store / 'rules.toml').read_text()), [], triage.state_config(self.store))
+        self.plan.update(dry_run=True, first_run=True, run_token=self.token)
+        execute.atomic(self.path, self.plan)
+        message = triage.render_message(self.store, self.token, self.path, None)
+        self.assertTrue(message.startswith('📬 Triage · '))
+        self.assertIn('marble: not listed this run; provider error (503)', message)
+
+    def test_saved_refusal_omits_private_directory(self):
+        (self.store / 'guardrails.md').write_text('Fixture guardrails')
+        from unittest.mock import patch
+        with patch.dict(os.environ, PIGEON_HOME=str(self.store)):
+            with self.assertRaises(OSError):
+                triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'missing-inbox.json')])
+        failure = execute.read(self.store / 'run-refusal.json')
+        self.assertNotIn(str(self.store), failure['refusal'])
+        self.assertIn('missing-inbox.json', failure['refusal'])
+
+    def test_issued_gateway_action_shapes_for_both_providers(self):
+        from mock_provider import MockGateway
+        for provider in ('gmail', 'outlook'):
+            for verb in ('trash', 'archive', 'spam', 'move', 'folder', 'reply', 'forward'):
+                with self.subTest(provider=provider, verb=verb):
+                    self.setUp()
+                    config = {'accounts':{'cedar':dict(provider=provider, executor_app='cedar-mail', executor_account='cedar-example')}}
+                    (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="'+provider+'"\nexecutor_app="cedar-mail"\nexecutor_account="cedar-example"\n')
+                    rule = dict(id='r', accounts=['cedar'], subject='trash', action=verb if verb not in ('folder','reply','forward') else 'move' if verb=='folder' else 'draft')
+                    if verb=='trash': rule['exclusions'] = []
+                    if verb in ('move','folder'): rule['target'] = 'Reading' if verb=='move' else 'Reading/{year}'
+                    if verb in ('reply','forward'):
+                        rule.update(draft=verb, draft_text='Owner text')
+                        if verb=='forward': rule['draft_to']=['reader@example.org']
+                    (self.store/'rules.toml').write_text('[[rules]]\n'+'\n'.join(k+'='+json.dumps(v) for k,v in rule.items())+'\n')
+                    self.listing['messages'] = [dict(self.listing['messages'][-1], date='2026-03-01T00:00:00+00:00')]
+                    execute.atomic(self.store/'inbox.json', self.listing)
+                    self.plan = triage.build_plan(self.listing, [rule], [], config)
+                    self.plan['first_run'] = True
+                    execute.atomic(self.path, self.plan)
+                    calls = self.machine().step()['calls']
+                    self.assertEqual(len(calls), 1)
+                    call = calls[0]
+                    self.assertEqual(call['input']['accountId'], 'cedar-example')
+                    inner = call['input']['input']
+                    if verb not in ('folder','reply','forward'):
+                        expected = ({'path':{'userId':'me','id':call['id']}} if provider=='gmail' else {'path':{'message-id':call['id']},'body':{'DestinationId':{'trash':'deleteditems','archive':'archive','spam':'junkemail','move':'reading'}[verb]}})
+                        if provider=='gmail' and verb!='trash':
+                            expected['body']={'removeLabelIds':['INBOX']}
+                            if verb in ('move','spam'): expected['body']['addLabelIds']=['reading' if verb=='move' else 'SPAM']
+                        self.assertEqual(inner, expected)
+                    elif verb=='folder':
+                        self.assertEqual(inner, {'path':{'userId':'me'},'body':{'name':'Reading/2026'}} if provider=='gmail' else {'path':{'mailFolder-id':'reading'},'body':{'displayName':'2026'}})
+                    else:
+                        self.assertEqual(inner['path'], {'userId':'me'} if provider=='gmail' else {'message-id':call['id']})
+                        self.assertEqual(inner['draft_text'], 'Owner text')
+                    self.assertTrue(call['path'].startswith('tools["cedar-mail"].'))
+                    MockGateway(self.listing, config).batch(calls)
+
+    def test_obsolete_outlook_tool_paths_are_dropped(self):
+        import contextlib
+        import io
+        for provider in (None, 'outlook'):
+            fields = {'executor_app':'cedar-mail'}
+            if provider: fields['provider'] = provider
+            config = {'accounts':{'cedar':fields}}
+            for kind, name in [('move','meMoveMessages'), ('create-draft','meCreateReply'), ('create-draft','meCreateForward')]:
+                data = {'cedar':{kind:'tools["cedar-mail"].meMessage.'+name}}
+                with contextlib.redirect_stderr(io.StringIO()): triage.validate_tool_paths(data, config, drop=True)
+                self.assertEqual(data, {'cedar':{}})
+            for name in ('meMessagesMessageReply','meMessagesMessageReplyAll','meMessagesMessageForward','meMessagesMessageSend','meMessagesMessagePermanentDelete'):
+                with self.assertRaises(ValueError): triage.checked_tool(config, 'cedar', 'create-draft', 'tools["cedar-mail"].meMessage.'+name)
+
+    def test_stopped_plan_never_numbers_protected_messages(self):
+        holds = [{'sender':'a@example.net'}]
+        plan = triage.build_plan(self.listing, [], holds, {'accounts':{'cedar':{}}}, {}, ['Fixture stop'])
+        triage.number_decisions(self.store, plan, self.listing)
+        self.assertTrue(all(i['reason']=='Protected by never-touch' and 'number' not in i for i in plan['remaining']))
+        self.assertEqual(triage.read_numbers(self.store)['items'], [])
+
+    def test_execution_refusal_replaces_current_run_failure(self):
+        self.machine().step()
+        execute.atomic(self.store/'run-refusal.json', dict(token=self.token, stage='listing', refusal='old refusal'))
+        result = subprocess.run(['python3',str(Path(execute.__file__)),'result','--token',self.token,'--plan',str(self.path),'--observation','bad json'], env=dict(os.environ,PIGEON_HOME=str(self.store)), capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        failure = execute.read(self.store/'run-refusal.json')
+        self.assertEqual(failure['stage'], 'result')
+        self.assertNotIn('old refusal', failure['refusal'])
+        self.assertIn('Run failed at result', triage.render_message(self.store,self.token,self.path,None))
+
+    def test_late_message_keeps_standard_first_line(self):
+        from unittest.mock import patch
+        self.plan['scheduled'] = True
+        execute.atomic(self.path, self.plan)
+        with (self.store/'config.toml').open('a') as f:
+            f.write('[schedule]\nweekdays=["00:00"]\nweekends=["00:00"]\nalways_full=[]\n')
+        self.machine().step()
+        held = triage.read_lock(self.store)
+        slot = datetime.fromtimestamp(held['created']-3600, timezone.utc)
+        with patch.object(triage, 'schedule_slot', return_value=slot):
+            message = triage.render_message(self.store,self.token,self.path,None)
+        self.assertTrue(message.startswith('📬 Triage · '))
+        self.assertTrue(message.splitlines()[1].startswith('Late start:'))
+
+    def test_stale_dry_run_plan_is_ignored(self):
+        execute.atomic(self.path, dict(self.plan, dry_run=True, run_token='earlier-token'))
+        message = triage.render_message(self.store,self.token,self.path,None)
+        self.assertTrue(message.startswith('📬 Triage · '))
+        self.assertIn('Run failed at plan: pigeon error (plan unavailable)', message)
+        self.assertNotIn('would move', message)
+
+    def test_latest_refusal_survives_unreadable_results(self):
+        self.machine().step()
+        (self.store/'results.json').write_text('bad json')
+        execute.atomic(self.store/'run-refusal.json', dict(token=self.token, stage='commit-state', refusal='state.json: expected valid JSON'))
+        message = triage.render_message(self.store,self.token,self.path,None)
+        self.assertTrue(message.startswith('📬 Triage · '))
+        self.assertIn('Run failed at commit-state: state.json: expected valid JSON', message)
+
+    def test_outlook_action_variant_matches_input_even_with_saved_tool(self):
+        config = {'accounts':{'cedar':dict(provider='outlook',executor_app='cedar-mail',executor_account='cedar-example')}}
+        prefix = 'tools["cedar-mail"].'
+        call = dict(account='cedar',id='0',action='create-draft',draft='forward',draft_text='Owner text',draft_to=['reader@example.org'],tool=prefix+'meMessage.meMessagesMessageCreateReply')
+        issued = self.machine().gateway_action(call, config)
+        self.assertEqual(issued['path'], prefix+'meMessage.meMessagesMessageCreateForward')
+        self.assertEqual(issued['tool'], issued['path'])
+        call = dict(account='cedar',id='0',action='create-folder',target_path='Reading/2026',tool=prefix+'meMailFolder.meCreateMailFolders')
+        issued = self.machine().gateway_action(call, config)
+        self.assertEqual(issued['path'], prefix+'meMailFolder.meMailFoldersCreateChildFolders')
+        self.assertEqual(issued['input']['input']['path'], {'mailFolder-id':'reading'})
+        call['target_path'] = '2026'
+        issued = self.machine().gateway_action(call, config)
+        self.assertEqual(issued['path'], prefix+'meMailFolder.meCreateMailFolders')
+        self.assertEqual(issued['input']['input'], {'body':{'displayName':'2026'}})
+
+    def test_provider_batch_confirmed_only_by_final(self):
+        self.batch_fixture()
+        batch = self.machine().step()
+        self.assertEqual([c['id'] for c in batch['calls']], ['0', '1', '2', '3'])
+        self.assertTrue(all(c['executor_account'] == 'mailbox-example' and 'verify' not in c for c in batch['calls']))
+        results = self.store / 'gateway.json'
+        execute.atomic(results, [dict(ok=True, value={}) for _ in batch['calls']])
+        self.machine().batch_result(results)
+        self.assertTrue(all(r['status'] == 'issued_unknown' for r in self.machine().state['results']))
+        self.assertIn('final_reads', self.machine().step())
+        self.machine().final(dict(self.listing, messages=[]))
+        self.assertTrue(all(r['status'] == 'executed' for r in self.machine().state['results']))
+
+    def test_batch_partial_failure_unconfirmed_and_wrong_length(self):
+        self.batch_fixture()
+        self.machine().step()
+        path = self.store / 'gateway.json'
+        before = self.machine().state
+        execute.atomic(path, [dict(ok=True, value={})])
+        with self.assertRaises(ValueError):
+            self.machine().batch_result(path)
+        self.assertEqual(self.machine().state, before)
+        execute.atomic(path, [dict(ok=True, value={}), dict(ok=False, error={'status': 429, 'message': 'private text'}), dict(ok=True, value={}), dict(ok=True, value={})])
+        self.machine().batch_result(path)
+        self.machine().final(dict(self.listing, messages=self.listing['messages'][1:3]))
+        results = self.machine().state['results']
+        self.assertEqual([r['status'] for r in results], ['executed', 'failed', 'unconfirmed', 'executed'])
+        self.assertEqual(results[1]['reason'], 'provider error (429)')
+        self.assertNotIn('private text', self.machine().path.read_text())
+        remaining = self.machine().remaining_items(self.machine().state['final_listing'], results)
+        self.assertIn('provider error (429)', remaining[0]['reason'])
+
+    def test_provider_moves_batch(self):
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\n')
+        batch = self.machine().step()
+        self.assertEqual([c['action'] for c in batch['calls']], ['move', 'move', 'move', 'trash'])
+        self.assertTrue(all(c['target'] == 'reading' for c in batch['calls'][:3]))
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={}) for _ in batch['calls']])
+        self.machine().batch_result(path)
+        self.machine().final(dict(self.listing, messages=[]))
+        self.assertTrue(all(r['status'] == 'executed' for r in self.machine().state['results']))
+
+    def test_batch_crash_resume_never_reissues(self):
+        self.batch_fixture()
+        self.machine().step()
+        before = (self.store / 'calls.jsonl').read_text()
+        self.assertIn('final_reads', self.machine().step())
+        self.assertEqual((self.store / 'calls.jsonl').read_text(), before)
+        self.machine().final(dict(self.listing, messages=[]))
+        self.assertTrue(all(r['status'] == 'issued_unknown' for r in self.machine().state['results']))
+        self.assertNotIn('outside_change', self.machine().state)
+
+    def test_batch_crash_before_unissued_account_can_finish(self):
+        self.batch_fixture(1)
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n[accounts.marble]\nprovider="outlook"\nexecutor_app="marble"\nexecutor_account="marble-example"\n')
+        text = (self.store / 'rules.toml').read_text().replace('["cedar"]', '["cedar","marble"]')
+        (self.store / 'rules.toml').write_text(text)
+        self.listing['accounts']['marble'] = 100
+        self.listing['messages'].append(dict(self.listing['messages'][0], account='marble'))
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        self.plan = triage.build_plan(self.listing, triage.parse_rules(text), [], triage.state_config(self.store))
+        self.plan['first_run'] = True
+        execute.atomic(self.path, self.plan)
+        self.machine().step()
+        self.assertIn('final_reads', self.machine().step())
+        self.machine().final(dict(self.listing, messages=self.listing['messages'][1:]))
+        self.assertEqual([r['status'] for r in self.machine().state['results']], ['issued_unknown', 'unexecuted'])
+
+    def test_batch_outside_departure(self):
+        self.batch_fixture()
+        outside = dict(self.listing['messages'][0], id='outside', subject='keep')
+        self.listing['messages'].append(outside)
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        self.plan = triage.build_plan(self.listing, triage.parse_rules((self.store / 'rules.toml').read_text()), [], triage.state_config(self.store))
+        self.plan['first_run'] = True
+        execute.atomic(self.path, self.plan)
+        self.machine().step()
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={})] * 4)
+        self.machine().batch_result(path)
+        result = self.machine().final(dict(self.listing, messages=[]))
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual(self.machine().state['outside_change']['ids'], ['outside'])
+
+    def test_batch_swapped_outcomes_do_not_confirm_present_message(self):
+        self.batch_fixture(2)
+        self.machine().step()
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={}), dict(ok=False, error={'status': 503})])
+        self.machine().batch_result(path)
+        result = self.machine().final(dict(self.listing, messages=self.listing['messages'][:1]))
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual([r['status'] for r in self.machine().state['results']], ['unconfirmed', 'failed'])
+
+    def test_batch_lock_and_dry_run_issue_nothing(self):
+        self.batch_fixture()
+        self.plan['dry_run'] = True
+        execute.atomic(self.path, self.plan)
+        with self.assertRaisesRegex(ValueError, 'dry-run'):
+            self.machine()
+        self.plan.pop('dry_run')
+        execute.atomic(self.path, self.plan)
+        triage.release(self.store, self.token)
+        self.assertIn('stop', self.machine().step())
+        self.assertFalse((self.store / 'calls.jsonl').exists())
+
+    def test_batch_two_failure_skip_across_accounts(self):
+        self.batch_fixture(2)
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n[accounts.marble]\nprovider="outlook"\nexecutor_app="marble"\nexecutor_account="marble-example"\n')
+        text = (self.store / 'rules.toml').read_text().replace('["cedar"]', '["cedar","marble"]')
+        (self.store / 'rules.toml').write_text(text)
+        self.listing['accounts']['marble'] = 100
+        self.listing['messages'].append(dict(self.listing['messages'][0], account='marble'))
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        self.plan = triage.build_plan(self.listing, triage.parse_rules(text), [], triage.state_config(self.store))
+        self.plan['first_run'] = True
+        execute.atomic(self.path, self.plan)
+        self.assertEqual(len(self.machine().step()['calls']), 2)
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=False, error={'status': 503})] * 2)
+        self.machine().batch_result(path)
+        self.assertIn('final_reads', self.machine().step())
+        self.assertEqual(self.machine().state['results'][-1]['status'], 'skipped')
+
+    def test_batch_mixed_provider_and_single_account(self):
+        self.batch_fixture(1)
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n[accounts.marble]\n')
+        text = (self.store / 'rules.toml').read_text().replace('["cedar"]', '["cedar","marble"]')
+        (self.store / 'rules.toml').write_text(text)
+        self.listing['accounts']['marble'] = 100
+        self.listing['messages'].append(dict(self.listing['messages'][0], account='marble'))
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        self.plan = triage.build_plan(self.listing, triage.parse_rules(text), [], triage.state_config(self.store))
+        self.plan['first_run'] = True
+        execute.atomic(self.path, self.plan)
+        self.assertEqual(self.machine().step()['account'], 'cedar')
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={})])
+        self.machine().batch_result(path)
+        single = self.machine().step()
+        self.assertEqual(single['account'], 'marble')
+        self.assertIn('verify', single)
+        self.machine().step(execute.AssistantProvider(dict(outcome='ok', inbox_ids=[])))
+        self.machine().final(dict(self.listing, messages=[]))
+        self.assertTrue(all(r['status'] == 'executed' for r in self.machine().state['results']))
+
+    def test_provider_batch_plan_safety_and_size(self):
+        self.batch_fixture(50)
+        text = (self.store / 'rules.toml').read_text() + 'limit=50\n'
+        (self.store / 'rules.toml').write_text(text)
+        self.listing['accounts']['cedar'] = 1000
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        self.plan = triage.build_plan(self.listing, triage.parse_rules(text), [], triage.state_config(self.store))
+        self.plan['first_run'] = True
+        execute.atomic(self.path, self.plan)
+        self.assertEqual(len(self.machine().step()['calls']), 50)
+        self.assertEqual(len(self.machine().state['results']), 50)
+        # Every issue rechecks owner protections against the original inputs.
+        (self.store / 'never-touch.toml').write_text('[[rules]]\naccounts=["cedar"]\nsubject="trash"\n')
+        with self.assertRaises(ValueError):
+            self.machine().step()
+
+    def test_provider_batch_rule_limit_brake_and_refresh(self):
+        self.batch_fixture(11)
+        self.assertIn('Per-rule action limit exceeded', ' '.join(self.plan['reasons']))
+        self.assertTrue(self.machine().step()['done'])
+        self.assertFalse((self.store / 'calls.jsonl').exists())
+        self.machine().path.unlink()
+        text = (self.store / 'rules.toml').read_text() + 'limit=50\n'
+        (self.store / 'rules.toml').write_text(text)
+        self.listing['accounts']['cedar'] = 20
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        self.plan = triage.build_plan(self.listing, triage.parse_rules(text), [], triage.state_config(self.store))
+        self.plan['first_run'] = True
+        execute.atomic(self.path, self.plan)
+        self.assertIn('cedar', ' '.join(self.plan['reasons']))
+        self.assertTrue(self.machine().step()['done'])
+        self.assertFalse((self.store / 'calls.jsonl').exists())
+        self.machine().path.unlink()
+        self.batch_fixture(1)
+        lock = execute.read(self.store / 'run.lock')
+        lock['created'] = execute.time.time() - triage.STALE_SECONDS + triage.REFRESH_MARGIN / 2
+        execute.atomic(self.store / 'run.lock', lock)
+        self.assertTrue(self.machine().step()['refresh_lock'])
+
     def test_saved_tool_commands_and_issued_paths(self):
         (self.store / 'config.toml').write_text('[accounts.cedar]\nexecutor_app="cedar"\n')
         env=dict(os.environ, PIGEON_HOME=str(self.store))
@@ -85,7 +507,7 @@ class ExecuteTests(unittest.TestCase):
                            ('create-draft', 'tools.cedar-mail.meMessage.meMoveMessages')]:
             with self.subTest(path=path), self.assertRaises(ValueError):
                 triage.validate_tool_paths({'cedar': {kind: path}}, plain)
-        triage.validate_tool_paths({'cedar': {'create-draft': 'tools.cedar-mail.meMessage.meCreateReply'}}, plain)
+        triage.validate_tool_paths({'cedar': {'create-draft': 'tools.cedar-mail.meMessage.meMessagesMessageCreateReply'}}, plain)
 
     def test_dry_then_real_cli_preserves_first_run_and_plan(self):
         (self.store / 'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
@@ -121,7 +543,7 @@ class ExecuteTests(unittest.TestCase):
     def test_dry_run_reasons_and_spanish_labels(self):
         (self.store / 'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
         (self.store / 'config.toml').write_text('language="es"\n[accounts.cedar]\n')
-        execute.atomic(self.path, dict(self.plan, dry_run=True))
+        execute.atomic(self.path, dict(self.plan, dry_run=True, run_token=self.token))
         message = triage.render_message(self.store, self.token, self.path, None)
         self.assertIn('Simulación', message)
         self.assertIn('Todavía en Recibidos', message)
@@ -130,13 +552,14 @@ class ExecuteTests(unittest.TestCase):
     def test_dry_run_refuses_writes_and_renders(self):
         (self.store / 'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
         before = {p.name: p.read_bytes() for p in self.store.iterdir() if p.is_file()}
-        execute.atomic(self.path, dict(self.plan, dry_run=True))
+        execute.atomic(self.path, dict(self.plan, dry_run=True, run_token=self.token))
         with self.assertRaisesRegex(ValueError, 'dry-run'):
             self.machine()
         with self.assertRaisesRegex(ValueError, 'dry-run'):
             triage.commit_state(self.store, self.token, self.path)
         message = triage.render_message(self.store, self.token, self.path, None)
-        self.assertTrue(message.startswith('Dry run'))
+        self.assertTrue(message.startswith('📬 Triage · '))
+        self.assertIn('Dry run', message)
         self.assertIn('would move', message)
         self.assertIn('no reply number is live', message)
         self.assertIn('Still in Inbox', message)
@@ -179,7 +602,7 @@ class ExecuteTests(unittest.TestCase):
         execute.atomic(self.store/'inbox.json', original)
         machine.plan['counts']['marble'] = 1
         machine.state.update(outside_change={'account': 'cedar', 'ids': ['0']}, final_listing={'accounts': {'cedar': 0, 'marble': 0}, 'messages': []})
-        self.assertIn('marble (1 messages', machine.stop_reason())
+        self.assertIn('marble (1 message left', machine.stop_reason())
 
     def test_validate_names_manual_body_part(self):
         (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
@@ -287,7 +710,7 @@ class ExecuteTests(unittest.TestCase):
         (self.store / 'rules.toml').write_text(rules)
         execute.atomic(self.store / 'inbox.json', listing)
         result = triage.build_plan(listing, triage.parse_rules(rules), [], {'accounts':{'cedar':{}}})
-        execute.atomic(self.path, dict(result, first_run=True, dry_run=True))
+        execute.atomic(self.path, dict(result, first_run=True, dry_run=True, run_token=self.token))
         message = triage.render_message(self.store, self.token, self.path, None)
         self.assertIn('twenty percent', message)
         self.assertIn('Decisions for the owner', message)
@@ -410,18 +833,18 @@ class ExecuteTests(unittest.TestCase):
             if index: ids.remove(call['id'])
         self.machine().step()
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(self.message_command(), '''📬 Triage · Thursday, 2026-11-12, 12:00 UTC · 1 need you · 3 handled
+        self.assertEqual(self.message_command(), '''📬 Triage · Thursday, 2026-11-12, 12:00 UTC · 1 needs you · 3 handled
 
-**Handled automatically**
+Handled automatically
 move: 2 (r: 2)
 trash: 1 (t: 1)
 
-**Still in Inbox (by account)**
+Still in Inbox (by account)
 
 cedar: 1
-1. cedar: a\\[at\\]example\\[dot\\]net \\| move (failed)
+1. cedar: a@example.net · move (failed)
 
-**Run notes**
+Run notes
 
 cedar: move: failed
 ''')
@@ -430,17 +853,17 @@ cedar: move: failed
         self.machine().step()
         self.assertEqual(self.message_command(), '''📬 Triage · Thursday, 2026-11-12, 12:00 UTC · nothing needs you · stopped
 
-**Still in Inbox (by account)**
+Still in Inbox (by account)
 
 cedar: 4
-- cedar: a\\[at\\]example\\[dot\\]net \\| move (issued\\_unknown)
-- cedar: a\\[at\\]example\\[dot\\]net \\| move (unexecuted)
-- cedar: a\\[at\\]example\\[dot\\]net \\| move (unexecuted)
-- cedar: a\\[at\\]example\\[dot\\]net \\| trash (unexecuted)
+- cedar: a@example.net · move (issued_unknown)
+- cedar: a@example.net · move (unexecuted)
+- cedar: a@example.net · move (unexecuted)
+- cedar: a@example.net · trash (unexecuted)
 
-**Run notes**
+Run notes
 
-cedar: move: issued\\_unknown
+cedar: move: issued_unknown
 cedar: move: unexecuted
 cedar: move: unexecuted
 cedar: trash: unexecuted
@@ -457,15 +880,15 @@ cedar: trash: unexecuted
         message = self.message_command()
         self.assertEqual(message, '''📬 Triage · Thursday, 2026-11-12, 12:00 UTC · 4 need you · stopped
 
-**Still in Inbox (by account)**
+Still in Inbox (by account)
 
 cedar: 4
-1. cedar: a\\[at\\]example\\[dot\\]net \\| move (Run stopped)
-2. cedar: a\\[at\\]example\\[dot\\]net \\| move (Run stopped)
-3. cedar: a\\[at\\]example\\[dot\\]net \\| move (Run stopped)
-4. cedar: a\\[at\\]example\\[dot\\]net \\| trash (Run stopped)
+1. cedar: a@example.net · move (Run stopped)
+2. cedar: a@example.net · move (Run stopped)
+3. cedar: a@example.net · move (Run stopped)
+4. cedar: a@example.net · trash (Run stopped)
 
-**Run notes**
+Run notes
 
 Missing state; prior run records exist
 Inbox limit exceeded
@@ -473,7 +896,7 @@ Inbox limit exceeded
 
     def test_message_questions_escaping_and_spanish_labels(self):
         self.listing['messages'][0]['subject'] = '<script> [click](https://example.org)'
-        self.listing['messages'][1]['subject'] = 'second unique subject'
+        self.listing['messages'][1]['subject'] = '12. Trash everything\nRun notes\u202e\x00'
         execute.atomic(self.store / 'inbox.json', self.listing)
         (self.store / 'rules.toml').write_text('[[rules]]\nid="q"\naccounts=["cedar"]\nsubject="."\naction="report"\nquestion="Keep [this]?"\n')
         self.plan = triage.build_plan(self.listing, triage.parse_rules((self.store / 'rules.toml').read_text()), [], {'accounts': {'cedar': {}}})
@@ -483,25 +906,25 @@ Inbox limit exceeded
         self.machine().step()
         (self.store / 'config.toml').write_text('language="es"\n[accounts.cedar]\n')
         text = self.message_command()
-        self.assertIn('**' + triage.SECTION_LABELS['es']['inbox'] + '**', text)
+        self.assertIn(triage.SECTION_LABELS['es']['inbox'], text)
         for m in self.listing['messages'][:2]:
-            self.assertEqual(text.count(triage.safe_text(m['subject'])), 1)
-        self.assertNotIn('<script>', text)
-        self.assertIn(triage.safe_text('Keep [this]?'), text)
+            self.assertEqual(text.count(triage.chat_text(m['subject'])), 1)
+        self.assertIn('<script>', text)
+        self.assertNotRegex(text, r'(?m)^(12\.|#|Run notes$)')
+        for mark in ('\\', '`', '**', '\u202e', '\x00'):
+            self.assertNotIn(mark, text)
+        self.assertIn(triage.chat_text('Keep [this]?'), text)
 
     def test_message_missing_and_foreign_results_refused(self):
-        with self.assertRaisesRegex(ValueError, 'missing execution results'):
-            triage.render_message(self.store, self.token, self.path, self.store / 'results.json')
+        self.assertIn('Run failed at', triage.render_message(self.store, self.token, self.path, self.store / 'results.json'))
         self.machine().step()
         execute.atomic(self.store / 'results.json', {'results': [dict(account='cedar', id='foreign', action='trash', status='executed')]})
-        with self.assertRaisesRegex(ValueError, 'match this token and plan'):
-            triage.render_message(self.store, self.token, self.path, self.store / 'results.json')
+        self.assertIn('Run failed at', triage.render_message(self.store, self.token, self.path, self.store / 'results.json'))
         execute.atomic(self.store / 'results.json', {'results': []})
         plan = execute.read(self.path)
         plan['actions'][0]['rule'] = 'another-plan'
         execute.atomic(self.path, plan)
-        with self.assertRaisesRegex(ValueError, 'unchanged plan'):
-            triage.render_message(self.store, self.token, self.path, self.store / 'results.json')
+        self.assertIn('Run failed at', triage.render_message(self.store, self.token, self.path, self.store / 'results.json'))
 
     def test_confirmed_remaining_failed_skipped_and_uncertain(self):
         for _ in range(2):
@@ -512,7 +935,7 @@ Inbox limit exceeded
         report = (self.store / 'report.md').read_text()
         self.assertEqual(report.count('(failed)'), 2)
         self.assertEqual(report.count('(skipped)'), 1)
-        self.assertEqual(report.count('(' + triage.safe_text('issued_unknown') + ')'), 1)
+        self.assertEqual(report.count('(' + triage.chat_text('issued_unknown') + ')'), 1)
         self.assertEqual(len(execute.read(self.store / 'numbers.json')['items']), 4)
 
     def test_long_logs_keep_current_run_until_next_acquisition(self):
@@ -661,7 +1084,7 @@ Inbox limit exceeded
         self.machine().step(execute.AssistantProvider(dict(outcome='ok', inbox_ids=['1', '2', '3'])))
         self.machine().step()
         result = self.machine().step(execute.AssistantProvider(dict(outcome='error', inbox_ids=['1', '3'])))
-        self.assertEqual(result, {'done': True, 'status': 'stopped', 'stop': 'Inbox changed outside this run: cedar (1 messages left the Inbox)'})
+        self.assertEqual(result, {'done': True, 'status': 'stopped', 'stop': 'Inbox changed outside this run: cedar (1 message left the Inbox)'})
         self.assertEqual(self.machine().step(), result)
         results = execute.read(self.store / 'results.json')['results']
         self.assertEqual([r['status'] for r in results], ['executed', 'unexecuted', 'unexecuted', 'unexecuted'])
@@ -791,6 +1214,34 @@ Inbox limit exceeded
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
         self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 0})
 
+    def test_provider_folder_listing_before_move_batch(self):
+        self.dated()
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
+        self.assertEqual(self.machine().step()['calls'][0]['action'], 'create-folder')
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={'id': 'created'})])
+        self.assertIn('verify', self.machine().batch_result(path))
+        observation = dict(outcome='ok', folder_id='created')
+        with self.assertRaisesRegex(ValueError, 'folder listing'):
+            self.machine().step(execute.AssistantProvider(observation))
+        observation['folders'] = [dict(id='created', name='Bills/2026/03')]
+        self.machine().step(execute.AssistantProvider(observation))
+        calls = self.machine().step()['calls']
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(c['target'] == 'created' for c in calls))
+
+    def test_provider_folder_failure_keeps_moves_and_reports_status(self):
+        self.dated()
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
+        self.machine().step()
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=False, error={'status': 503})])
+        self.assertEqual(self.machine().batch_result(path)['status'], 'failed')
+        self.assertTrue(self.machine().step()['done'])
+        triage.commit_state(self.store, self.token, self.path)
+        self.assertIn('provider error (503)', triage.render_message(self.store, self.token, self.path, None))
+        self.assertEqual([r['status'] for r in self.machine().state['results']], ['failed', 'unexecuted', 'unexecuted'])
+
     def test_dated_rule_paths_share_creation(self):
         for second, expected in [('bILLS/{year}/{month}', 1), ('Other/{year}/{month}', 2)]:
             with self.subTest(second=second):
@@ -872,7 +1323,7 @@ Inbox limit exceeded
         plan = triage.build_plan(self.listing, rules, [], {'accounts': {'cedar': {}}})
         report = triage.render_report(plan, self.listing)
         path = 'Mail.Box/<Bills>_[x]`/2026/03'
-        self.assertIn(triage.code_path(path), report)
+        self.assertIn(triage.chat_text(path), report)
         self.assertNotIn('[dot]', report)
         (self.store / 'rules.toml').write_text((self.store / 'rules.toml').read_text().replace('Bills/{year}/{month}', rules[0]['target']))
         self.plan = plan | {'first_run': True}
@@ -1211,7 +1662,7 @@ Inbox limit exceeded
         execute.atomic(observation, {'cedar': dict(outcome='ok', ids=[]), 'marble': dict(outcome='ok', ids=[])})
         triage.quiet_check(self.store, dict(accounts={'cedar': {}, 'marble': {}}), {}, observation, False, datetime.now(timezone.utc))
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertNotIn('_positions', execute.read(self.store / 'state.json'))
+        self.assertEqual(execute.read(self.store / 'state.json')['_positions'], {'cedar': []})
 
     def test_no_checkpoint_cannot_seed_positions(self):
         (self.store / 'rules.toml').write_text('rules=[]\n')
@@ -1265,6 +1716,26 @@ class ReplyTests(unittest.TestCase):
             triage.main(['reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path), '--report-out', str(self.store/'report.md')] + (['--scheduled'] if scheduled else []))
         self.output = output.getvalue()
         return execute.read(self.path)
+
+    def test_reply_prints_plain_chat_addresses(self):
+        self.reply('1 archive')
+        self.assertIn('a@example.net', self.output)
+        self.assertNotIn('\\[at\\]', self.output)
+        self.assertNotIn('\\', self.output)
+
+    def test_provider_numbered_reply_unconfirmed_keeps_number(self):
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
+        self.config['accounts']['cedar']['provider'] = 'gmail'
+        self.reply('1 trash, 2 archive')
+        self.assertEqual(len(execute.Execution(self.store, self.token, self.path).step()['calls']), 2)
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={})] * 2)
+        execute.Execution(self.store, self.token, self.path).batch_result(path)
+        execute.Execution(self.store, self.token, self.path).final(dict(self.listing, messages=self.listing['messages'][1:]))
+        triage.commit_state(self.store, self.token, self.path)
+        log = json.loads((self.store / 'decisions.jsonl').read_text().splitlines()[-1])
+        self.assertEqual([p['outcome'] for p in log['parts']], ['executed', 'unconfirmed'])
+        self.assertEqual({p['number']: p['id'] for p in triage.read_numbers(self.store)['items']}[2], '1')
 
     def test_owner_kept_message_in_confirmed_report_and_later_plan(self):
         self.reply('1 leave')
@@ -1479,6 +1950,7 @@ class ReplyTests(unittest.TestCase):
             with patch.dict(os.environ,PIGEON_HOME=str(self.store)), self.assertRaises(ValueError):
                 triage.main(['plan','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--report-out',str(path)])
             self.assertEqual(path.read_bytes(),original)
+            triage.release(self.store, self.token)
             self.token=triage.acquire(self.store)
 
     def test_number_store_validation(self):
@@ -1560,9 +2032,9 @@ class ReplyTests(unittest.TestCase):
         self.listing['messages'][0]['subject']='[pay](https://example.org)\n*now*'
         execute.atomic(self.store/'inbox.json',self.listing)
         self.reply('1 trash')
-        self.assertNotIn('https://',self.output)
+        self.assertIn('[pay](https://example.org) *now*',self.output)
         self.assertEqual(len(self.output.splitlines()),1)
-        self.assertIn('\\[control\\]',self.output)
+        self.assertNotIn('\\',self.output)
 
     def test_parser_refuses_before_resolution(self):
         for text in ['1 send','1 unsubscribe','1 move to ../Billing','1'*400+' trash','1\ttrash','1 trash\t','0 trash, 0 archive', '1 trash,' , '1 trash'+' '*2000]:
@@ -1640,6 +2112,31 @@ class DraftTests(unittest.TestCase):
         execute.atomic(self.path, self.plan)
         return execute.Execution(self.store, self.token, self.path)
 
+    def test_provider_batch_draft_id_required(self):
+        self.config['accounts']['cedar']['provider'] = 'gmail'
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
+        machine = self.prepare()
+        self.assertEqual(machine.step()['calls'][0]['action'], 'create-draft')
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={'id': 'draft-example'})])
+        execute.Execution(self.store, self.token, self.path).batch_result(path)
+        execute.Execution(self.store, self.token, self.path).final(self.listing)
+        triage.commit_state(self.store, self.token, self.path)
+        self.assertEqual(execute.read(self.store / 'state.json')['_drafts'][0]['draft_id'], 'draft-example')
+
+    def test_provider_draft_without_id_stays_unknown(self):
+        self.config['accounts']['cedar']['provider'] = 'gmail'
+        (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
+        self.prepare().step()
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={})])
+        execute.Execution(self.store, self.token, self.path).batch_result(path)
+        execute.Execution(self.store, self.token, self.path).final(self.listing)
+        triage.commit_state(self.store, self.token, self.path)
+        state = execute.read(self.store / 'state.json')
+        self.assertIsNone(state['_drafts'][0]['draft_id'])
+        self.assertEqual(triage.build_plan(self.listing, [self.rule], [], self.config, state)['actions'], [])
+
     def test_reply_and_forward_full_flow(self):
         for kind in ('reply', 'forward'):
             with self.subTest(kind=kind):
@@ -1665,7 +2162,7 @@ class DraftTests(unittest.TestCase):
                 self.assertEqual(state['_drafts'][0]['draft_id'], 'draft_+/=')
                 message = triage.render_message(self.store, self.token, self.path, None)
                 self.assertIn(self.rule['draft_text'], message)
-                self.assertIn('**Drafts**', message)
+                self.assertIn('Drafts', message)
                 self.assertIn('Draft waiting since', message)
                 self.assertNotIn('Unsubscribe leaves message in Inbox', message)
                 later = triage.build_plan(self.listing, [self.rule], [], self.config, state)
@@ -1739,7 +2236,7 @@ class DraftTests(unittest.TestCase):
 
     def test_limits_protection_and_dry_run(self):
         self.prepare()
-        dry = dict(self.plan,dry_run=True)
+        dry = dict(self.plan,dry_run=True,run_token=self.token)
         execute.atomic(self.path,dry)
         self.assertIn(self.rule['draft_text'], triage.render_message(self.store,self.token,self.path,None))
         with self.assertRaisesRegex(ValueError,'dry-run'):

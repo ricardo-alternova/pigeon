@@ -65,7 +65,7 @@ class LockTests(unittest.TestCase):
                 triage.acquire(store)
             triage.release(store, token)
 
-    def test_si12_release_after_error(self):
+    def test_plan_failure_keeps_lock_for_message(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
             shutil.copyfile(ROOT / "config/config.example.toml", store / "config.toml")
@@ -73,7 +73,10 @@ class LockTests(unittest.TestCase):
             env = dict(os.environ, PIGEON_HOME=tmp)
             result = subprocess.run([shutil.which('python3'), 'scripts/triage.py', 'plan', '--token', token, '--inbox', 'tests/fixtures/inbox.json'], cwd=ROOT, env=env, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
-            self.assertFalse((store / 'run.lock').exists())
+            self.assertTrue((store / 'run.lock').exists())
+            message = subprocess.run([shutil.which('python3'), 'scripts/triage.py', 'message', '--token', token, '--plan', str(store/'absent.json')], cwd=ROOT, env=env, capture_output=True, text=True)
+            self.assertEqual(message.returncode, 0)
+            self.assertIn('Run failed at plan:', message.stdout)
 
     def prepare(self, store):
         shutil.copyfile(ROOT / 'tests/fixtures/inbox.json', store / 'inbox.json')
@@ -268,7 +271,8 @@ class LockTests(unittest.TestCase):
                 result = self.run_plan(store, token)
                 self.assertNotEqual(result.returncode, 0, text)
                 self.assertEqual(result.stdout, b'')
-                self.assertFalse((store / 'run.lock').exists())
+                self.assertTrue((store / 'run.lock').exists())
+                triage.release(store, token)
 
     def test_check_cli_and_repeated_release(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -374,7 +378,7 @@ class LockTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(plan.exists())
                 self.assertEqual(result.stdout, b'')
-                self.assertFalse((store / 'run.lock').exists())
+                self.assertTrue((store / 'run.lock').exists())
 
     def test_stdout_encoding(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -431,7 +435,7 @@ class LockTests(unittest.TestCase):
                                  '--plan-out', str(store / 'plan.json')])
             self.assertTrue((store / 'state.json').is_file())
             self.assertIsInstance(json.loads((store / 'state.json').read_text()), dict)
-            self.assertFalse((store / 'run.lock').exists())
+            self.assertTrue((store / 'run.lock').exists())
 
     def test_output_paths_cannot_name_inputs_state_or_lock(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -449,7 +453,8 @@ class LockTests(unittest.TestCase):
                         self.assertIn(b'expected a path other than an input', result.stderr)
                         if name != 'run.lock' or used == 'wrong':
                             self.assertEqual((store / name).read_bytes(), before, (name, flag, used))
-                    self.assertFalse((store / 'run.lock').exists())
+                    self.assertTrue((store / 'run.lock').exists())
+                    triage.release(store, token)
 
     def test_state_records_only_configured_accounts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -967,6 +972,8 @@ class QuietTests(unittest.TestCase):
                 result = LockTests().run_plan(self.store, token, '--report-out', str(target))
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(target.read_bytes(), b'preserve')
+
+                triage.release(self.store, token)
 
     def test_missing_history_position_full(self):
         del self.previous['_positions']['cedar']
@@ -1539,6 +1546,8 @@ class DriveLockTests(unittest.TestCase):
             result = LockTests().run_plan(self.store, token, '--report-out', str(target))
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(target.read_text(), 'preserve')
+
+            triage.release(self.store, token)
 
     def test_invalid_recorded_backend_and_loss_flag(self):
         self.acquire()

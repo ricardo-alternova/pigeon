@@ -71,10 +71,27 @@ class MockGateway:
 
     def answer(self, call):
         from datetime import datetime
+        if 'action' in call:
+            a = call['account']
+            fields = self.config['accounts'][a]
+            assert call['input']['accountId'] == fields['executor_account']
+            inner = call['input']['input']
+            assert call['path'].startswith('tools')
+            if call['action'] == 'create-folder':
+                assert 'body' in inner
+                return {'id':'folder-example'}
+            if call['action'] == 'create-draft':
+                assert inner['draft_text'] == call['draft_text']
+                return {'id':'draft-example'}
+            assert call['action'] in {'trash', 'archive', 'move', 'spam'}
+            assert inner['path'].get('id', inner['path'].get('message-id')) == call['id']
+            self.listing['messages'][:] = [m for m in self.listing['messages']
+                                           if (m['account'], m['id']) != (call['account'], call['id'])]
+            return {}
         a = next(a for a,f in self.config['accounts'].items() if f['executor_account']==call['input']['accountId'])
         f = self.config['accounts'][a]
         inner = call['input']['input']; q = inner.get('query',{}); path = inner.get('path',{})
-        tool = call['path'].split(f['executor_app']+'.')[1]
+        tool = call['path'].split(f['executor_app']+'.')[-1] if call['path'].startswith('tools.') else call['path'].split('].', 1)[1]
         messages = [m for m in self.listing['messages'] if m['account']==a]
         folders = self.listing.get('folders',{}).get(a,[])
         if tool.endswith('meUserGetUser'):

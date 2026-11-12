@@ -67,9 +67,10 @@ while True:
             result=json.loads(run(cmd+' --results /absolute/private-store/gateway-results.json',token))
         assert result['done']; break
     if action.get('done'):break
-    listing['messages'][:]=[m for m in listing['messages'] if (m['account'],m['id'])!=(action['account'],action['id'])]
-    result=blocks[9].replace('{"outcome":"ok","inbox_ids":["id-2","id-3"]}','{"outcome":"ok","in_inbox":false}')
-    assert json.loads(run(result,token))['status']=='executed'
+    assert 'calls' in action
+    (store/'gateway-results.json').write_text(json.dumps(gateway.batch(action['calls'])))
+    assert json.loads(run(blocks[9],token))['status']=='reported'
+
 run(blocks[10],token)
 message=run(blocks[11],token)
 assert '2 handled' in message and 'Still in Inbox' in message
@@ -78,6 +79,37 @@ assert not (store/'run-message.md').exists()
 assert json.loads(run(blocks[12],token))['done']
 assert run(blocks[13],token)=='released'
 print('PASS: fresh-shell scripted routine from quickstart through final IDs, commit, message and release; two mixed-provider listing exchanges for 40 messages each')
+# Follow the quickstart again without actions to save current positions, then
+# prove a scheduled quiet run against the same mock gateway.
+with (store/'config.toml').open('a') as stream:
+    stream.write('\n[schedule]\nweekdays=["00:00"]\nweekends=["00:00"]\nalways_full=[]\n')
+token=run(blocks[0]); run(blocks[2],token); run(blocks[4],token)
+# Use the exact documented scheduled commands without run() removing the flag.
+def scheduled(command):
+    command=command.replace('/absolute/private-store',str(store)).replace('TOKEN',token)
+    result=subprocess.run(['bash','-eu','-c',command],env={'PATH':os.environ['PATH']},capture_output=True,text=True)
+    assert result.returncode==0,(command,result.stderr)
+    return result.stdout.strip()
+def check_quiet():
+    result=json.loads(scheduled(blocks[5]))
+    while 'calls' in result:
+        (store/'gateway-results.json').write_text(json.dumps(gateway.batch(result['calls'])))
+        result=json.loads(scheduled(blocks[6]))
+    return result
+assert check_quiet()['decision']=='full'
+result=json.loads(run(commands[0],token))
+while 'calls' in result:
+    (store/'gateway-results.json').write_text(json.dumps(gateway.batch(result['calls'])))
+    result=json.loads(run(commands[1],token))
+run(blocks[7],token)
+assert json.loads(run(blocks[8],token))['done']
+run(blocks[10],token); run(blocks[11],token)
+run(blocks[12],token); run(blocks[13],token)
+token=run(blocks[0]); run(blocks[2],token); run(blocks[4],token)
+assert check_quiet()['decision']=='skip'
+run(blocks[12],token); run(blocks[13],token)
+print('PASS: quickstart scheduled quiet run with mock gateway; no message or commit')
+
 PYSCRIPTED
 export PIGEON_HOME="$PWD/private/demo"
 python3 - <<'PY' > "$scratch/quick-start.sh"
@@ -99,6 +131,7 @@ for command in ('setup', 'validate'):
     subprocess.run(['env', '-i', 'PATH='+os.environ['PATH'], 'PIGEON_HOME='+str(store),
                     'python3', 'scripts/triage.py', command], check=True)
 blocks = re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)
+blocks[9] = blocks[9].replace('--results /absolute/private-store/gateway-results.json', "--observation '{\"outcome\":\"ok\",\"inbox_ids\":[\"id-2\",\"id-3\"]}'")
 def run(index, token='', observation=None):
     command = blocks[index].replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --batch', '').replace(' --scheduled', '')
     if observation is not None:
@@ -150,6 +183,7 @@ with (store/'config.toml').open('a') as out:
     out.write('\n[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n[state]\nkind="gdrive"\naccount="state-example"\nfolder="files-example"\n')
 text = Path('docs/quickstart.md').read_text()
 blocks = re.findall(r'```bash\n(.*?)\n```', text, re.S)
+blocks[9] = blocks[9].replace('--results /absolute/private-store/gateway-results.json', "--observation '{\"outcome\":\"ok\",\"inbox_ids\":[\"id-2\",\"id-3\"]}'")
 
 def run(command, token=''):
     command = command.replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --scheduled', '')
@@ -174,7 +208,7 @@ for dry in (True, False):
     if dry:
         rehearsal = plan['actions']
         message = run(blocks[11].split(' --results')[0], token)
-        assert message.startswith('Dry run') and 'would' in message
+        assert message.startswith('📬 Triage · ') and 'Dry run' in message and 'would' in message
         assert all(((store/n).read_bytes() if (store/n).exists() else None) == raw for n,raw in before.items())
         call = json.loads(run(blocks[13], token))['call']
         observed(blocks[13]+' --observation /absolute/private-store/lock-observation.json', drive.perform(call), token)
@@ -223,8 +257,9 @@ import subprocess
 
 store = Path(os.environ['PIGEON_HOME'])
 qblocks = [c.replace(' --batch', '') for c in re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)]
+qblocks[9] = qblocks[9].replace('--results /absolute/private-store/gateway-results.json', "--observation '{\"outcome\":\"ok\",\"inbox_ids\":[\"id-2\",\"id-3\"]}'")
 qblocks[6] = qblocks[6].replace('--results /absolute/private-store/gateway-results.json', '--observation /absolute/private-store/quiet-observation.json')
-reply = re.search(r'```bash\n([^\n]*triage.py reply [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
+reply = re.search(r'`(PIGEON_HOME=[^`]*triage.py reply [^`]*)`', Path('docs/quickstart.md').read_text()).group(1).strip()
 observed = re.search(r'```bash\n([^\n]*execute.py observed [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
 blocks = [qblocks[i] for i in (0,5,6,7,8,9)] + [observed, qblocks[10], qblocks[13], qblocks[0], reply, qblocks[8], qblocks[9], qblocks[10], qblocks[13]]
 assert len(blocks) == 15
@@ -472,8 +507,9 @@ base = Path(os.environ['WALK_STORE'])
 base.mkdir(parents=True, exist_ok=True)
 text = (root / 'docs/quickstart.md').read_text()
 qblocks = [c.replace(' --batch', '') for c in re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)]
+qblocks[9] = qblocks[9].replace('--results /absolute/private-store/gateway-results.json', "--observation '{\"outcome\":\"ok\",\"inbox_ids\":[\"id-2\",\"id-3\"]}'")
 qblocks[6] = qblocks[6].replace('--results /absolute/private-store/gateway-results.json', '--observation /absolute/private-store/quiet-observation.json')
-reply = re.search(r'```bash\n([^\n]*triage.py reply [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
+reply = re.search(r'`(PIGEON_HOME=[^`]*triage.py reply [^`]*)`', Path('docs/quickstart.md').read_text()).group(1).strip()
 observed = re.search(r'```bash\n([^\n]*execute.py observed [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
 blocks = [qblocks[i] for i in (0,5,6,7,8,9)] + [observed, qblocks[10], qblocks[13], qblocks[0], reply, qblocks[8], qblocks[9], qblocks[10], qblocks[13]]
 inline = [qblocks[1], qblocks[13] + ' --observation /absolute/private-store/lock-observation.json']
@@ -556,8 +592,9 @@ drive = base / 'drive'
 drive.mkdir()
 text = Path('docs/quickstart.md').read_text()
 qblocks = [c.replace(' --batch', '') for c in re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)]
+qblocks[9] = qblocks[9].replace('--results /absolute/private-store/gateway-results.json', "--observation '{\"outcome\":\"ok\",\"inbox_ids\":[\"id-2\",\"id-3\"]}'")
 qblocks[6] = qblocks[6].replace('--results /absolute/private-store/gateway-results.json', '--observation /absolute/private-store/quiet-observation.json')
-reply = re.search(r'```bash\n([^\n]*triage.py reply [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
+reply = re.search(r'`(PIGEON_HOME=[^`]*triage.py reply [^`]*)`', Path('docs/quickstart.md').read_text()).group(1).strip()
 observed = re.search(r'```bash\n([^\n]*execute.py observed [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
 blocks = [qblocks[i] for i in (0,5,6,7,8,9)] + [observed, qblocks[10], qblocks[13], qblocks[0], reply, qblocks[8], qblocks[9], qblocks[10], qblocks[13]]
 inline = [qblocks[1], qblocks[2], qblocks[3], qblocks[12], qblocks[12] + ' --lock-observation /absolute/private-store/state-lock-observation.json', qblocks[12] + ' --observation /absolute/private-store/upload-observation.json', qblocks[13] + ' --observation /absolute/private-store/lock-observation.json']
@@ -675,7 +712,7 @@ event = dict(id='event-a', start=start.isoformat(), end=(start+timedelta(hours=1
 token = run('triage.py','lock').strip()
 plan = str(store/'plan.json')
 run('triage.py','plan','--dry-run','--token',token,'--inbox',str(store/'inbox.json'),'--plan-out',plan,'--calendar',str(store/'calendar.json'))
-assert '**Calendar**' in run('triage.py','message','--token',token,'--plan',plan)
+assert 'Calendar' in run('triage.py','message','--token',token,'--plan',plan)
 assert not (store/'state.json').exists() and not (store/'numbers.json').exists()
 run('triage.py','plan','--token',token,'--inbox',str(store/'inbox.json'),'--plan-out',plan,'--calendar',str(store/'calendar.json'))
 assert 'oak stays' in '\n'.join(json.loads((store/'plan.json').read_text())['calendar_section'])
@@ -686,7 +723,7 @@ assert json.loads(run('execute.py','next','--token',token,'--plan',plan))['done'
 run('triage.py','commit-state','--token',token,'--plan',plan)
 assert json.loads((store/'state.json').read_text())['cedar']==1
 message = run('triage.py','message','--token',token,'--plan',plan)
-assert 'Owner prepared reply.' in message and '**Calendar**' in message and 'oak stays' in message
+assert 'Owner prepared reply.' in message and 'Calendar' in message and 'oak stays' in message
 assert not any('calendar' in key for key in json.loads((store/'state.json').read_text()))
 run('triage.py','release','--token',token)
 print('PASS: draft rule creates once, preserves Inbox, saves id and shows whole text')

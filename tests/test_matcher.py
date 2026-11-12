@@ -160,7 +160,7 @@ class MatcherTests(unittest.TestCase):
             self.assertEqual(bool(plan['reasons']), stopped)
             if stopped:
                 self.assertEqual(plan['reasons'], ['Rule exceeds twenty percent of account total: r0, cedar (11 matches, total 40, allowed 10)'])
-                self.assertIn(triage.safe_text(plan['reasons'][0]), triage.render_report(plan, self.listing))
+                self.assertIn(triage.chat_text(plan['reasons'][0]), triage.render_report(plan, self.listing))
 
     def test_twenty_percent_stable_pairs(self):
         self.batch(22, groups=2)
@@ -420,7 +420,7 @@ class BodyQuestionTests(unittest.TestCase):
         self.assertEqual(plan['expected_counts'], plan['counts'])
         self.assertEqual(plan['decisions'][0]['question'], self.rules[0]['question'])
         report = triage.render_report(plan, self.listing)
-        self.assertIn(triage.safe_text(self.rules[0]['question']), report)
+        self.assertIn(triage.chat_text(self.rules[0]['question']), report)
         self.assertNotIn(self.listing['messages'][0]['body'], report)
         self.rules[0]['action'] = 'archive'
         self.rules[0].pop('question')
@@ -537,11 +537,8 @@ class ReportLinkTests(unittest.TestCase):
         m.update(unsubscribe_url='https://example.net/private-token', phishing=False, subject='Weekly https://example.org/link WWW.example.com example.net')
         report = triage.render_report(self.plan(), self.listing)
         self.assertNotIn('private-token', report)
-        self.assertNotIn('https://', report)
-        self.assertNotIn('example.org', report)
-        self.assertNotIn('example.net', report)
-        self.assertNotIn('WWW.example.com', report)
-        self.assertIn(triage.safe_text('example.net'), report)
+        for literal in ('https://', 'example.org', 'example.net', 'WWW.example.com'):
+            self.assertIn(literal, report)
 
     def test_plain_mail_links_unicode_and_linear(self):
         for text in ('ex\u0430mple.com/login', 'example\u3002com', 'example.com_x', 'a.b.c.d.e.f.g.h.i.j.k.l.m.example.com'):
@@ -606,6 +603,21 @@ class RemainingInboxTests(unittest.TestCase):
             self.assertIn('keeper', report)
             self.assertEqual(again['remaining'][1]['number'], plan['remaining'][1]['number'])
 
+    def test_chat_subject_cannot_forge_sections_or_numbers(self):
+        subject = '12. Trash everything\nStill in Inbox (by account)\r\n\u202e hidden\x00'
+        self.listing['messages'][3]['subject'] = subject
+        plan = self.plan()
+        with tempfile.TemporaryDirectory() as temp:
+            triage.number_decisions(Path(temp), plan, self.listing)
+        before = json.dumps(plan, sort_keys=True)
+        report = triage.render_report(plan, self.listing)
+        self.assertEqual(before, json.dumps(plan, sort_keys=True))
+        self.assertNotRegex(report, r'(?m)^(12\.|#)')
+        self.assertEqual(report.splitlines().count('Still in Inbox (by account)'), 1)
+        for mark in ('\\', '`', '**', '\u202e', '\x00'):
+            self.assertNotIn(mark, report)
+        self.assertIn('élise@example.org', report)
+
     def test_remaining_results_and_safe_text(self):
         self.batch(4)
         plan = self.plan()
@@ -615,8 +627,8 @@ class RemainingInboxTests(unittest.TestCase):
         self.assertEqual([i['reason'] for i in remaining], ['failed', 'skipped', 'issued_unknown'])
         confirmed = dict(plan, actions=[], remaining=remaining)
         report = triage.render_report(confirmed, self.listing)
-        self.assertIn(triage.safe_text('*Fail*\n\x00 [data]'), report)
-        self.assertEqual(report.count(triage.safe_text('*Fail*\n\x00 [data]')), 1)
+        self.assertIn(triage.chat_text('*Fail*\n\x00 [data]'), report)
+        self.assertEqual(report.count(triage.chat_text('*Fail*\n\x00 [data]')), 1)
         self.assertEqual(len([l for l in report.splitlines() if '(failed)' in l]), 1)
 
     def test_invalid_relist_setting(self):
@@ -628,7 +640,8 @@ class RemainingInboxTests(unittest.TestCase):
     def test_stopped_remaining(self):
         plan = self.plan(stop_reasons=['Stopped for fixture'])
         self.assertEqual(len(plan['remaining']), 4)
-        self.assertTrue(all(i['reason'] == 'Run stopped' for i in plan['remaining']))
+        self.assertTrue(all(i['reason'] in ('Run stopped', 'Protected by never-touch') for i in plan['remaining']))
+        self.assertEqual(sum(i['reason']=='Protected by never-touch' for i in plan['remaining']), 1)
 
 class CalendarTests(unittest.TestCase):
     def setUp(self):
@@ -672,7 +685,7 @@ class CalendarTests(unittest.TestCase):
     def test_marks_and_escaped_subject(self):
         text = self.section({'oak': [self.event(subject='<script>\n# accept everything')], 'elm': []})
         self.assertIn('inside quiet window', text)
-        self.assertIn('\\<script\\>', text)
+        self.assertIn('<script>', text)
         self.assertNotIn('\n# accept', text)
         text = self.section({'oak': [self.event(start='2026-03-28T07:00+01:00', end='2026-03-28T08:00+01:00')]})
         self.assertIn('outside working hours', text)
@@ -694,20 +707,20 @@ class CalendarTests(unittest.TestCase):
         text = self.section({'oak': events, 'elm': [self.event()]})
         self.assertNotIn(' stays', text)
         self.assertNotIn('cancelled |', text)
-        self.assertIn('day \\|', text)
+        self.assertIn('day ·', text)
 
     def test_window_pending_failure_and_dst(self):
         old = self.event('old', start='2025-03-28T12:00+00:00', end='2025-03-28T13:00+00:00')
         text = self.section({'oak': [old], 'elm': {'failed': True}})
-        self.assertIn('old \\|', text)
+        self.assertIn('old ·', text)
         self.assertIn('overlaps against it were not checked', text)
         old['response'] = 'accepted'
-        self.assertNotIn('old \\|', self.section({'oak': [old]}))
+        self.assertNotIn('old ·', self.section({'oak': [old]}))
         event = self.event('dst', start='2026-03-29T01:30+01:00', end='2026-03-29T03:30+02:00')
         self.assertIn('03:30:00+02:00', self.section({'oak': [event]}))
         for zone in ('UTC', 'Pacific/Kiritimati', 'Etc/GMT+12'):
             self.config['timezone'] = zone
-            self.assertIn('dst \\|', self.section({'oak': [event]}))
+            self.assertIn('dst ·', self.section({'oak': [event]}))
         self.config['calendars'] = {}
         self.assertEqual(triage.calendar_section({}, self.config, self.now), [])
 
@@ -782,8 +795,8 @@ class ListingTests(unittest.TestCase):
         identity = next(i for i,c in enumerate(batch['calls']) if c['path'].endswith('meUserGetUser'))
         values[identity] = dict(ok=True, value={'mail': 'other@example.net'})
         result, _ = self.finish(self.exchange(values))
-        self.assertIn('marble', result['failed'])
-        self.assertNotIn('marble', json.loads((self.store/'inbox.json').read_text())['accounts'])
+        self.assertNotIn('marble', result['failed'])
+        self.assertIn('marble', json.loads((self.store/'inbox.json').read_text())['accounts'])
 
     def test_ordinary_missing_subject_sender_and_departed_gmail(self):
         batch = self.exchange()
@@ -828,6 +841,23 @@ class ListingTests(unittest.TestCase):
         self.listing['messages']=[]
         self.assertEqual(self.finish()[0]['counts'],{'cedar':0,'marble':0})
 
+    def test_gateway_results_format_refused_without_consumption(self):
+        batch = self.exchange()
+        good = self.gateway.batch(batch['calls'])
+        for bad in ({}, [], good[:-1], [dict(v, ok=1) for v in good],
+                    [dict(value={}) for v in good], [None for v in good]):
+            path = self.store / 'gateway.json'
+            path.write_text(json.dumps(bad))
+            with self.assertRaisesRegex(ValueError, 'JSON array.*boolean ok'):
+                triage.listing_exchange(self.store, self.token, path)
+            self.assertEqual(self.exchange(), batch)
+        self.assertEqual(triage.gateway_results(self._results_file(good), len(good)), good)
+
+    def _results_file(self, values):
+        path = self.store / 'gateway.json'
+        path.write_text(json.dumps(values))
+        return path
+
     def test_bad_length_and_message_order_refuse_without_consumption(self):
         batch = self.exchange()
         with self.assertRaisesRegex(ValueError,'one result'): self.exchange([])
@@ -850,8 +880,8 @@ class ListingTests(unittest.TestCase):
                 if fault=='id': values[1]['value']['messages'][0]['id']='bad!'
                 if fault=='repeat': values[1]['value']['nextPageToken']='first'
                 result,_=self.finish(self.exchange(values))
-                self.assertIn('cedar',result['failed'])
-                self.assertEqual(set(json.loads((self.store/'inbox.json').read_text())['accounts']),{'marble'})
+                self.assertNotIn('cedar',result['failed'])
+                self.assertEqual(set(json.loads((self.store/'inbox.json').read_text())['accounts']),{'cedar','marble'})
 
     def test_lock_and_body_and_manual_refusal(self):
         old=self.token; self.token='wrong'
@@ -862,6 +892,67 @@ class ListingTests(unittest.TestCase):
         (self.store/'rules.toml').write_text('rules=[]\n')
         p=self.store/'config.toml'; p.write_text(p.read_text().replace('provider="gmail"',''))
         with self.assertRaisesRegex(ValueError,'mixed'): self.exchange()
+
+    def test_final_arrival_read_retries_after_transient_failure(self):
+        (self.store/'inbox.json').write_text(json.dumps(self.listing))
+        self.gateway.listing['messages'].append(dict(self.listing['messages'][0], id='item-new'))
+        result = self.exchange(ids_only=True)
+        failed = False
+        for _ in range(20):
+            if result.get('done'): break
+            values = self.gateway.batch(result['calls'])
+            for c, v in zip(result['calls'], values):
+                if c['path'].endswith('messages.get') and not failed:
+                    v.clear(); v.update(ok=False, error={'status':503}); failed = True
+            result = self.exchange(values, ids_only=True)
+        self.assertTrue(failed)
+        self.assertTrue(result.get('done'))
+        self.assertFalse(result['failed'])
+        final = json.loads((self.store/'final-inbox.json').read_text())
+        self.assertIn('item-new', [m['id'] for m in final['messages']])
+
+    def test_quiet_account_is_neutral_and_not_skipped(self):
+        import execute
+        execute.atomic(self.store/'quiet-check.json', dict(token=self.token, decision={'quiet_accounts':['cedar']}))
+        result, _ = self.finish()
+        self.assertNotIn('cedar', result['failed'])
+        listing = execute.read(self.store/'inbox.json')
+        plan = triage.build_plan(listing, [], [], self.config)
+        self.assertNotIn('cedar', plan['not_listed'])
+        report = triage.render_report(plan, listing)
+        self.assertIn('cedar: no new mail', report)
+        self.assertNotIn('pigeon error', report)
+
+    def test_embedded_provider_error_is_not_empty_listing_final_or_quiet(self):
+        import execute
+        for final in (False, True):
+            with self.subTest(final=final):
+                self.setUp()
+                if final: execute.atomic(self.store/'inbox.json', self.listing)
+                result = self.exchange(ids_only=final)
+                for _ in range(20):
+                    if result.get('done'): break
+                    values = self.gateway.batch(result['calls'])
+                    for call, value in zip(result['calls'], values):
+                        if call['input']['accountId']=='cedar-example':
+                            value.update(ok=True, value={'error':{'code':403,'message':'PRIVATE_PROVIDER_TEXT'}})
+                    result = self.exchange(values, ids_only=final)
+                self.assertTrue(result.get('done'))
+                self.assertEqual(result['failed'], {'cedar':'provider error (403)'})
+                listing = execute.read(self.store/('final-inbox.json' if final else 'inbox.json'))
+                self.assertNotIn('cedar', listing['accounts'])
+                self.assertEqual(len(listing['messages']), 120)
+        self.setUp()
+        previous = {'_positions':{'cedar':'100','marble':[]}}
+        first = triage.quiet_gateway(self.store,self.token,self.config,previous)
+        values = self.gateway.batch(first['calls'])
+        for call, value in zip(first['calls'], values):
+            if call['input']['accountId']=='cedar-example':
+                value.update(ok=True,value={'error':{'code':404}})
+        path=self.store/'quiet-results.json'; execute.atomic(path,values)
+        observed=execute.read(triage.quiet_gateway(self.store,self.token,self.config,previous,path))
+        self.assertEqual(observed['cedar']['outcome'], 'error')
+        self.assertEqual(observed['cedar']['reason'], 'provider error (404)')
 
     def test_ids_only_and_quiet_gateway(self):
         (self.store/'inbox.json').write_text(json.dumps(self.listing))
@@ -906,7 +997,7 @@ class ListingTests(unittest.TestCase):
         values=self.gateway.batch(batch['calls'])
         values[0]['value'].pop('id')
         result,_=self.finish(self.exchange(values))
-        self.assertEqual(result['failed'],{'cedar':'message'})
+        self.assertEqual(result['failed'],{})
 
     def test_metadata_wrong_date_type_isolates_account(self):
         batch=self.exchange()
@@ -915,7 +1006,7 @@ class ListingTests(unittest.TestCase):
         values=self.gateway.batch(batch['calls'])
         values[0]['value']['internalDate']=True
         result,_=self.finish(self.exchange(values))
-        self.assertEqual(result['failed'],{'cedar':'message'})
+        self.assertEqual(result['failed'],{})
 
 
     def test_final_arrivals_both_providers(self):
@@ -999,3 +1090,165 @@ class RuleCaseTests(unittest.TestCase):
             self.assertIn('cases: 1, failed: 1',result.stdout)
             self.assertNotIn('SECRET SAMPLE',result.stdout+result.stderr)
             self.assertEqual(before,{p.name:p.read_bytes() for p in store.iterdir()})
+
+class GatewayRobustnessTests(unittest.TestCase):
+    setUp = ListingTests.setUp
+    exchange = ListingTests.exchange
+    finish = ListingTests.finish
+    def test_omitted_arrays_empty_and_wrong_types_fail(self):
+        self.listing['messages'] = []
+        original = self.gateway.batch
+        def empty(calls):
+            values = original(calls)
+            for c,v in zip(calls,values):
+                for key in ('messages','labels','value','history'):
+                    if v['value'].get(key) == []: del v['value'][key]
+            return values
+        self.gateway.batch = empty
+        result,_ = self.finish()
+        self.assertEqual(result['counts'], {'cedar':0,'marble':0})
+        self.assertEqual(result['failed'], {})
+
+    def test_path_builder_and_slug_validation(self):
+        for app,expected in [('cedar-mail','tools["cedar-mail"].'), ('cedar_mail','tools.cedar_mail.')]:
+            fields = self.config['accounts']['cedar'] | {'executor_app':app}
+            self.assertTrue(triage.mail_call(fields,'ids')['path'].startswith(expected))
+            config = {'accounts':{'cedar':fields}}
+            for spelling in ['tools.'+app+'.gmail.users.messages.list', 'tools["'+app+'"].gmail.users.messages.list']:
+                self.assertEqual(triage.checked_tool(config,'cedar','ids',spelling),expected+'gmail.users.messages.list')
+        for app in ['cedar"mail','cedar[mail','cedar]mail']:
+            with self.assertRaisesRegex(ValueError,'executor_app'):
+                triage.validate_inputs({'accounts':{},'messages':[]}, {'accounts':{'cedar':{'executor_app':app}}}, {})
+
+    def test_folder_recipe_strings(self):
+        recipe = (ROOT/'docs/setup.md').read_text()
+        self.assertIn('includeHiddenFolders: "true"', recipe)
+        for ident in (None,'folder-a'):
+            call = triage.mail_call(self.config['accounts']['marble'],'folders',id=ident)
+            self.assertEqual(call['input']['input']['query']['includeHiddenFolders'],'true')
+
+    def test_twice_failed_account_has_safe_reason(self):
+        original = self.gateway.batch
+        issued = []
+        def failing(calls):
+            values = original(calls)
+            for i,c in enumerate(calls):
+                if c['input']['accountId'] == 'cedar-example':
+                    issued.append(c['path'])
+                    values[i] = {'ok':False,'error':{'error':{'status':503,'message':'PRIVATE_PROVIDER_TEXT'}}}
+            return values
+        self.gateway.batch = failing
+        result,_ = self.finish()
+        self.assertEqual(result['failed'], {'cedar':'provider error (503)'})
+        self.assertEqual(sum(p.endswith('getProfile') for p in issued),2)
+        listing=json.loads((self.store/'inbox.json').read_text())
+        plan=triage.build_plan(listing,[],[],self.config,{})
+        self.assertFalse(any(a['account']=='cedar' for a in plan['actions']))
+        self.assertIn('provider error (503)',triage.render_report(plan,listing))
+        for p in self.store.iterdir():
+            if p.name != 'gateway.json' and p.is_file(): self.assertNotIn('PRIVATE_PROVIDER_TEXT',p.read_text())
+        self.assertEqual(triage.provider_error({'error':{'message':'PRIVATE_PROVIDER_TEXT'}}),'provider error (no status)')
+
+    def test_parser_exception_and_manual_skip(self):
+        from unittest.mock import patch
+        original = triage.consume_listing
+        def broken(state,job,*args):
+            if job['account']=='cedar': raise RuntimeError('PRIVATE_PROVIDER_TEXT')
+            return original(state,job,*args)
+        with patch.object(triage,'consume_listing',broken):
+            result,_=self.finish()
+        self.assertEqual(result['failed'],{'cedar':'pigeon error (listing answer)'})
+        (self.store/'listing-exchange.json').unlink()
+        first=self.exchange(skip=['cedar'])
+        self.assertTrue(all(c['input']['accountId']!='cedar-example' for c in first['calls']))
+        result,_=self.finish(first)
+        self.assertEqual(result['failed'],{'cedar':'pigeon error (manual skip)'})
+        with self.assertRaisesRegex(ValueError,'unknown'): self.exchange(skip=['unknown'])
+
+    def test_three_accounts_commit_then_only_failed_account_lists(self):
+        import execute
+        from datetime import datetime, timezone
+        self.config['accounts']['oak'] = self.config['accounts']['cedar'] | {'executor_app':'oak-mail','executor_account':'oak-example'}
+        self.config['schedule'] = dict(weekdays=['00:00'],weekends=['00:00'],always_full=[])
+        self.config['inbox_limit'] = 1000
+        path=self.store/'config.toml'
+        path.write_text('inbox_limit=1000\n[schedule]\nweekdays=["00:00"]\nweekends=["00:00"]\nalways_full=[]\n'+ '\n'.join('[accounts.'+a+']\n'+'\n'.join(k+'='+json.dumps(v) for k,v in f.items()) for a,f in self.config['accounts'].items()))
+        self.listing['accounts']['oak']=0
+        obs=self.store/'positions-observation.json'
+        observed={'cedar':dict(outcome='ok',position='120',arrivals=[]),'marble':dict(outcome='ok',ids=[]),'oak':dict(outcome='ok',position='120',arrivals=[])}
+        execute.atomic(obs,observed)
+        previous={'cedar':7}
+        execute.atomic(self.store/'state.json',previous)
+        triage.quiet_check(self.store,self.config,previous,obs,False,datetime.now(timezone.utc))
+        original=self.gateway.batch
+        def fail(calls):
+            return [dict(ok=False,error={'status':503,'message':'PRIVATE_PROVIDER_TEXT'}) if c['input']['accountId']=='cedar-example' else v for c,v in zip(calls,original(calls))]
+        self.gateway.batch=fail
+        self.finish()
+        listing=execute.read(self.store/'inbox.json')
+        plan=triage.build_plan(listing,[],[],self.config,previous)
+        plan_path=self.store/'plan.json'
+        triage.number_decisions(self.store,plan,listing)
+        execute.atomic(plan_path,plan)
+        self.assertEqual(execute.Execution(self.store,self.token,plan_path).step(),{'done':True})
+        triage.commit_state(self.store,self.token,plan_path)
+        state=execute.read(self.store/'state.json')
+        self.assertEqual(state['_positions'],{'marble':[],'oak':'120'})
+        self.assertEqual(state['cedar'],7)
+        self.assertIn('provider error (503)',triage.render_message(self.store,self.token,plan_path,None))
+        if (self.store/'run-message.md').exists(): (self.store/'run-message.md').unlink()
+        triage.release(self.store,self.token);self.token=triage.acquire(self.store)
+        decision=triage.quiet_check(self.store,self.config,state,obs,True,datetime.now(timezone.utc))
+        self.assertEqual(set(decision['quiet_accounts']),{'marble','oak'})
+        batch=self.exchange()
+        self.assertTrue(all(c['input']['accountId']=='cedar-example' for c in batch['calls']))
+        self.finish(batch)
+        plan=triage.build_plan(execute.read(self.store/'inbox.json'),[],[],self.config,state)
+        self.assertEqual(plan['actions'],[])
+
+    def test_omitted_quiet_arrays_and_nonobject_lists(self):
+        previous={'_positions':{'cedar':'100','marble':[]}}
+        first=triage.quiet_gateway(self.store,self.token,self.config,previous)
+        values=self.gateway.batch(first['calls'])
+        for c,v in zip(first['calls'],values):
+            if c['path'].endswith('history.list'): v['value']={}
+            if c['path'].endswith('ListMessages'): v['value']={}
+        path=self.store/'quiet-results.json';path.write_text(json.dumps(values))
+        observation=triage.quiet_gateway(self.store,self.token,self.config,previous,path)
+        self.assertIsNotNone(triage.read_observation(observation,self.config,previous['_positions']))
+        for bad in ([], {'messages':None}):
+            if (self.store/'listing-exchange.json').exists(): (self.store/'listing-exchange.json').unlink()
+            original=self.gateway.batch
+            def broken(calls):
+                values=original(calls)
+                for c,v in zip(calls,values):
+                    if c['input']['accountId']=='cedar-example' and c['path'].endswith('messages.list'): v['value']=bad
+                return values
+            self.gateway.batch=broken
+            result,_=self.finish()
+            self.assertEqual(result['failed'],{'cedar':'pigeon error (listing answer)'})
+            self.gateway.batch=original
+
+    def test_every_account_failed_commits_and_message_without_plan(self):
+        import execute
+        execute.atomic(self.store/'numbers.json',{'next':8,'items':[dict(number=7,account='cedar',id='item-0')]})
+        previous={'cedar':9,'marble':4,'_positions':{'cedar':'100','marble':['old']}}
+        execute.atomic(self.store/'state.json',previous)
+        self.gateway.batch=lambda calls:[dict(ok=False,error={}) for c in calls]
+        result,_=self.finish()
+        self.assertEqual(set(result['failed']),set(self.config['accounts']))
+        listing=execute.read(self.store/'inbox.json')
+        plan=triage.build_plan(listing,[],[],self.config,previous)
+        triage.number_decisions(self.store,plan,listing)
+        path=self.store/'plan.json';execute.atomic(path,plan)
+        self.assertEqual(execute.Execution(self.store,self.token,path).step(),{'done':True})
+        triage.commit_state(self.store,self.token,path)
+        message=triage.render_message(self.store,self.token,path,None)
+        self.assertIn('cedar: not listed this run; provider error (no status)',message)
+        self.assertIn('marble: not listed this run; provider error (no status)',message)
+        self.assertEqual(execute.read(self.store/'state.json')['_positions'],previous['_positions'])
+        self.assertEqual(execute.read(self.store/'numbers.json')['items'][0]['number'],7)
+        with self.assertRaisesRegex(ValueError,'fresh Inbox'):
+            triage.reply_plan(self.store,listing,[],self.config,previous,[dict(number=7,verb='trash',target=None)])
+        self.assertIn('Run failed at plan',triage.render_message(self.store,self.token,self.store/'absent.json',None))
+        self.assertIn('Run failed at message',triage.render_message(self.store,self.token,self.store/'gateway.json',None))

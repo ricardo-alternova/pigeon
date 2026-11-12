@@ -485,7 +485,7 @@ def validate_state_file(name, raw, config, folder):
                             or type(part['number']) is not int or part['number'] < 1
                             or part['account'] not in config['accounts'] or not isinstance(part['id'], str)
                             or part['verb'] not in {'trash', 'archive', 'spam', 'move', 'leave', 'yes', 'no'}
-                            or part['outcome'] not in {'executed', 'failed', 'skipped', 'unexecuted', 'issued_unknown', 'answered'}):
+                            or part['outcome'] not in {'executed', 'failed', 'skipped', 'unexecuted', 'issued_unknown', 'unconfirmed', 'answered'}):
                         raise ValueError(name + ': invalid decision')
                     if part['target'] is not None:
                         folder_path(part['target'])
@@ -1127,7 +1127,7 @@ def validate_positions(positions, config):
             raise ValueError('state.json._positions.' + account + ': expected up to 10 unique ASCII ids (1 to 512 letters, digits or _ - = + /)')
 
 
-def read_observation(path, config, saved):
+def read_observation(path, config, saved, *, partial=False):
     # Errors identify fields only; gateway values never become diagnostics.
     account = ', '.join(safe_text(a) for a in config['accounts'])
     field = 'observation'
@@ -1141,33 +1141,46 @@ def read_observation(path, config, saved):
             raise ValueError()
         data = json.loads(raw)
         field = 'accounts'
-        if not isinstance(data, dict) or set(data) != set(config['accounts']):
+        if not isinstance(data, dict) or (set(data) - set(config['accounts']) if partial else set(data) != set(config['accounts'])):
             raise ValueError()
-        positions = {}
+        positions, quiet_accounts = {}, []
         quiet = True
         for account, fields in config['accounts'].items():
-            entry = data[account]
-            kind = fields.get('quiet_kind', 'history' if fields.get('provider')=='gmail' else 'ids')
-            field = 'fields'
-            known_keys(entry, {'outcome', 'position', 'arrivals'} if kind == 'history' else {'outcome', 'ids'}, 'observation')
-            field = 'outcome'
-            if entry.get('outcome') != 'ok':
-                raise ValueError()
-            field = 'position' if kind == 'history' else 'ids'
-            positions[account] = entry.get(field)
-            validate_positions({account: positions[account]}, config)
-            if kind == 'history':
-                if account in saved and int(positions[account]) < int(saved[account]):
+            try:
+                entry = data[account]
+                kind = fields.get('quiet_kind', 'history' if fields.get('provider')=='gmail' else 'ids')
+                field = 'fields'
+                known_keys(entry, {'outcome', 'position', 'arrivals', 'reason'} if kind == 'history' else {'outcome', 'ids', 'reason'}, 'observation')
+                field = 'outcome'
+                if entry.get('outcome') == 'error':
+                    reason = entry.get('reason', 'provider error (no status)')
+                    if not isinstance(reason, str) or not re.fullmatch(r'(?:provider error \([A-Za-z0-9 _-]{1,40}\)|pigeon error \(listing answer\))', reason): reason = 'provider error (no status)'
+                    print('Quiet check: ' + safe_text(account) + ': ' + reason + '; full run', file=sys.stderr)
+                    if not partial: return None
+                    continue
+                if entry.get('outcome') != 'ok':
                     raise ValueError()
-                field = 'arrivals'
-                arrivals = entry.get('arrivals')
-                if (not isinstance(arrivals, list) or len(arrivals) > 1000 or
-                        any(not isinstance(i, str) or not re.fullmatch(r'[A-Za-z0-9_=+/-]{1,512}', i) for i in arrivals)):
-                    raise ValueError()
-                quiet = quiet and not arrivals
-            else:
-                quiet = quiet and positions[account] == saved.get(account)
-        return positions, quiet
+                field = 'position' if kind == 'history' else 'ids'
+                position = entry.get(field)
+                validate_positions({account: position}, config)
+                if kind == 'history':
+                    if account in saved and int(position) < int(saved[account]):
+                        raise ValueError()
+                    field = 'arrivals'
+                    arrivals = entry.get('arrivals')
+                    if (not isinstance(arrivals, list) or len(arrivals) > 1000 or
+                            any(not isinstance(i, str) or not re.fullmatch(r'[A-Za-z0-9_=+/-]{1,512}', i) for i in arrivals)):
+                        raise ValueError()
+                    unchanged = account in saved and not arrivals
+                else:
+                    unchanged = position == saved.get(account)
+                quiet = quiet and (not arrivals if kind == "history" else unchanged)
+                positions[account] = position
+                if unchanged: quiet_accounts.append(account)
+            except (ValueError, TypeError, KeyError, RecursionError):
+                print('Quiet check: ' + safe_text(account) + ': invalid ' + field + '; full run', file=sys.stderr)
+                if not partial: return None
+        return (positions, len(quiet_accounts) == len(config['accounts']), quiet_accounts) if partial else (positions, quiet)
     except (OSError, ValueError, TypeError, KeyError, RecursionError):
         print('Quiet check: ' + safe_text(account) + ': invalid ' + field + '; full run', file=sys.stderr)
         return None
@@ -1190,7 +1203,7 @@ def quiet_check(store, config, previous, observation, scheduled, now):
         if cached.get('token') == token:
             return cached['decision']
     saved = previous.get('_positions', {})
-    observed = read_observation(observation, config, saved) if observation is not None else None
+    observed = read_observation(observation, config, saved, partial=True) if observation is not None else None
     if 'schedule' not in config:
         decision = {'decision': 'full', 'reason': 'no schedule'}
     elif not scheduled:
@@ -1209,6 +1222,10 @@ def quiet_check(store, config, previous, observation, scheduled, now):
         with (store / 'history.log').open('a', encoding='utf-8') as out:
             out.write(now.astimezone(timezone.utc).isoformat() + ' skipped: no new mail\n')
         decision = {'decision': 'skip', 'reason': 'no new mail'}
+    if (observed and scheduled and 'schedule' in config
+            and schedule_slot(config, now).strftime('%H:%M') not in config['schedule']['always_full']
+            and not (store / 'run-message.md').exists()):
+        decision['quiet_accounts'] = observed[2]
     if token is not None:
         execute.atomic(path, dict(token=token, decision=decision, positions=observed[0] if observed else None))
     return decision
@@ -1355,6 +1372,8 @@ def validate_inputs(listing, config, previous):
         for key, value in fields.items():
             if not isinstance(value, str) or not value.strip():
                 raise ValueError('config.accounts.' + account + '.' + key + ': expected a non-empty string')
+        if 'executor_app' in fields and not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', fields['executor_app']):
+            raise ValueError('config.accounts.' + account + '.executor_app: expected safe app slug')
         if 'provider' in fields and fields['provider'] not in ('gmail', 'outlook'):
             raise ValueError('config.accounts.' + account + '.provider: expected gmail or outlook')
         if fields.get('provider') and 'quiet_kind' in fields and fields['quiet_kind'] != ('history' if fields['provider']=='gmail' else 'ids'):
@@ -1369,7 +1388,15 @@ def validate_inputs(listing, config, previous):
                 raise ValueError('config.accounts.' + account + '.executor_account: expected a unique executor_app and executor_account pair')
         if fields.get('quiet_kind', 'history' if fields.get('provider')=='gmail' else 'ids') not in ('history', 'ids'):
             raise ValueError('config.accounts.' + account + '.quiet_kind: expected history or ids')
-    known_keys(listing, {'accounts', 'messages', 'folders'}, 'Inbox')
+    known_keys(listing, {'accounts', 'messages', 'folders', 'skipped', 'quiet'}, 'Inbox')
+    quiet = listing.get('quiet', [])
+    if not isinstance(quiet, list) or any(a not in config['accounts'] for a in quiet) or set(quiet) & set(listing.get('accounts', {})):
+        raise ValueError('Inbox.quiet: expected absent configured accounts')
+    skipped = listing.get('skipped', {})
+    if not isinstance(skipped, dict) or set(skipped) - set(config['accounts']) or any(not isinstance(r, str) or not re.fullmatch(r'(?:provider error \([A-Za-z0-9 _-]{1,40}\)|pigeon error \((?:manual skip|listing answer|no new mail)\))', r) for r in skipped.values()):
+        raise ValueError('Inbox.skipped: expected account skip reasons')
+    if set(skipped) & set(listing.get('accounts', {})) or any(m.get('account') in skipped for m in listing.get('messages', [])):
+        raise ValueError('Inbox.skipped: skipped account must be absent')
     if not isinstance(listing.get('accounts'), dict):
         raise ValueError('Inbox.accounts: expected account totals object')
     for account, total in listing['accounts'].items():
@@ -1414,13 +1441,13 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
             raise ValueError(('rules.toml: rule ' + repr(rule['id']) if 'id' in rule else 'never-touch.toml: entry ' + str(never_touch.index(rule) + 1)) + ': account ' + repr(next(a for a in rule['accounts'] if a not in config['accounts'])) + ' expected one of config.toml accounts: ' + ', '.join(config['accounts']))
     messages = listing['messages']
     totals = listing['accounts']
-    not_listed = [a for a in config['accounts'] if a not in totals]
+    not_listed = [a for a in config['accounts'] if a not in totals and a not in listing.get('quiet', [])]
     if set(totals) - set(config['accounts']) or not set(totals) & set(config['accounts']):
         return {'relist_inbox': config.get('relist_inbox', 'all'),
                 'remaining': [dict(account=m['account'], id=m['id'], sender=m['sender'], subject=m['subject'], reason='Run stopped') for m in messages], 'actions': [],
-                'decisions': [{'account': m['account'], 'id': m['id'], 'reason': 'Run stopped'} for m in messages],
+                'decisions': [{'account': m['account'], 'id': m['id'], 'reason': 'Protected by never-touch' if any(matches(m, h, protection=True) for h in never_touch) else 'Run stopped'} for m in messages],
                 'reasons': list(stop_reasons) + ['Listing has an unconfigured account' if set(totals) - set(config['accounts']) else 'No configured account listed'],
-                'not_listed': not_listed,
+                'not_listed': not_listed, 'skip_reasons': {a:listing.get('skipped', {}).get(a, 'pigeon error (listing answer)') for a in not_listed},
                 'counts': {a: sum(m['account'] == a for m in messages) for a in totals}}
     keys = [(m['account'], m['id']) for m in messages]
     if len(set(keys)) != len(keys) or any(m['account'] not in totals or m.get('folder') != 'Inbox' for m in messages):
@@ -1545,14 +1572,14 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
             reasons.append(f'Rule exceeds twenty percent of account total: {rule}, {account} ({count} matches, total {totals[account]}, allowed {allowed})')
     if reasons:
         actions = []
-        decisions = [{'account': m['account'], 'id': m['id'], 'reason': 'Run stopped'} for m in messages]
+        decisions = [{'account': m['account'], 'id': m['id'], 'reason': 'Protected by never-touch' if any(matches(m, h, protection=True) for h in never_touch) else 'Run stopped'} for m in messages]
     validate_actions(actions, listing)
     expected = dict(counts)
     for action in actions:
         if action['action'] in {'trash', 'archive', 'move', 'spam'}:
             expected[action['account']] -= 1
     result = {'actions': actions, 'decisions': decisions, 'reasons': reasons, 'counts': counts,
-            'expected_counts': expected, 'not_listed': not_listed,
+            'expected_counts': expected, 'not_listed': not_listed, 'skip_reasons': {a:listing.get('skipped', {}).get(a, 'pigeon error (listing answer)') for a in not_listed},
             'relist_inbox': config.get('relist_inbox', 'all')}
     result['remaining'] = remaining_items(result, listing)
     for item in result['remaining']:
@@ -1589,6 +1616,9 @@ def remaining_items(plan, listing, results=None, *, final=False):
                if i['action'] in REMOVALS and (results is None or i['status'] == 'executed')}
     statuses = {(i['account'], i['id']): (('Draft waiting since ' + i.get('created', '') if i['action'] == 'create-draft' else 'Unsubscribe leaves message in Inbox') if i['status'] == 'executed' else i['status'])
                 for i in results or [] if i['action'] != 'create-folder'}
+    for entry in results or []:
+        if entry['action'] != 'create-folder' and entry.get('reason'):
+            statuses[entry['account'], entry['id']] += ': ' + entry['reason']
     items = []
     for m in listing['messages']:
         key = (m['account'], m['id'])
@@ -1752,6 +1782,10 @@ def safe_text(value):
     return re.sub(r'([\\`*_{}\[\]()<>!|#])', r'\\\1', ' '.join(value.split()))
 
 
+def chat_text(value):
+    return ' '.join(''.join(' ' if c in '\r\n' else '' if unicodedata.category(c) in {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'} else c for c in str(value)).split())
+
+
 def code_path(value):
     # A delimiter longer than any embedded backtick run keeps literal paths inert.
     delimiter = '`' * (max((len(s) for s in re.findall(r'`+', value)), default=0) + 1)
@@ -1783,19 +1817,20 @@ def safe_unsubscribe_host(url):
 def render_remaining(plan, listing, language='en'):
     lines = []
     for account in plan['counts']:
+        if account not in listing['accounts']: continue
         items = [i for i in plan.get('remaining', remaining_items(plan, listing)) if i['account'] == account]
-        lines.append(safe_text(account) + ': ' + str(len(items)))
+        lines.append(chat_text(account) + ': ' + str(len(items)))
         hidden = 0
         for item in items:
             if plan.get('relist_inbox') == 'new_plus_count' and item.get('previously_listed'):
                 hidden += 1
                 continue
             lines.append((str(item['number']) + '. ' if 'number' in item else '- ') +
-                         safe_text(account + ': ' + item['sender'][:160] + ' | ' + item['subject'][:240]) +
-                         ' (' + safe_text(item['reason']) + ')' +
-                         (' | ' + safe_text(item['question']) if 'question' in item else ''))
+                         chat_text(account + ': ' + chat_text(item['sender'])[:160] + ' · ' + chat_text(item['subject'])[:240]) +
+                         ' (' + chat_text(item['reason']) + ')' +
+                         (' · ' + chat_text(item['question']) if 'question' in item else ''))
         if plan.get('relist_inbox') == 'new_plus_count':
-            lines.append(safe_text(account) + ': ' + str(hidden) +
+            lines.append(chat_text(account) + ': ' + str(hidden) +
                          (' previously listed' if language == 'en' else ' ya enumerados'))
     return lines
 
@@ -1805,16 +1840,15 @@ def render_drafts(plan, listing, results=None):
     if not actions:
         return []
     lookup = {(m['account'], m['id']): m for m in listing['messages']}
-    lines = ['', '**Drafts**', '']
+    lines = ['', 'Drafts', '']
     for i, action in actions:
         status = 'would create' if plan.get('dry_run') else (results[i]['status'] if results is not None and i < len(results) else 'planned')
-        lines.append(safe_text(action['account'] + ': ' + action['draft'] + ' | ' + lookup.get((action['account'], action['id']), {}).get('subject', '')) + ' | ' + status)
+        lines.append(chat_text(action['account'] + ': ' + action['draft'] + ' · ' + lookup.get((action['account'], action['id']), {}).get('subject', '')) + ' · ' + status)
         if action['draft_to']:
             lines.append('Recipients: ' + ', '.join(action['draft_to']))
         if status == 'issued_unknown':
             lines.append('check Drafts by hand')
-        fence = '`' * max(3, 1 + max((len(x) for x in re.findall(r'`+', action['draft_text'])), default=0))
-        lines += [fence, action['draft_text'], fence]
+        lines += action['draft_text'].splitlines()
     return lines
 
 
@@ -1830,7 +1864,7 @@ def calendar_section(data, config, now):
     events, pending, unread = [], [], []
     for name in sorted(config['calendars']):
         if name not in data or data[name] == {'failed': True}:
-            unread.append(safe_text(name) + ': not read; overlaps against it were not checked')
+            unread.append(chat_text(name) + ': not read; overlaps against it were not checked')
             continue
         for event in data[name]:
             if event['cancelled'] or event['response'] == 'declined':
@@ -1847,8 +1881,8 @@ def calendar_section(data, config, now):
                 events.append(item)
     def describe(item):
         _, name, ident, _, event, a, b = item
-        return safe_text(name + ' | ' + ident + ' | ' + a.isoformat() + ' — ' + b.isoformat() + ' | ' + event.get('subject', ''))
-    lines = ['', '**Calendar**', '', 'Invitations waiting for an answer']
+        return chat_text(name + ' · ' + ident + ' · ' + a.isoformat() + ' — ' + b.isoformat() + ' · ' + event.get('subject', ''))
+    lines = ['', 'Calendar', '', 'Invitations waiting for an answer']
     for item in sorted(pending):
         a, b = item[5:]
         marks = []
@@ -1860,7 +1894,7 @@ def calendar_section(data, config, now):
             qend = a.replace(hour=int(settings['quiet_end'][:2]), minute=int(settings['quiet_end'][3:]), second=0, microsecond=0).timestamp()
             if a.timestamp() < qend and b.timestamp() > qstart:
                 marks.append('inside quiet window')
-        lines.append('- ' + describe(item) + (' | ' + ', '.join(marks) if marks else ''))
+        lines.append('- ' + describe(item) + (' · ' + ', '.join(marks) if marks else ''))
     lines.append('Overlaps')
     ordered = sorted(events)
     for i, first in enumerate(ordered):
@@ -1868,7 +1902,7 @@ def calendar_section(data, config, now):
             if second[0] >= first[3]:
                 break
             winner = next((x[1] for x in (first, second) if config['calendars'][x[1]].get('wins')), None)
-            lines.append('- ' + describe(first) + ' / ' + describe(second) + (' | ' + safe_text(winner) + ' stays' if winner else ''))
+            lines.append('- ' + describe(first) + ' / ' + describe(second) + (' · ' + chat_text(winner) + ' stays' if winner else ''))
     lines += unread
     return lines
 
@@ -1879,25 +1913,56 @@ def render_report(plan, listing, language='en'):
     lookup = {(m['account'], m['id']): m for m in listing['messages']}
     def describe(item):
         m = lookup[item['account'], item['id']]
-        return safe_text(item['account'] + ': ' + m['sender'] + ' | ' + m['subject'])
-    lines = ['Inbox: ' + str(sum(plan['counts'].values())) + ' total | ' + ' · '.join(safe_text(a) + ' ' + str(n) for a, n in plan['counts'].items())]
-    lines = [safe_text(a) + ': not listed this run' for a in plan.get('not_listed', [])] + lines
-    lines += [stopped + ': ' + safe_text(r) for r in plan['reasons']]
+        return chat_text(item['account'] + ': ' + chat_text(m['sender'])[:160] + ' · ' + chat_text(m['subject'])[:240])
+    lines = ['Inbox: ' + str(sum(plan['counts'].values())) + ' total' + (' · ' if plan['counts'] else '') + ' · '.join(chat_text(a) + ' ' + str(n) for a, n in plan['counts'].items())]
+    lines = [chat_text(a) + ': not listed this run; ' + plan.get('skip_reasons', {}).get(a, 'pigeon error (listing answer)') for a in plan.get('not_listed', [])] + lines
+    lines += [chat_text(a) + ': no new mail' for a in listing.get('quiet', [])]
+    lines += [stopped + ': ' + chat_text(r) for r in plan['reasons']]
     lines += render_drafts(plan, listing)
-    lines += ['', '**' + SECTION_LABELS[language]['inbox'] + '**', ''] + render_remaining(plan, listing, language)
+    if listing['accounts']: lines += ['', SECTION_LABELS[language]['inbox'], ''] + render_remaining(plan, listing, language)
     lines += plan.get('calendar_section', [])
     hosts = {(a['account'], a['id']): safe_unsubscribe_host(a['url']) for a in plan['actions'] if 'url' in a}
-    lines += ['', '**' + planned + '**', '']
-    lines += ['- ' + a['action'] + ': ' + describe(a) + (' | ' + code_path(a['target_path']) if 'target_path' in a else '') + (' | ' + safe_text(hosts.get((a['account'], a['id']), '')) if 'url' in a else '') for a in plan['actions'] if a['action'] != 'unsubscribe' or (a['account'], a['id']) in hosts] or [empty]
-    lines += ['', '**' + new + '**', '', empty, '']
+    lines += ['', planned, '']
+    lines += ['- ' + a['action'] + ': ' + describe(a) + (' · ' + chat_text(a['target_path']) if 'target_path' in a else '') + (' · ' + chat_text(hosts.get((a['account'], a['id']), '')) if 'url' in a else '') for a in plan['actions'] if a['action'] != 'unsubscribe' or (a['account'], a['id']) in hosts] or [empty]
+    lines += ['', new, '', empty, '']
     return '\n'.join(lines)
 
 
+def message_opening(store):
+    config = state_config(store)
+    started = datetime.fromtimestamp(read_lock(store).get('started', read_lock(store)['created']), ZoneInfo(config.get('timezone', 'UTC')))
+    return '📬 Triage · ' + started.strftime('%A, %Y-%m-%d, %H:%M %Z') + ' · nothing needs you · stopped\n'
+
+
 def render_message(store, token, plan_path, results_path, *, now=None):
+    require_lock(store, token)
+    try:
+        return _render_message(store, token, plan_path, results_path, now=now)
+    except (ValueError, OSError, KeyError, TypeError, AttributeError, IndexError):
+        try:
+            failure = parse_json(read_text(store/'run-refusal.json'), 'run-refusal.json')
+            if failure.get('token') == token:
+                return message_opening(store) + 'Run failed at ' + chat_text(failure['stage']) + ': ' + chat_text(failure['refusal']) + '\n'
+        except (ValueError, OSError, KeyError, TypeError, AttributeError):
+            pass
+        return message_opening(store) + 'Run failed at message: pigeon error (run data refused)\n'
+
+
+def _render_message(store, token, plan_path, results_path, *, now=None):
     import execute
     require_lock(store, token)
+    failure_path = store / 'run-refusal.json'
+    failure = execute.read(failure_path) if failure_path.exists() else {}
+    failure_line = ('Run failed at ' + chat_text(failure.get('stage', 'plan')) + ': ' + chat_text(failure.get('refusal', 'pigeon error (plan unavailable)'))) if failure.get('token') == token else None
+    checkpoint = store / ('execution-' + hashlib.sha256(token.encode()).hexdigest() + '.json')
+    if (failure_line and not checkpoint.exists()) or not Path(plan_path).exists():
+        refusal = failure.get('refusal', 'pigeon error (plan unavailable)') if failure.get('token') == token else 'pigeon error (plan unavailable)'
+        stage = failure.get('stage', 'plan') if failure.get('token') == token else 'plan'
+        return message_opening(store) + 'Run failed at ' + chat_text(stage) + ': ' + chat_text(refusal) + '\n'
     plan = execute.read(plan_path)
     if plan.get('dry_run') is True:
+        if plan.get('run_token') != token:
+            return message_opening(store) + 'Run failed at plan: pigeon error (plan unavailable)\n'
         require_fetched(store, token)
         listing = execute.read(store / 'inbox.json')
         config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')])
@@ -1911,11 +1976,14 @@ def render_message(store, token, plan_path, results_path, *, now=None):
         labels = SECTION_LABELS[language]
         would = 'would ' if language == 'en' else 'haría '
         lines = ['Dry run', 'Replies to this dry run are not acted on; no reply number is live.'] if language == 'en' else ['Simulación', 'Las respuestas a esta simulación no se aplican; ningún número está activo.']
-        lines += [STRINGS[language][1] + ': ' + safe_text(r) for r in plan['reasons']]
-        lines += ['[' + safe_text(a['rule']) + '] ' + would + safe_text(a['action']) + ': ' + safe_text(a['account'] + ': ' + lookup[a['account'], a['id']]['sender'] + ' | ' + lookup[a['account'], a['id']]['subject']) + (' | ' + code_path(a.get('target_path', a.get('target'))) if 'target_path' in a or 'target' in a else '') for a in plan['actions']]
+        lines = [message_opening(store).strip()] + lines
+        lines += [chat_text(a) + ': not listed this run; ' + r for a, r in plan.get('skip_reasons', {}).items()]
+        lines += [chat_text(a) + ': no new mail' for a in listing.get('quiet', [])]
+        lines += [STRINGS[language][1] + ': ' + chat_text(r) for r in plan['reasons']]
+        lines += ['[' + chat_text(a['rule']) + '] ' + would + chat_text(a['action']) + ': ' + chat_text(a['account'] + ': ' + lookup[a['account'], a['id']]['sender'] + ' · ' + lookup[a['account'], a['id']]['subject']) + (' · ' + chat_text(a.get('target_path', a.get('target'))) if 'target_path' in a or 'target' in a else '') for a in plan['actions']]
         lines += render_drafts(plan, listing)
         lines += ['', 'Decisions for the owner' if language == 'en' else 'Decisiones para el propietario']
-        lines += [safe_text(i['account'] + ': ' + lookup[i['account'], i['id']]['subject'] + ' | ' + i['reason']) + (' | ' + safe_text(i['question']) if 'question' in i else '') for i in plan['decisions']]
+        lines += [chat_text(i['account'] + ': ' + lookup[i['account'], i['id']]['subject'] + ' · ' + i['reason']) + (' · ' + chat_text(i['question']) if 'question' in i else '') for i in plan['decisions']]
         lines += ['', labels['inbox']]
         items = remaining_items(dict(plan, actions=[]), listing)
         for item in items:
@@ -1926,7 +1994,7 @@ def render_message(store, token, plan_path, results_path, *, now=None):
         return '\n'.join(lines) + '\n'
     execution = execute.Execution(store, token, plan_path)
     if not execution.path.exists():
-        raise ValueError('message: missing execution results for this token and plan; run execute.py next')
+        return message_opening(store) + 'Run failed at execution: pigeon error (results unavailable)\n' + '\n'.join(chat_text(a) + ': ' + r for a,r in plan.get('skip_reasons', {}).items()) + '\n'
     results = execute.read(results_path or store / 'results.json')
     if results != {'results': execution.state['results']}:
         raise ValueError('message: results must match this token and plan checkpoint')
@@ -1949,9 +2017,9 @@ def render_message(store, token, plan_path, results_path, *, now=None):
             item['number'] = numbers[key]
         item['previously_listed'] = old.get(key, {}).get('previously_listed', False)
     handled = {}
-    notes = [safe_text(r) for r in plan['reasons']]
+    notes = [chat_text(r) for r in plan['reasons']]
     if execution.stop_reason():
-        notes.insert(0, safe_text(execution.stop_reason()))
+        notes.insert(0, chat_text(execution.stop_reason()))
     for index, action in enumerate(plan['actions']):
         status = (observed[index]['status'] if index < len(observed) else 'unexecuted')
         if status == 'executed' and action['action'] != 'create-folder':
@@ -1959,19 +2027,21 @@ def render_message(store, token, plan_path, results_path, *, now=None):
             group = action.get('target_path', action.get('rule', action.get('target', '')))
             groups[group] = groups.get(group, 0) + 1
         elif status != 'executed':
-            notes.append(safe_text(action['account'] + ': ' + action['action'] + ': ' + status))
+            notes.append(chat_text(action['account'] + ': ' + action['action'] + ': ' + ('not confirmed' if status == 'unconfirmed' else status) + (': ' + observed[index]['reason'] if index < len(observed) and observed[index].get('reason') else '')))
             if action['action'] == 'create-folder':
                 instruction = ('Check whether this folder exists; create it if absent: ' if status == 'issued_unknown' else 'Create this folder: ')
-                notes.append(safe_text(action['account'] + ': ' + instruction) + code_path(action['target_path']) + '; dependent messages stay in Inbox this run.')
-    notes += [safe_text(a) + ': not listed this run' for a in plan.get('not_listed', [])]
+                notes.append(chat_text(action['account'] + ': ' + instruction) + chat_text(action['target_path']) + '; dependent messages stay in Inbox this run.')
+    if failure_line: notes.insert(0, failure_line)
+    notes += [chat_text(a) + ': final reading failed; ' + reason for a, reason in listing.get('skipped', {}).items() if a in plan['counts']]
+    notes += [chat_text(a) + ': not listed this run; ' + plan.get('skip_reasons', {}).get(a, 'pigeon error (listing answer)') for a in plan.get('not_listed', [])]
     log = store / 'calls.jsonl'
     for line in read_text(log).splitlines() if log.exists() else []:
         entry = parse_json(line, log)
         if entry['run'] == token and entry['outcome'] == 'unplanned':
-            notes.append('Unplanned call: ' + safe_text(json.dumps(entry, ensure_ascii=True)))
+            notes.append('Unplanned call: ' + chat_text(json.dumps(entry, ensure_ascii=True)))
     started = datetime.fromtimestamp(read_lock(store).get('started', read_lock(store)['created']), ZoneInfo(config.get('timezone', 'UTC')))
     count = sum('number' in i for i in remaining)
-    need = (str(count) + ' need you' if count else 'nothing needs you') if language == 'en' else (str(count) + ' requieren tu decisión' if count else 'nada requiere tu decisión')
+    need = (str(count) + (' needs you' if count == 1 else ' need you') if count else 'nothing needs you') if language == 'en' else (str(count) + ' requieren tu decisión' if count else 'nada requiere tu decisión')
     total = sum(sum(groups.values()) for groups in handled.values())
     stopped = bool(plan['reasons']) or bool(execution.stop_reason()) or len(results['results']) != len(plan['actions'])
     summary = STRINGS[language][1].lower() if stopped else str(total) + (' handled' if language == 'en' else ' gestionados')
@@ -1981,18 +2051,19 @@ def render_message(store, token, plan_path, results_path, *, now=None):
         delay = int((started.timestamp() - slot.timestamp()) // 60)
         if delay > 15:
             lines.append(('Late start: ' if language == 'en' else 'Inicio tardío: ') + slot.strftime('%Y-%m-%d %H:%M %Z') + ', ' + str(delay) + ' min')
-    lines.append('📬 Triage · ' + started.strftime('%A, %Y-%m-%d, %H:%M %Z') + ' · ' + need + ' · ' + summary)
-    lines += [safe_text(a) + ': not listed this run' for a in plan.get('not_listed', [])]
+    lines.insert(0, '📬 Triage · ' + started.strftime('%A, %Y-%m-%d, %H:%M %Z') + ' · ' + need + ' · ' + summary)
+    lines += [chat_text(a) + ': not listed this run; ' + plan.get('skip_reasons', {}).get(a, 'pigeon error (listing answer)') for a in plan.get('not_listed', [])]
     if handled:
-        lines += ['', '**' + labels['handled'] + '**']
+        lines += ['', labels['handled']]
         for verb, groups in handled.items():
-            lines.append(safe_text(verb) + ': ' + str(sum(groups.values())) + ' (' + '; '.join(safe_text(k) + ': ' + str(v) for k, v in groups.items()) + ')')
+            lines.append(chat_text(verb) + ': ' + str(sum(groups.values())) + ' (' + '; '.join(chat_text(k) + ': ' + str(v) for k, v in groups.items()) + ')')
     lines += render_drafts(plan, execute.read(store / 'inbox.json'), observed)
     confirmed = dict(plan, remaining=remaining)
-    lines += ['', '**' + labels['inbox'] + '**', ''] + render_remaining(confirmed, listing, language)
+    lines += [chat_text(a) + ': no new mail' for a in listing.get('quiet', [])]
+    if listing['accounts']: lines += ['', labels['inbox'], ''] + render_remaining(confirmed, listing, language)
     lines += plan.get('calendar_section', [])
     if notes:
-        lines += ['', '**' + labels['notes'] + '**', ''] + notes
+        lines += ['', labels['notes'], ''] + notes
     return '\n'.join(lines) + '\n'
 
 
@@ -2126,7 +2197,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         plan = read(plan_path)
         if plan.get('dry_run'):
             raise ValueError('dry-run plan: commit-state is refused')
-        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled'}, str(plan_path))
+        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled'}, str(plan_path))
         for key in ('actions', 'reasons', 'not_listed'):
             if not isinstance(plan.get(key), list):
                 raise ValueError(str(plan_path) + '.' + key + ': expected an array')
@@ -2173,8 +2244,8 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
             if key not in actions or key in seen:
                 raise ValueError(label + '.id: expected a unique action matching the plan account, id and action')
             seen.add(key)
-            if entry['status'] not in {'executed', 'failed', 'skipped', 'unexecuted', 'unsubscribe_not_executable', 'unsubscribe_not_attempted', 'issued_unknown'}:
-                raise ValueError(label + '.status: expected executed, failed, skipped, unexecuted, unsubscribe_not_executable, unsubscribe_not_attempted or issued_unknown')
+            if entry['status'] not in {'executed', 'failed', 'skipped', 'unexecuted', 'unsubscribe_not_executable', 'unsubscribe_not_attempted', 'issued_unknown', 'unconfirmed'}:
+                raise ValueError(label + '.status: expected executed, failed, skipped, unexecuted, unsubscribe_not_executable, unsubscribe_not_attempted issued_unknown or unconfirmed')
             if entry['status'] == 'executed' and entry['action'] in {'trash', 'archive', 'move', 'spam'}:
                 executed.append(entry['account'])
         if (not execution.path.exists() or results['results'] != execution.state['results']):
@@ -2203,16 +2274,18 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
             change = execution.state['outside_change']
             counts[change['account']] -= len(change['ids'])
         if 'final_listing' in execution.state:
-            counts = {a: sum(m['account'] == a for m in execution.state['final_listing']['messages']) for a in counts}
+            for account in execution.state['final_listing'].get('skipped', {}):
+                previous.get('_positions', {}).pop(account, None)
+            counts = {a: sum(m['account'] == a for m in execution.state['final_listing']['messages']) for a in counts if a in execution.state['final_listing']['accounts']}
         path = store / 'quiet-check.json'
         cached = read(path) if path.exists() else {}
         known_keys(cached, {'token', 'decision', 'positions'}, str(path))
         positions = cached.get('positions') if cached.get('token') == token else None
-        if (not execution.stop_reason() and not plan.get('reply') and not plan['reasons'] and positions is not None and counts.keys() == config['accounts'].keys()
-                and execution.path.exists()
-                and len(execution.state['results']) == len(plan['actions'])):
+        if (not execution.stop_reason() and not plan.get('reply') and not plan['reasons'] and positions is not None
+                and execution.path.exists() and len(execution.state['results']) == len(plan['actions'])):
             validate_positions(positions, config)
-            previous['_positions'] = positions
+            confirmed = {a for a in counts if all(r['status'] not in ('issued_unknown', 'unexecuted', 'unconfirmed') for r in execution.state['results'] if r['account'] == a)}
+            previous.setdefault('_positions', {}).update({a:p for a,p in positions.items() if a in confirmed})
         if plan.get('reply') and not plan['reasons']:
             log = store / 'decisions.jsonl'
             batches = [parse_json(line, log) for line in read_text(log).splitlines()] if log.exists() else []
@@ -2230,6 +2303,8 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         if execution.state['pending'] is not None:
             observed.append(execution.state['pending'] | {'status': 'issued_unknown'})
         confirmed = dict(plan, actions=[], remaining=execution.remaining_items(listing, observed),
+                         not_listed=list(dict.fromkeys(plan.get('not_listed', []) + list(listing.get('skipped', {})))),
+                         skip_reasons=plan.get('skip_reasons', {}) | listing.get('skipped', {}),
                          reasons=plan['reasons'] + ([execution.stop_reason()] if execution.stop_reason() else []))
         old = {(i['account'], i['id']): i for i in plan.get('remaining', [])}
         for item in confirmed['remaining']:
@@ -2258,6 +2333,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+        (store / 'run-refusal.json').unlink(missing_ok=True)
 
 
 TOOL_KINDS = PLAN_VERBS | {'message-read', 'profile', 'ids', 'attachments', 'labels', 'message', 'history', 'folders'}
@@ -2280,12 +2356,40 @@ PROVIDER_TOOLS = {
         'ids': {'meMailFolder.meMailFoldersListMessages'},
         'folders': {'meMailFolder.meListMailFolders', 'meMailFolder.meMailFoldersListChildFolders'},
         'message-read': {'meMessage.meGetMessages'},
-        'trash': {'meMessage.meMoveMessages'}, 'archive': {'meMessage.meMoveMessages'},
-        'move': {'meMessage.meMoveMessages'}, 'spam': {'meMessage.meMoveMessages'},
+        'trash': {'meMessage.meMessagesMessageMove'}, 'archive': {'meMessage.meMessagesMessageMove'},
+        'move': {'meMessage.meMessagesMessageMove'}, 'spam': {'meMessage.meMessagesMessageMove'},
         'create-folder': {'meMailFolder.meCreateMailFolders', 'meMailFolder.meMailFoldersCreateChildFolders'},
-        'create-draft': {'meMessage.meCreateReply', 'meMessage.meCreateForward'},
+        'create-draft': {'meMessage.meMessagesMessageCreateReply', 'meMessage.meMessagesMessageCreateForward'},
     },
 }
+
+
+def tool_path(app, tail):
+    prefix = 'tools.' + app if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', app) else 'tools[' + json.dumps(app) + ']'
+    return prefix + '.' + tail
+
+
+def provider_failed(value):
+    if not isinstance(value, dict): return False
+    if value.get('ok') is False or 'error' in value: return True
+    for key in ('code', 'status', 'statusCode'):
+        status = value.get(key)
+        if (type(status) is int or isinstance(status, str) and status.isdigit()) and int(status) >= 400:
+            return True
+    return any(provider_failed(value.get(k)) for k in ('error', 'value'))
+
+
+def provider_error(value):
+    if isinstance(value, dict):
+        for key in ('status', 'statusCode', 'code'):
+            code = value.get(key)
+            if (type(code) is int and code >= 100 and len(str(code)) <= 40) or (isinstance(code, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,40}', code)):
+                return 'provider error (' + str(code) + ')'
+        for key in ('error', 'value'):
+            if isinstance(value.get(key), dict):
+                reason = provider_error(value[key])
+                if reason != 'provider error (no status)': return reason
+    return 'provider error (no status)'
 
 
 def checked_tool(config, account, kind, path):
@@ -2296,12 +2400,14 @@ def checked_tool(config, account, kind, path):
             or (kind != 'create-draft' and any(word in path.casefold() for word in ('reply', 'forward')))):
         raise ValueError('tool-paths.json: expected own account app and safe tool for ' + kind)
     tail = match[3]
+    if tail in {'meMessage.meMoveMessages', 'meMessage.meCreateReply', 'meMessage.meCreateForward'}:
+        raise ValueError('tool-paths.json: expected current provider tool')
     provider = fields.get('provider')
     if provider in PROVIDER_TOOLS and tail not in PROVIDER_TOOLS[provider].get(kind, set()):
         raise ValueError('tool-paths.json: expected provider tool for ' + kind)
     if kind == 'create-draft' and provider not in PROVIDER_TOOLS and not re.search(r'(?:draft.*create|create.*(?:draft|reply|forward))', tail, re.I):
         raise ValueError('tool-paths.json: expected a draft-creating tool')
-    return 'tools.' + (match[1] or match[2]) + '.' + tail
+    return tool_path(match[1] or match[2], tail)
 
 
 def validate_tool_paths(data, config, *, drop=False):
@@ -2359,7 +2465,7 @@ def mail_call(fields, kind, *, page=None, id=None, parent=''):
         else:
             if id: path = {'mailFolder-id':id}
             query = {'$select':['id', 'displayName', 'totalItemCount', 'childFolderCount'],
-                     '$top':100, '$skip':page or 0, 'includeHiddenFolders':True}
+                     '$top':100, '$skip':page or 0, 'includeHiddenFolders':'true'}
     if not gmail and kind == 'profile':
         tool = 'meUser.meUserGetUser'
         path = {}
@@ -2367,7 +2473,7 @@ def mail_call(fields, kind, *, page=None, id=None, parent=''):
     inner = {}
     if path: inner['path'] = path
     if query: inner['query'] = query
-    return dict(path='tools.' + fields['executor_app'] + '.' + tool,
+    return dict(path=tool_path(fields['executor_app'], tool),
                 input=dict(accountId=fields['executor_account'], input=inner))
 
 
@@ -2381,15 +2487,36 @@ def listing_call(config, job, ids_only, store=None):
     return call
 
 
-def listing_exchange(store, token, results=None, *, ids_only=False, accounts=None, manual_part=None):
+def gateway_results(path, count):
+    expected = 'gateway results: expected a JSON array with one result per call in call order, each with boolean ok (true and value, or false and error)'
+    try:
+        values = parse_json(read_text(path), 'gateway results')
+    except ValueError:
+        raise ValueError(expected) from None
+    if (not isinstance(values, list) or len(values) != count
+            or any(not isinstance(v, dict) or type(v.get('ok')) is not bool for v in values)):
+        raise ValueError(expected)
+    return values
+
+
+def listing_exchange(store, token, results=None, *, ids_only=False, accounts=None, manual_part=None, skip=()):
     """Persist issued reads before returning them; mail values remain data."""
     import execute
     with lock_gate(store):
         require_lock(store, token)
         require_fetched(store, token)
         config, rules, holds = load_safety([store / n for n in ('config.toml','rules.toml','never-touch.toml','guardrails.md')])
+        filename = store / ('final-listing-exchange.json' if ids_only else 'listing-exchange.json')
+        state = parse_json(read_text(filename), filename) if filename.exists() else {}
+        if state.get('token') == token:
+            skip = set(skip) | {a for a,r in state.get('failed', {}).items() if r == 'pigeon error (manual skip)'}
         names = list(accounts if accounts is not None else config['accounts'])
-        manual = [a for a in names if not ids_only and any('body' in r and a in r.get('accounts', []) for r in rules + holds)]
+        if set(skip) - set(config['accounts']):
+            raise ValueError('listing: unknown skipped account')
+        quiet_path = store / 'quiet-check.json'
+        quiet_cache = parse_json(read_text(quiet_path), quiet_path) if quiet_path.exists() else {}
+        quiet_names = quiet_cache.get('decision', {}).get('quiet_accounts', []) if quiet_cache.get('token') == token and not ids_only else []
+        manual = [a for a in names if a not in skip and a not in quiet_names and not ids_only and any('body' in r and a in r.get('accounts', []) for r in rules + holds)]
         part = None
         if manual:
             if manual_part is None:
@@ -2401,29 +2528,24 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
             build_plan(part, rules, holds, config, {})
         elif manual_part is not None:
             raise ValueError('listing: no manual accounts expected')
-        names = [a for a in names if a not in manual]
-        for account in names:
-            fields = config['accounts'][account]
-            if not all(fields.get(k) for k in ('provider','executor_app','executor_account')):
-                raise ValueError('listing: ' + account + ': build the whole listing by hand; mixed listings refused')
-        filename = store / ('final-listing-exchange.json' if ids_only else 'listing-exchange.json')
+        names = [a for a in names if a not in manual and a not in quiet_names]
         fingerprint = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
-        if filename.exists():
-            state = parse_json(read_text(filename), filename)
-        else: state = {}
         if state.get('token') != token:
             if results is not None: raise ValueError('listing: no pending batch')
-            state = dict(token=token, config=fingerprint, round=0, queue=[], pending=[], failed={},
+            state = dict(token=token, config=fingerprint, round=0, queue=[], pending=[], failed={a:'pigeon error (manual skip)' for a in skip}, attempts={},
                          data={a:dict(ids=[], attachments=[], messages=[], folders=[], total=0, seen={}) for a in names})
             for a in names:
-                for kind in (['ids'] if ids_only else ['profile','ids','attachments','labels'] if config['accounts'][a]['provider']=='gmail' else ['profile','ids','folders']):
+                for kind in (['ids'] if ids_only else ['profile','ids','attachments','labels'] if config['accounts'][a].get('provider')=='gmail' else ['profile','ids','folders']):
                     state['queue'].append(dict(account=a,kind=kind))
+        state['failed'].update({a:'pigeon error (manual skip)' for a in skip})
+        for account in names:
+            if account in state['failed']: continue
+            if not all(config['accounts'][account].get(k) for k in ('provider','executor_app','executor_account')):
+                raise ValueError('listing: ' + account + ': build the whole listing by hand; mixed listings refused')
         if state['config'] != fingerprint or set(state['data']) != set(names):
             raise ValueError('listing: configuration changed')
         if results is not None:
-            values = parse_json(read_text(results), 'listing results')
-            if not state['pending'] or not isinstance(values,list) or len(values) != len(state['pending']):
-                raise ValueError('listing: expected one result per issued call in order')
+            values = gateway_results(results, len(state['pending']))
             # A message response carries the requested ID; validate before consuming any result.
             for job, value in zip(state['pending'], values):
                 if job['kind']=='message' and isinstance(value,dict) and value.get('ok') is True and isinstance(value.get('value'),dict) and message_id(value['value'].get('id')) and value['value']['id'] != job['id']:
@@ -2432,11 +2554,21 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
                 a, kind = job['account'], job['kind']
                 if a in state['failed']: continue
                 try:
+                    if provider_failed(value): raise ValueError()
                     if not isinstance(value,dict) or value.get('ok') is not True or not isinstance(value.get('value'),dict): raise ValueError()
                     consume_listing(state, job, value['value'], config, ids_only)
-                except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
-                    state['failed'][a] = kind
+                except Exception:
+                    state['failed'][a] = (provider_error(value) if provider_failed(value) else 'pigeon error (listing answer)')
             state['pending'] = []
+            for a in list(state['failed']):
+                if state['failed'][a] in ('pigeon error (manual skip)', 'pigeon error (no new mail)') or a not in state['data'] or state.setdefault('attempts', {}).get(a, 0): continue
+                state['attempts'][a] = 1
+                if ids_only: state['arrivals_checked'] = False
+                del state['failed'][a]
+                state['data'][a] = dict(ids=[], attachments=[], messages=[], folders=[], total=0, seen={})
+                state['queue'] = [j for j in state['queue'] if j['account'] != a]
+                kinds = ['ids'] if ids_only else ['profile','ids','attachments','labels'] if config['accounts'][a]['provider']=='gmail' else ['profile','ids','folders']
+                state['queue'] += [dict(account=a,kind=k) for k in kinds]
         if ids_only and not state['pending'] and not state['queue'] and not state.get('arrivals_checked'):
             original = parse_json(read_text(store/'inbox.json'), 'inbox')
             for a,d in state['data'].items():
@@ -2461,6 +2593,8 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
                         calls=[listing_call(config, j, ids_only, store) for j in jobs], failed=state['failed'])
         listing = part or dict(accounts={},messages=[],folders={})
         listing.setdefault('folders', {})
+        listing['skipped'] = dict(state['failed'])
+        if quiet_names: listing['quiet'] = quiet_names
         for a,d in state['data'].items():
             if a in state['failed']: continue
             listing['accounts'][a] = (parse_json(read_text(store/'inbox.json'), 'inbox')['accounts'][a] if ids_only else d['total'])
@@ -2538,7 +2672,7 @@ def consume_listing(state, job, value, config, ids_only):
         d['messages'].append(m)
         return
     key = 'labels' if kind=='labels' else 'messages' if gmail else 'value'
-    rows = value[key]
+    rows = value.get(key, [])
     if not isinstance(rows,list): raise ValueError()
     if kind=='labels':
         for row in rows:
@@ -2604,12 +2738,11 @@ def quiet_gateway(store, token, config, previous, results=None):
                 state['queue'].append(dict(account=a,kind='history',id=previous['_positions'][a]))
             state['observations'][a] = dict(outcome='ok',position=None,arrivals=[]) if kind=='profile' else dict(outcome='ok',ids=[])
     if results is not None:
-        values=parse_json(read_text(results),'quiet results')
-        if not state['pending'] or not isinstance(values,list) or len(values)!=len(state['pending']): raise ValueError('quiet-check: expected results in issued order')
+        values = gateway_results(results, len(state['pending']))
         for j,v in zip(state['pending'],values):
             a=j['account']; entry=state['observations'][a]
             try:
-                if v['ok'] is not True: raise ValueError()
+                if provider_failed(v) or v['ok'] is not True: raise ValueError()
                 value=v['value']
                 if j['kind']=='profile' and config['accounts'][a]['provider']=='outlook':
                     outlook_identity(value, config['accounts'][a])
@@ -2618,13 +2751,13 @@ def quiet_gateway(store, token, config, previous, results=None):
                     if not isinstance(pos,str) or not pos.isascii() or not pos.isdigit(): raise ValueError()
                     entry['position']=pos
                 elif j['kind']=='ids':
-                    rows=value['value']
+                    rows=value.get('value',[])
                     if not isinstance(rows,list) or len(rows)>NEWEST_IDS: raise ValueError()
                     ids=[r['id'] for r in rows]
                     if len(set(ids))!=len(ids) or any(not message_id(i) for i in ids): raise ValueError()
                     entry['ids']=ids
                 else:
-                    rows=value['history']
+                    rows=value.get('history',[])
                     if not isinstance(rows,list): raise ValueError()
                     for h in rows:
                         for k in ('messagesAdded','labelsAdded'):
@@ -2639,7 +2772,8 @@ def quiet_gateway(store, token, config, previous, results=None):
                         seen.append(page); state['queue'].append(j|dict(page=page))
             except (ValueError,TypeError,KeyError,AttributeError):
                 entry['outcome']='error'
-                print('Quiet check: '+safe_text(a)+': failed '+j['kind']+'; full run',file=sys.stderr)
+                entry['reason'] = provider_error(v) if provider_failed(v) else 'pigeon error (listing answer)'
+                print('Quiet check: '+safe_text(a)+': '+entry['reason']+'; full run',file=sys.stderr)
         state['pending']=[]
     if not state['pending']:
         state['pending']=state['queue'][:LISTING_BATCH];state['queue']=state['queue'][LISTING_BATCH:]
@@ -2658,7 +2792,30 @@ def quiet_gateway(store, token, config, previous, results=None):
     return dict(calls=calls,round=state['round'],batches_remaining=(len(state['queue'])+LISTING_BATCH-1)//LISTING_BATCH)
 
 
+def record_refusal(arguments, error):
+    if '--token' not in arguments: return
+    try:
+        import execute
+        store = private_store()
+        token = arguments[arguments.index('--token') + 1]
+        with lock_gate(store):
+            require_lock(store, token)
+            refusal = re.sub(r'(?:/[^/:\n]+)+', lambda m: Path(m[0]).name, ' '.join(str(error).split()))[:500]
+            execute.atomic(store / 'run-refusal.json', dict(token=token, stage=arguments[0], refusal=refusal))
+    except (ValueError, OSError, IndexError):
+        pass
+
+
 def main(argv=None, *, now=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        return _main(arguments, now=now)
+    except Exception as error:
+        record_refusal(arguments, error)
+        raise
+
+
+def _main(argv=None, *, now=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('validate', allow_abbrev=False)
@@ -2695,21 +2852,22 @@ def main(argv=None, *, now=None):
     commit = sub.add_parser('commit-state', allow_abbrev=False)
     commit.add_argument('--token', required=True)
     commit.add_argument('--plan', required=True)
-    commit.add_argument('--results')
+    commit.add_argument('--results', help='Recorded execution results, not gateway results; docs/quickstart.md#gateway-results')
     commit.add_argument('--lock-observation')
     message = sub.add_parser('message', allow_abbrev=False)
     message.add_argument('--token', required=True)
     message.add_argument('--plan', required=True)
-    message.add_argument('--results')
+    message.add_argument('--results', help='Recorded execution results, not gateway results; docs/quickstart.md#gateway-results')
     listing = sub.add_parser('listing', allow_abbrev=False)
     listing.add_argument('--token', required=True)
-    listing.add_argument('--results')
+    listing.add_argument('--results', help='Gateway array: docs/quickstart.md#gateway-results')
     listing.add_argument('--manual-part')
+    listing.add_argument('--skip', action='append', default=[])
     listing.add_argument('--ids-only', action='store_true')
     quiet = sub.add_parser('quiet-check', allow_abbrev=False)
     quiet.add_argument('--token', required=True)
     quiet.add_argument('--observation')
-    quiet.add_argument('--results')
+    quiet.add_argument('--results', help='Gateway array: docs/quickstart.md#gateway-results')
     quiet.add_argument('--scheduled', action='store_true')
     for command_name in ('plan', 'reply'):
         plan = sub.add_parser(command_name, allow_abbrev=False)
@@ -2741,6 +2899,7 @@ def main(argv=None, *, now=None):
                 raise ValueError(str(store / name) + ': expected no existing setup file')
         root = Path(__file__).resolve().parents[1]
         contents = {name: read_text(root / source) for name, source in examples.items()}
+        contents['guardrails.md'] = re.sub(r'\]\(\.\./([^)]*)\)', lambda m: '](' + str(root) + '/' + m[1] + ')', contents['guardrails.md'])
         store.mkdir(parents=True, exist_ok=True, mode=0o700)
         store.chmod(0o700)
         for name, content in contents.items():
@@ -2821,7 +2980,7 @@ def main(argv=None, *, now=None):
         with lock_gate(store):
             print(render_message(store, args.token, args.plan, args.results, now=now), end='')
     elif args.command == 'listing':
-        print(json.dumps(listing_exchange(store, args.token, args.results, ids_only=args.ids_only, manual_part=args.manual_part), ensure_ascii=True))
+        print(json.dumps(listing_exchange(store, args.token, args.results, ids_only=args.ids_only, manual_part=args.manual_part, skip=args.skip), ensure_ascii=True))
     elif args.command == 'quiet-check':
         with lock_gate(store):
             require_lock(store, args.token)
@@ -2858,7 +3017,7 @@ def main(argv=None, *, now=None):
                 print(json.dumps(quiet_check(store, config, previous, args.observation, args.scheduled, now), sort_keys=True))
     else:
         sources = [getattr(args, n.replace('-', '_')) or store / (n + ('.md' if n == 'guardrails' else '.toml')) for n in ('config', 'rules', 'never-touch', 'guardrails')]
-        protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'numbers.json', 'reply.json', 'reply.txt', 'decisions.jsonl', 'history.log', 'run-message.md', 'quiet-observation.json', 'positions-observation.json', 'quiet-check.json', 'lock-exchange.json', 'lock-observation.json', 'lock-commit-observation.json', 'state-exchange.json', 'finish-exchange.json', 'final-inbox.json', 'state-incoming', 'state-outgoing', 'state-observation.json', 'upload-observation.json', 'state-lock-observation.json', 'tool-paths.json', 'cases.toml', 'inbox.json', 'config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')}
+        protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'numbers.json', 'reply.json', 'reply.txt', 'decisions.jsonl', 'history.log', 'run-message.md', 'quiet-observation.json', 'positions-observation.json', 'quiet-check.json', 'lock-exchange.json', 'lock-observation.json', 'lock-commit-observation.json', 'state-exchange.json', 'finish-exchange.json', 'final-inbox.json', 'state-incoming', 'state-outgoing', 'state-observation.json', 'upload-observation.json', 'state-lock-observation.json', 'tool-paths.json', 'cases.toml', 'run-refusal.json', 'inbox.json', 'config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')}
         if args.command == 'reply':
             protected.add(Path(args.reply).resolve())
         protected = {p.resolve() for p in protected}
@@ -2931,6 +3090,7 @@ def main(argv=None, *, now=None):
                     result['calendar_section'] = calendar_section(data, config, now or datetime.now(timezone.utc))
                 if getattr(args, 'dry_run', False):
                     result['dry_run'] = True
+                    result['run_token'] = args.token
                 else:
                     number_decisions(store, result, listing)
                 result['first_run'] = first_run
@@ -2951,7 +3111,7 @@ def main(argv=None, *, now=None):
                         if entry['verb'] in {'leave', 'yes', 'no'}:
                             continue
                         m = lookup[entry['account'], entry['id']]
-                        print(str(entry['number']) + '. [' + safe_text(entry['account']) + '] ' + safe_text(m['sender']) + ': "' + safe_text(m['subject']) + '" ' + entry['verb'])
+                        print(str(entry['number']) + '. [' + chat_text(entry['account']) + '] ' + chat_text(m['sender']) + ': "' + chat_text(m['subject']) + '" ' + entry['verb'])
                 payload = json.dumps(result, ensure_ascii=True, indent=2) + '\n'
                 outputs = []
                 temporary = []
@@ -2989,10 +3149,6 @@ def main(argv=None, *, now=None):
                             destination.unlink()
                     except (ValueError, OSError):
                         pass
-            try:
-                release(store, args.token)
-            except (ValueError, FileNotFoundError):
-                pass
             raise
 
 

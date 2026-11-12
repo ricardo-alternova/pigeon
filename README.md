@@ -1,6 +1,6 @@
 # pigeon
 
-pigeon is an MIT-licensed email triage kit. An AI assistant carries calls through an MCP mail gateway such as [Executor](https://executor.sh). The Python planner matches Inbox messages against private rules; the execution step machine issues one action at a time.
+pigeon is an MIT-licensed email triage kit. An AI assistant carries calls through an MCP mail gateway such as [Executor](https://executor.sh). The Python planner matches Inbox messages against private rules; the execution step machine issues actions in batches per account.
 
 ## Quick start
 
@@ -29,7 +29,7 @@ trap - EXIT
 ```
 <!-- /quick-start -->
 
-Compare the report with tests/fixtures/expected-report.md. The final command prints "released". For real mail, follow [setup](docs/setup.md).
+Compare the plain-text report with tests/fixtures/expected-report.md. The demo prints addresses unchanged and uses plain section titles. The final command prints "released". For real mail, follow [setup](docs/setup.md).
 
 ## Contributions
 
