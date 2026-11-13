@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Inbox planner.
 
-See docs/setup.md.
+See docs/quickstart.md.
 """
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -183,6 +183,18 @@ def refresh(store, token, *, now=None):
     return token
 
 
+SIMULATION_DIR = '.dry-run'
+
+
+def clean_simulation(store):
+    import shutil
+    folder = store / SIMULATION_DIR
+    if folder.is_symlink() or folder.is_file():
+        folder.unlink()
+    elif folder.exists():
+        shutil.rmtree(folder)
+
+
 def release(store, token):
     if store_lock_setting(store)['kind'] == 'onedrive':
         raise ValueError('run.lock: release requires the conditional drive exchange')
@@ -194,6 +206,10 @@ def release(store, token):
         if not secrets.compare_digest(held['token'], token):
             raise ValueError(str(store / 'run.lock') + ': token expected to match the holder; only the holder may release the lock')
         (store / 'run.lock').unlink()
+        try:
+            clean_simulation(store)
+        except OSError:
+            return 'released; dry-run cleanup failed'
         return 'released'
 
 
@@ -370,6 +386,10 @@ def drive_lock(store, operation, token=None, observation=None, *, now=None):
                     raise ValueError('lock exchange: changed holder; lost lock')
                 (store / 'run.lock').unlink()
                 path.unlink()
+                try:
+                    clean_simulation(store)
+                except OSError:
+                    return 'released; dry-run cleanup failed'
                 return 'released'
             if phase == 'verify' and status == 'ok':
                 item = lock_item(data, clock)
@@ -699,6 +719,8 @@ def batch_lock(store, observation=None, *, now=None):
 
 def finish_run(store, token, plan=None, observation=None, *, now=None):
     import execute
+    if plan is not None:
+        require_plan_token(execute.read(plan), token)
     if plan is not None and execute.read(plan).get('dry_run'):
         raise ValueError('dry-run plan: finish-run is refused')
     if store_lock_setting(store)['kind'] == 'local':
@@ -1132,14 +1154,17 @@ def read_observation(path, config, saved, *, partial=False):
     account = ', '.join(safe_text(a) for a in config['accounts'])
     field = 'observation'
     try:
-        path = Path(path)
-        if not path.is_file() or not path.stat().st_mode & 0o444:
-            raise ValueError()
-        with path.open('rb') as stream:
-            raw = stream.read(OBSERVATION_LIMIT + 1)
-        if len(raw) > OBSERVATION_LIMIT:
-            raise ValueError()
-        data = json.loads(raw)
+        if isinstance(path, dict):
+            data = path
+        else:
+            path = Path(path)
+            if not path.is_file() or not path.stat().st_mode & 0o444:
+                raise ValueError()
+            with path.open('rb') as stream:
+                raw = stream.read(OBSERVATION_LIMIT + 1)
+            if len(raw) > OBSERVATION_LIMIT:
+                raise ValueError()
+            data = json.loads(raw)
         field = 'accounts'
         if not isinstance(data, dict) or (set(data) - set(config['accounts']) if partial else set(data) != set(config['accounts'])):
             raise ValueError()
@@ -1193,11 +1218,11 @@ def gateway_account(config, account):
     return {k: fields[k] for k in ('executor_app', 'executor_account') if k in fields}
 
 
-def quiet_check(store, config, previous, observation, scheduled, now):
+def quiet_check(store, config, previous, observation, scheduled, now, *, dry_run=False):
     import execute
     path = store / 'quiet-check.json'
     token = read_lock(store)['token'] if (store / 'run.lock').exists() else None
-    if token is not None and path.exists():
+    if not dry_run and token is not None and path.exists():
         cached = parse_json(read_text(path), path)
         known_keys(cached, {'token', 'decision', 'positions'}, str(path))
         if cached.get('token') == token:
@@ -1219,14 +1244,20 @@ def quiet_check(store, config, previous, observation, scheduled, now):
     elif not observed[1]:
         decision = {'decision': 'full', 'reason': 'arrival or changed ids'}
     else:
-        with (store / 'history.log').open('a', encoding='utf-8') as out:
-            out.write(now.astimezone(timezone.utc).isoformat() + ' skipped: no new mail\n')
+        if not dry_run:
+            with (store / 'history.log').open('a', encoding='utf-8') as out:
+                out.write(now.astimezone(timezone.utc).isoformat() + ' skipped: no new mail\n')
         decision = {'decision': 'skip', 'reason': 'no new mail'}
+    if observed is not None and not observed[0]:
+        decision = {'decision': 'full', 'reason': 'account errors'}
     if (observed and scheduled and 'schedule' in config
             and schedule_slot(config, now).strftime('%H:%M') not in config['schedule']['always_full']
             and not (store / 'run-message.md').exists()):
         decision['quiet_accounts'] = observed[2]
-    if token is not None:
+    if dry_run:
+        decision['dry_run'] = True
+        decision['positions'] = observed[0] if observed else {}
+    elif token is not None:
         execute.atomic(path, dict(token=token, decision=decision, positions=observed[0] if observed else None))
     return decision
 
@@ -1368,10 +1399,12 @@ def validate_inputs(listing, config, previous):
     for account, fields in accounts.items():
         if account in {'version', '_positions', '_drafts'}:
             raise ValueError('config.accounts._positions: reserved state key')
-        known_keys(fields, {'address', 'executor_app', 'executor_account', 'quiet_kind', 'provider'}, 'config.accounts.' + account)
+        known_keys(fields, {'name', 'address', 'executor_app', 'executor_account', 'quiet_kind', 'provider'}, 'config.accounts.' + account)
         for key, value in fields.items():
             if not isinstance(value, str) or not value.strip():
                 raise ValueError('config.accounts.' + account + '.' + key + ': expected a non-empty string')
+        if 'name' in fields and (len(fields['name']) > 80 or fields['name'] != fields['name'].strip() or any(unicodedata.category(c) in {'Cc', 'Cf', 'Cs', 'Zl', 'Zp'} for c in fields['name'])):
+            raise ValueError('config.accounts.' + account + '.name: expected a plain single-line string of 1 to 80 characters')
         if 'executor_app' in fields and not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', fields['executor_app']):
             raise ValueError('config.accounts.' + account + '.executor_app: expected safe app slug')
         if 'provider' in fields and fields['provider'] not in ('gmail', 'outlook'):
@@ -1424,6 +1457,11 @@ def validate_inputs(listing, config, previous):
             known_keys(folder, {'id', 'name'}, 'Inbox.folders.' + account)
             if any(not isinstance(folder.get(k), str) for k in ('id', 'name')):
                 raise ValueError('Inbox.folders.' + account + ': expected id and name strings')
+    for account, fields in accounts.items():
+        name = fields.get('name', account).casefold()
+        if any(other != account and name in {other.casefold(), value.get('name', other).casefold()}
+               for other, value in accounts.items()):
+            raise ValueError('config.accounts.' + account + '.name: expected a unique name distinct from other account handles')
     known_keys(previous, set(accounts) | {'version', '_positions', '_drafts'}, 'state.json')
     validate_drafts(previous.get('_drafts', []), config)
     if '_positions' in previous:
@@ -1443,7 +1481,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
     totals = listing['accounts']
     not_listed = [a for a in config['accounts'] if a not in totals and a not in listing.get('quiet', [])]
     if set(totals) - set(config['accounts']) or not set(totals) & set(config['accounts']):
-        return {'relist_inbox': config.get('relist_inbox', 'all'),
+        return {'account_names': {a: f.get('name', a) for a, f in config['accounts'].items()}, 'relist_inbox': config.get('relist_inbox', 'all'),
                 'remaining': [dict(account=m['account'], id=m['id'], sender=m['sender'], subject=m['subject'], reason='Run stopped') for m in messages], 'actions': [],
                 'decisions': [{'account': m['account'], 'id': m['id'], 'reason': 'Protected by never-touch' if any(matches(m, h, protection=True) for h in never_touch) else 'Run stopped'} for m in messages],
                 'reasons': list(stop_reasons) + ['Listing has an unconfigured account' if set(totals) - set(config['accounts']) else 'No configured account listed'],
@@ -1570,9 +1608,12 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         allowed = max(BRAKE_FLOOR, totals[account] // 5)
         if count > allowed:
             reasons.append(f'Rule exceeds twenty percent of account total: {rule}, {account} ({count} matches, total {totals[account]}, allowed {allowed})')
+    refused = {(a['account'], a['id']) for a in actions if any(
+        r.startswith('Rule exceeds twenty percent of account total: ' + a['rule'] + ', ' + a['account'] + ' (')
+        for r in reasons)}
     if reasons:
         actions = []
-        decisions = [{'account': m['account'], 'id': m['id'], 'reason': 'Protected by never-touch' if any(matches(m, h, protection=True) for h in never_touch) else 'Run stopped'} for m in messages]
+        decisions = [{'account': m['account'], 'id': m['id'], 'reason': 'Protected by never-touch' if any(matches(m, h, protection=True) for h in never_touch) else 'Run stopped; rule refused by brake' if (m['account'], m['id']) in refused else 'Run stopped'} for m in messages]
     validate_actions(actions, listing)
     expected = dict(counts)
     for action in actions:
@@ -1580,7 +1621,8 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
             expected[action['account']] -= 1
     result = {'actions': actions, 'decisions': decisions, 'reasons': reasons, 'counts': counts,
             'expected_counts': expected, 'not_listed': not_listed, 'skip_reasons': {a:listing.get('skipped', {}).get(a, 'pigeon error (listing answer)') for a in not_listed},
-            'relist_inbox': config.get('relist_inbox', 'all')}
+            'relist_inbox': config.get('relist_inbox', 'all'),
+            'account_names': {a: f.get('name', a) for a, f in config['accounts'].items()}}
     result['remaining'] = remaining_items(result, listing)
     for item in result['remaining']:
         for record in (previous or {}).get('_drafts', []):
@@ -1659,7 +1701,7 @@ def read_numbers(store):
     return data
 
 
-def number_decisions(store, plan, listing):
+def number_decisions(store, plan, listing, *, read_only=False):
     import execute
     data = read_numbers(store)
     protected = {(i['account'], i['id']) for i in plan['decisions'] + plan.get('remaining', []) if i['reason'] == 'Protected by never-touch'}
@@ -1678,7 +1720,12 @@ def number_decisions(store, plan, listing):
         key = (item['account'], item['id'])
         if key in kept and item['reason'] == 'No matching rule':
             item['reason'] = 'Kept by owner reply'
-        item.setdefault('previously_listed', key in lookup)
+        if not read_only or key in lookup:
+            item.setdefault('previously_listed', key in lookup)
+        if read_only:
+            continue
+        if key not in lookup and item['account'] in listing.get('skipped', {}) and key not in {(d['account'], d['id']) for d in plan['decisions']}:
+            continue
         if key not in lookup:
             lookup[key] = data['next']
             data['items'].append(dict(number=data['next'], account=key[0], id=key[1]))
@@ -1687,7 +1734,8 @@ def number_decisions(store, plan, listing):
         for decision in plan['decisions']:
             if (decision['account'], decision['id']) == key:
                 decision['number'] = lookup[key]
-    execute.atomic(store / 'numbers.json', data)
+    if not read_only:
+        execute.atomic(store / 'numbers.json', data)
 
 
 def parse_reply(text):
@@ -1814,24 +1862,160 @@ def safe_unsubscribe_host(url):
     return host if valid else None
 
 
-def render_remaining(plan, listing, language='en'):
-    lines = []
+def account_name(plan, account):
+    return chat_text(plan.get('account_names', {}).get(account, account))
+
+
+def account_reason(plan, value):
+    names = plan.get('account_names', {})
+    return re.sub(r'(?<![\w.-])(' + '|'.join(re.escape(a) for a in names) + r')(?![\w.-])', lambda m: names[m[0]], chat_text(value)) if names else chat_text(value)
+
+
+def reply_hint(items, language, listing=None):
+    numbered = [i for i in items if 'number' in i]
+    if not numbered:
+        return []
+    n = str(numbered[0]['number'])
+    folders = (listing or {}).get('folders', {}).get(numbered[0]['account'], [])
+    target = None
+    for folder in folders:
+        name = folder.get('name', '')
+        try:
+            parts = parse_reply(n + ' move to ' + name)
+        except ValueError:
+            continue
+        if (len(parts) == 1 and parts[0]['target'] == name
+                and sum(f['name'].casefold() == name.casefold() for f in folders) == 1):
+            target = name
+            break
+    examples = ', '.join(n + ' ' + action for action in (['trash', 'archive', 'spam'] + (['move to ' + target] if target else []) + ['leave', 'yes', 'no']))
+    return [('Reply with a number and action, for example: ' if language == 'en' else 'Responde con un número y una acción, por ejemplo: ') + examples]
+
+
+def action_label(action, listing, language='en', planned=False):
+    verb = 'draft' if action['action'] == 'create-draft' and language == 'en' else action['action']
+    if language == 'es':
+        verb = {'trash': 'eliminar', 'archive': 'archivar', 'move': 'mover', 'spam': 'marcar como spam', 'unsubscribe': 'dar de baja', 'create-draft': 'crear borrador'}.get(verb, verb)
+    if action['action'] == 'move':
+        target = action.get('target_path', action.get('target', ''))
+        target = next((f['name'] for f in listing.get('folders', {}).get(action['account'], []) if f['id'] == target), target)
+        verb += (' to ' if language == 'en' else ' a ') + chat_text(target)
+    return (('would ' if language == 'en' else 'previsto: ') if planned else '') + verb
+
+
+def message_outcomes(plan, listing, items, observed=None, language='en', *, known_left=None, final_listing=None):
+    """Classify message presentation once for real and rehearsal messages."""
+    if final_listing is not None:
+        if final_listing:
+            present = {(m['account'], m['id']) for m in final_listing['messages']}
+            known_left = {(m['account'], m['id']) for m in listing['messages']
+                          if m['account'] in final_listing['accounts'] and (m['account'], m['id']) not in present}
+        else:
+            known_left = {(a['account'], a['id']) for a, r in zip(plan['actions'], observed or [])
+                          if a['action'] in REMOVALS and r['status'] == 'executed'}
+    marks = {(i['account'], i['id']): i for i in plan.get('remaining', [])}
+    messages = {(m['account'], m['id']): m for m in listing['messages']}
+    remaining = {(i['account'], i['id']): dict(i) for i in items}
+    handled, unfinished = {}, {}
+    for index, action in enumerate(plan['actions']):
+        if action['action'] == 'create-folder': continue
+        if observed is not None and (index >= len(observed) or observed[index]['status'] != 'executed'):
+            status = observed[index]['status'] if index < len(observed) else 'unexecuted'
+            unfinished.setdefault((action['account'], action['id']), []).append((action, status))
+            continue
+        handled.setdefault((action['account'], action['id']), []).append(action)
+    outcomes = []
+    for key in dict.fromkeys([*remaining, *handled, *unfinished]):
+        item = remaining[key] if key in remaining else dict(messages[key], reason='No matching rule')
+        item['previously_listed'] = marks.get(key, {}).get('previously_listed', item.get('previously_listed', False))
+        hidden = plan.get('relist_inbox') == 'new_plus_count' and item['previously_listed']
+        kind = ('handled' if key in handled else 'protected' if item['reason'] == 'Protected by never-touch'
+                else 'previously listed' if hidden else 'kept by owner reply' if marks.get(key, {}).get('reason') == 'Kept by owner reply'
+                else 'numbered for owner' if owner_items(plan, [item], numbered=observed is not None) else 'not answerable')
+        inline = plan.get('dry_run') and kind == 'handled'
+        visible = not hidden or kind == 'handled' or key in unfinished
+        status_words = ({'failed': 'failed', 'unconfirmed': 'action not confirmed',
+                         'unexecuted': 'not attempted', 'unsubscribe_not_attempted': 'not attempted',
+                         'unsubscribe_not_executable': 'not executable', 'issued_unknown': 'result unknown',
+                         'skipped': 'skipped'} if language == 'en' else
+                        {'failed': 'falló', 'unconfirmed': 'acción no confirmada',
+                         'unexecuted': 'no intentado', 'unsubscribe_not_attempted': 'no intentado',
+                         'unsubscribe_not_executable': 'no ejecutable', 'issued_unknown': 'resultado desconocido',
+                         'skipped': 'omitido'})
+        failure = ', '.join(action_label(a, listing, language) + ' ' + status_words[status]
+                            for a, status in unfinished.get(key, []))
+        if inline:
+            item['reason'] = ', '.join(action_label(a, listing, language, planned=True) for a in handled[key])
+            item.pop('number', None)
+        elif key in handled and key in remaining:
+            labels = {'create-draft': 'draft created', 'unsubscribe': 'unsubscribed'} if language == 'en' else {'create-draft': 'borrador creado', 'unsubscribe': 'baja realizada'}
+            done = ', '.join(labels.get(a['action'], item['reason']) for a in handled[key])
+            if key in unfinished:
+                item.pop('number', None)
+                item['reason'] = done + '; ' + failure
+            else:
+                item['reason'] = done
+        planned = [a for a in plan['actions'] if a['action'] != 'create-folder' and (a['account'], a['id']) == key]
+        left = key not in remaining if known_left is None else key in known_left
+        section = 'handled' if left and planned and not plan.get('dry_run') else 'inbox'
+        if planned:
+            visible, hidden = True, False
+        reason = item['reason'].replace('unconfirmed', 'action not confirmed')
+        if item['account'] in listing.get('skipped', {}):
+            reason = re.sub(r': (?:provider|pigeon) error \([^)]*\)', '', reason)
+        if language == 'es':
+            for source, target in {'Protected by never-touch': 'Protegido por never-touch', 'Run stopped': 'Ejecución detenida', 'action not confirmed': 'acción no confirmada', 'rule refused by brake': 'regla rechazada por el freno', 'failed': 'falló', 'unexecuted': 'sin ejecutar', 'issued_unknown': 'resultado desconocido'}.items():
+                reason = reason.replace(source, target)
+        if section == 'handled':
+            completed = handled.get(key, []) or planned
+            tag = ', '.join(action_label(a, listing, language) for a in completed)
+            if failure: tag += ' (' + failure + ')'
+        else:
+            tag = '' if reason == 'No matching rule' else reason
+            if failure:
+                done = ', '.join(action_label(a, listing, language) for a in handled.get(key, []))
+                tag = (done + '; ' if done else '') + failure
+                item.pop('number', None)
+            if not owner_items(plan, [item], numbered=True) and not inline:
+                item.pop('number', None)
+        outcomes.append(dict(item=item, kind=kind, actions=handled.get(key, []), failure=failure,
+                             visible=visible, hidden=hidden, remaining=section == 'inbox', section=section, tag=tag,
+                             owner=section == 'inbox' and visible and (
+                                 bool(owner_items(plan, [item])) and not any(a['action'] in REMOVALS for a in planned)
+                                 if plan.get('dry_run') else 'number' in item)))
+    return outcomes
+
+
+def render_remaining(plan, listing, language='en', *, outcomes=None):
+    lines, empty_accounts, shown = [], [], []
+    if outcomes is None:
+        outcomes = message_outcomes(plan, listing, plan.get('remaining', remaining_items(plan, listing)), None if plan.get('dry_run') else [], language)
     for account in plan['counts']:
         if account not in listing['accounts']: continue
-        items = [i for i in plan.get('remaining', remaining_items(plan, listing)) if i['account'] == account]
-        lines.append(chat_text(account) + ': ' + str(len(items)))
+        account_outcomes = [o for o in outcomes if o['item']['account'] == account and o['section'] == 'inbox']
+        items = [o['item'] for o in account_outcomes]
+        name = account_name(plan, account)
+        if not items:
+            if account not in listing.get('skipped', {}):
+                empty_accounts.append(name)
+            continue
+        lines.append(name + ': ' + str(len(items)))
         hidden = 0
-        for item in items:
-            if plan.get('relist_inbox') == 'new_plus_count' and item.get('previously_listed'):
-                hidden += 1
-                continue
+        for outcome in account_outcomes:
+            item = outcome['item']
+            if outcome['hidden'] and not outcome['visible']: hidden += 1
+            if not outcome['visible']: continue
+            shown.append(item)
+            reason = outcome['tag']
             lines.append((str(item['number']) + '. ' if 'number' in item else '- ') +
-                         chat_text(account + ': ' + chat_text(item['sender'])[:160] + ' · ' + chat_text(item['subject'])[:240]) +
-                         ' (' + chat_text(item['reason']) + ')' +
+                         chat_text(item['sender'])[:160] + ' · ' + chat_text(item['subject'])[:240] +
+                         (' (' + chat_text(reason) + ')' if reason else '') +
                          (' · ' + chat_text(item['question']) if 'question' in item else ''))
         if plan.get('relist_inbox') == 'new_plus_count':
-            lines.append(chat_text(account) + ': ' + str(hidden) +
-                         (' previously listed' if language == 'en' else ' ya enumerados'))
+            lines.append(str(hidden) + (' previously listed' if language == 'en' else ' ya enumerados'))
+    if empty_accounts:
+        lines.append(', '.join(empty_accounts) + (': empty' if language == 'en' else ': vacío'))
+    lines += reply_hint(shown, language, listing)
     return lines
 
 
@@ -1839,11 +2023,10 @@ def render_drafts(plan, listing, results=None):
     actions = [(i, a) for i, a in enumerate(plan['actions']) if a['action'] == 'create-draft']
     if not actions:
         return []
-    lookup = {(m['account'], m['id']): m for m in listing['messages']}
     lines = ['', 'Drafts', '']
     for i, action in actions:
         status = 'would create' if plan.get('dry_run') else (results[i]['status'] if results is not None and i < len(results) else 'planned')
-        lines.append(chat_text(action['account'] + ': ' + action['draft'] + ' · ' + lookup.get((action['account'], action['id']), {}).get('subject', '')) + ' · ' + status)
+        lines.append(chat_text(account_name(plan, action['account']) + ': ' + action['draft']) + ' · ' + status)
         if action['draft_to']:
             lines.append('Recipients: ' + ', '.join(action['draft_to']))
         if status == 'issued_unknown':
@@ -1907,31 +2090,65 @@ def calendar_section(data, config, now):
     return lines
 
 
-def render_report(plan, listing, language='en'):
+def render_report(plan, listing, language='en', store=None):
     empty, stopped = STRINGS[language]
     planned, new = (SECTION_LABELS[language][k] for k in ('planned', 'rules'))
     lookup = {(m['account'], m['id']): m for m in listing['messages']}
-    def describe(item):
-        m = lookup[item['account'], item['id']]
-        return chat_text(item['account'] + ': ' + chat_text(m['sender'])[:160] + ' · ' + chat_text(m['subject'])[:240])
-    lines = ['Inbox: ' + str(sum(plan['counts'].values())) + ' total' + (' · ' if plan['counts'] else '') + ' · '.join(chat_text(a) + ' ' + str(n) for a, n in plan['counts'].items())]
-    lines = [chat_text(a) + ': not listed this run; ' + plan.get('skip_reasons', {}).get(a, 'pigeon error (listing answer)') for a in plan.get('not_listed', [])] + lines
-    lines += [chat_text(a) + ': no new mail' for a in listing.get('quiet', [])]
-    lines += [stopped + ': ' + chat_text(r) for r in plan['reasons']]
+    lines = ['Inbox: ' + str(sum(plan['counts'].values())) + ' total' + (' · ' if plan['counts'] else '') + ' · '.join(account_name(plan, a) + ' ' + str(n) for a, n in plan['counts'].items())]
+    lines = account_problems(plan, listing, store, language) + lines
+    lines += [account_name(plan, a) + ': no new mail' for a in listing.get('quiet', [])]
+    lines += [stopped + ': ' + account_reason(plan, r) for r in plan['reasons']]
     lines += render_drafts(plan, listing)
     if listing['accounts']: lines += ['', SECTION_LABELS[language]['inbox'], ''] + render_remaining(plan, listing, language)
     lines += plan.get('calendar_section', [])
     hosts = {(a['account'], a['id']): safe_unsubscribe_host(a['url']) for a in plan['actions'] if 'url' in a}
     lines += ['', planned, '']
-    lines += ['- ' + a['action'] + ': ' + describe(a) + (' · ' + chat_text(a['target_path']) if 'target_path' in a else '') + (' · ' + chat_text(hosts.get((a['account'], a['id']), '')) if 'url' in a else '') for a in plan['actions'] if a['action'] != 'unsubscribe' or (a['account'], a['id']) in hosts] or [empty]
+    for account in plan['counts']:
+        actions = [a for a in plan['actions'] if a['account'] == account]
+        if not actions: continue
+        lines.append(account_name(plan, account))
+        for action in actions:
+            m = lookup[action['account'], action['id']]
+            lines.append('- ' + action['action'] + ': ' + chat_text(m['sender'])[:160] + ' · ' + chat_text(m['subject'])[:240] + (' · ' + chat_text(action['target_path']) if 'target_path' in action else '') + (' · ' + chat_text(hosts.get((account, action['id']), '')) if 'url' in action else ''))
+    if not plan['actions']: lines.append(empty)
     lines += ['', new, '', empty, '']
     return '\n'.join(lines)
 
 
-def message_opening(store):
+def account_problems(plan, listing, store, language):
+    problems = {a: ('not listed this run', plan.get('skip_reasons', {}).get(a, 'pigeon error (listing answer)')) for a in plan.get('not_listed', [])}
+    problems.update({a: ('final reading failed', r) for a, r in listing.get('skipped', {}).items() if a in plan['counts']})
+    retried = set()
+    for filename in ('listing-exchange.json', 'final-listing-exchange.json', 'quiet-gateway.json'):
+        path = store / filename if store is not None else None
+        if path is not None and path.exists():
+            data = parse_json(read_text(path), path)
+            if data.get('token') == read_lock(store)['token']:
+                retried.update(a for a, n in data.get('attempts', {}).items() if n)
+                retried.update(data.get('retried', []))
+    lines = []
+    for a, (status, reason) in problems.items():
+        if language == 'es':
+            status = 'no incluida en esta ejecución' if status == 'not listed this run' else 'falló la lectura final'
+        lines.append(account_name(plan, a) + ': ' + status + '; ' + reason + (('; retried once' if language == 'en' else '; reintentada una vez') if a in retried else ''))
+    return lines
+
+
+def message_opening(store, plan=None, outcomes=()):
     config = state_config(store)
+    language = config.get('language', 'en')
     started = datetime.fromtimestamp(read_lock(store).get('started', read_lock(store)['created']), ZoneInfo(config.get('timezone', 'UTC')))
-    return '📬 Triage · ' + started.strftime('%A, %Y-%m-%d, %H:%M %Z') + ' · nothing needs you · stopped\n'
+    plan = plan or dict(decisions=[], remaining=[], counts={}, not_listed=[])
+    plan = dict(plan, account_names={a: f.get('name', a) for a, f in config['accounts'].items()})
+    count = owner_count(outcomes)
+    need = (str(count) + (' needs you' if count == 1 else ' need you') if count else 'nothing needs you') if language == 'en' else (str(count) + (' requiere tu decisión' if count == 1 else ' requieren tu decisión') if count else 'nada requiere tu decisión')
+    opening = '📬 Triage · ' + started.strftime('%A, %Y-%m-%d, %H:%M %Z')
+    return opening + ' · ' + need + (' · 0 handled · stopped' if language == 'en' else ' · 0 gestionados · ' + STRINGS[language][1].lower()) + '\n' + ''.join(line + '\n' for line in account_problems(plan, {}, store, language))
+
+
+def require_plan_token(plan, token):
+    if plan.get('run_token') != token:
+        raise ValueError('plan.run_token: expected current run token; plan again')
 
 
 def render_message(store, token, plan_path, results_path, *, now=None):
@@ -1948,59 +2165,79 @@ def render_message(store, token, plan_path, results_path, *, now=None):
         return message_opening(store) + 'Run failed at message: pigeon error (run data refused)\n'
 
 
+def owner_count(outcomes):
+    return sum(o['owner'] for o in outcomes)
+
+
+def owner_items(plan, items, *, numbered=False):
+    protected = {(i['account'], i['id']) for i in plan['decisions'] if i['reason'] == 'Protected by never-touch'}
+    return [i for i in items if (i['account'], i['id']) not in protected
+            and i['reason'] != 'Protected by never-touch'
+            and not (plan.get('relist_inbox') == 'new_plus_count' and i.get('previously_listed'))
+            and (not numbered or ('number' in i and not re.match(r'^(?:failed|unexecuted|unconfirmed|issued_unknown|skipped)(?::|$)', i['reason'])))]
+
+
 def _render_message(store, token, plan_path, results_path, *, now=None):
     import execute
     require_lock(store, token)
     failure_path = store / 'run-refusal.json'
     failure = execute.read(failure_path) if failure_path.exists() else {}
     failure_line = ('Run failed at ' + chat_text(failure.get('stage', 'plan')) + ': ' + chat_text(failure.get('refusal', 'pigeon error (plan unavailable)'))) if failure.get('token') == token else None
+    candidate = execute.read(plan_path) if Path(plan_path).exists() else {}
+    current_plan = candidate.get('run_token') == token
+    if Path(plan_path).exists() and not current_plan and not failure_line:
+        return message_opening(store) + 'Run failed at plan: plan.run_token: expected current run token; plan again\n'
     checkpoint = store / ('execution-' + hashlib.sha256(token.encode()).hexdigest() + '.json')
-    if (failure_line and not checkpoint.exists()) or not Path(plan_path).exists():
+    if not current_plan:
         refusal = failure.get('refusal', 'pigeon error (plan unavailable)') if failure.get('token') == token else 'pigeon error (plan unavailable)'
         stage = failure.get('stage', 'plan') if failure.get('token') == token else 'plan'
         return message_opening(store) + 'Run failed at ' + chat_text(stage) + ': ' + chat_text(refusal) + '\n'
-    plan = execute.read(plan_path)
+    plan = candidate
+    if not checkpoint.exists() and not plan.get('dry_run'):
+        listing = execute.read(store / 'inbox.json')
+        language = state_config(store).get('language', 'en')
+        outcomes = message_outcomes(plan, listing, remaining_items(plan, listing), [], language, known_left=set())
+        reason = failure_line or 'Run failed at execution: pigeon error (results unavailable)'
+        lines = render_remaining(plan, listing, language, outcomes=outcomes)
+        return message_opening(store, plan, outcomes) + reason + '\n' + '\n'.join(lines) + '\n'
     if plan.get('dry_run') is True:
-        if plan.get('run_token') != token:
-            return message_opening(store) + 'Run failed at plan: pigeon error (plan unavailable)\n'
         require_fetched(store, token)
         listing = execute.read(store / 'inbox.json')
         config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')])
         previous = execute.read(store / 'state.json') if (store / 'state.json').exists() else {}
         stops = ['Missing state; prior run records exist'] if not (store / 'state.json').exists() and not plan.get('first_run') else []
         expected = build_plan(listing, rules, holds, config, previous, stops)
+        number_decisions(store, expected, listing, read_only=True)
         if any(plan.get(k) != expected[k] for k in expected):
             raise ValueError('dry-run plan: expected unchanged private inputs and listing')
-        lookup = {(m['account'], m['id']): m for m in listing['messages']}
         language = config.get('language', 'en')
         labels = SECTION_LABELS[language]
-        would = 'would ' if language == 'en' else 'haría '
         lines = ['Dry run', 'Replies to this dry run are not acted on; no reply number is live.'] if language == 'en' else ['Simulación', 'Las respuestas a esta simulación no se aplican; ningún número está activo.']
-        lines = [message_opening(store).strip()] + lines
-        lines += [chat_text(a) + ': not listed this run; ' + r for a, r in plan.get('skip_reasons', {}).items()]
-        lines += [chat_text(a) + ': no new mail' for a in listing.get('quiet', [])]
-        lines += [STRINGS[language][1] + ': ' + chat_text(r) for r in plan['reasons']]
-        lines += ['[' + chat_text(a['rule']) + '] ' + would + chat_text(a['action']) + ': ' + chat_text(a['account'] + ': ' + lookup[a['account'], a['id']]['sender'] + ' · ' + lookup[a['account'], a['id']]['subject']) + (' · ' + chat_text(a.get('target_path', a.get('target'))) if 'target_path' in a or 'target' in a else '') for a in plan['actions']]
+        outcomes = message_outcomes(plan, listing, remaining_items(plan, listing), language=language)
+        count = owner_count(outcomes)
+        need = (str(count) + (' needs you' if count == 1 else ' need you') if count else 'nothing needs you') if language == 'en' else (str(count) + (' requiere tu decisión' if count == 1 else ' requieren tu decisión') if count else 'nada requiere tu decisión')
+        total = len({(a['account'], a['id']) for a in plan['actions'] if a['action'] != 'create-folder'})
+        summary = (str(total) + (' message' if total == 1 else ' messages') + ' would be handled · dry run') if language == 'en' else (str(total) + (' mensaje previsto' if total == 1 else ' mensajes previstos') + ' · simulación')
+        if plan['reasons']:
+            summary += ' · ' + STRINGS[language][1].lower()
+        opening = ' · '.join(message_opening(store).splitlines()[0].split(' · ')[:2])
+        lines = [opening + ' · ' + need + ' · ' + summary] + lines
+        lines[1:1] = account_problems(plan, listing, store, language)
+        lines += [account_name(plan, a) + ': no new mail' for a in listing.get('quiet', [])]
+        lines += [STRINGS[language][1] + ': ' + account_reason(plan, r) for r in plan['reasons']]
         lines += render_drafts(plan, listing)
-        lines += ['', 'Decisions for the owner' if language == 'en' else 'Decisiones para el propietario']
-        lines += [chat_text(i['account'] + ': ' + lookup[i['account'], i['id']]['subject'] + ' · ' + i['reason']) + (' · ' + chat_text(i['question']) if 'question' in i else '') for i in plan['decisions']]
-        lines += ['', labels['inbox']]
-        items = remaining_items(dict(plan, actions=[]), listing)
-        for item in items:
-            actions = [a['action'] for a in plan['actions'] if (a['account'], a['id']) == (item['account'], item['id'])]
-            if actions: item['reason'] = would + ', '.join(actions)
-        lines += render_remaining(dict(plan, actions=[], remaining=items), listing, language)
+        if listing['accounts']: lines += ['', labels['inbox']]
+        lines += render_remaining(plan, listing, language, outcomes=outcomes)
         lines += plan.get('calendar_section', [])
         return '\n'.join(lines) + '\n'
     execution = execute.Execution(store, token, plan_path)
-    if not execution.path.exists():
-        return message_opening(store) + 'Run failed at execution: pigeon error (results unavailable)\n' + '\n'.join(chat_text(a) + ': ' + r for a,r in plan.get('skip_reasons', {}).items()) + '\n'
     results = execute.read(results_path or store / 'results.json')
     if results != {'results': execution.state['results']}:
         raise ValueError('message: results must match this token and plan checkpoint')
     plan = execution.plan
     listing = execution.current_listing(execute.read(store / 'inbox.json'))
     config = parse_toml(load_inputs([store / 'config.toml'])[0], store / 'config.toml')
+    plan = dict(plan, account_names={a: f.get('name', a) for a, f in config['accounts'].items()})
     language = config.get('language', 'en')
     labels = SECTION_LABELS[language]
     observed = list(results['results'])
@@ -2016,35 +2253,36 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
         if key in numbers and item['reason'] != 'Protected by never-touch':
             item['number'] = numbers[key]
         item['previously_listed'] = old.get(key, {}).get('previously_listed', False)
+    outcomes = message_outcomes(plan, execute.read(store / 'inbox.json'), remaining, observed, language,
+                                final_listing=execution.state.get('final_listing', {}))
     handled = {}
-    notes = [chat_text(r) for r in plan['reasons']]
+    for outcome in outcomes:
+        if outcome['section'] == 'handled':
+            handled.setdefault(outcome['item']['account'], []).append(outcome)
+    stop_notes = [account_reason(plan, r) for r in plan['reasons']]
     if execution.stop_reason():
-        notes.insert(0, chat_text(execution.stop_reason()))
+        stop_notes.append(account_reason(plan, execution.stop_reason()))
+    notes = []
     for index, action in enumerate(plan['actions']):
         status = (observed[index]['status'] if index < len(observed) else 'unexecuted')
-        if status == 'executed' and action['action'] != 'create-folder':
-            groups = handled.setdefault(action['action'], {})
-            group = action.get('target_path', action.get('rule', action.get('target', '')))
-            groups[group] = groups.get(group, 0) + 1
-        elif status != 'executed':
-            notes.append(chat_text(action['account'] + ': ' + action['action'] + ': ' + ('not confirmed' if status == 'unconfirmed' else status) + (': ' + observed[index]['reason'] if index < len(observed) and observed[index].get('reason') else '')))
-            if action['action'] == 'create-folder':
-                instruction = ('Check whether this folder exists; create it if absent: ' if status == 'issued_unknown' else 'Create this folder: ')
-                notes.append(chat_text(action['account'] + ': ' + instruction) + chat_text(action['target_path']) + '; dependent messages stay in Inbox this run.')
-    if failure_line: notes.insert(0, failure_line)
-    notes += [chat_text(a) + ': final reading failed; ' + reason for a, reason in listing.get('skipped', {}).items() if a in plan['counts']]
-    notes += [chat_text(a) + ': not listed this run; ' + plan.get('skip_reasons', {}).get(a, 'pigeon error (listing answer)') for a in plan.get('not_listed', [])]
+        if action['action'] == 'create-folder':
+            instruction = 'Check whether this folder exists; create it if absent: ' if status == 'issued_unknown' else 'Create this folder: '
+            notes.append(account_name(plan, action['account']) + ': ' + instruction + chat_text(action['target_path']) + ('; ' + observed[index]['reason'] if index < len(observed) and observed[index].get('reason') else ''))
+    if len(results['results']) != len(plan['actions']) and not (plan['reasons'] or execution.stop_reason()):
+        stop_notes.append('Run ended before all actions completed' if language == 'en' else 'La ejecución terminó antes de completar todas las acciones')
+    if failure_line: stop_notes.append(account_reason(plan, failure_line))
     log = store / 'calls.jsonl'
     for line in read_text(log).splitlines() if log.exists() else []:
         entry = parse_json(line, log)
         if entry['run'] == token and entry['outcome'] == 'unplanned':
-            notes.append('Unplanned call: ' + chat_text(json.dumps(entry, ensure_ascii=True)))
+            notes.append('Unplanned call: ' + chat_text(json.dumps(dict(entry, account=account_name(plan, entry['account'])), ensure_ascii=True)))
     started = datetime.fromtimestamp(read_lock(store).get('started', read_lock(store)['created']), ZoneInfo(config.get('timezone', 'UTC')))
-    count = sum('number' in i for i in remaining)
-    need = (str(count) + (' needs you' if count == 1 else ' need you') if count else 'nothing needs you') if language == 'en' else (str(count) + ' requieren tu decisión' if count else 'nada requiere tu decisión')
-    total = sum(sum(groups.values()) for groups in handled.values())
+    count = owner_count(outcomes)
+    need = (str(count) + (' needs you' if count == 1 else ' need you') if count else 'nothing needs you') if language == 'en' else (str(count) + (' requiere tu decisión' if count == 1 else ' requieren tu decisión') if count else 'nada requiere tu decisión')
+    total = sum(o['section'] == 'handled' or bool(o['actions']) for o in outcomes)
     stopped = bool(plan['reasons']) or bool(execution.stop_reason()) or len(results['results']) != len(plan['actions'])
-    summary = STRINGS[language][1].lower() if stopped else str(total) + (' handled' if language == 'en' else ' gestionados')
+    summary = str(total) + (' handled' if language == 'en' else ' gestionado' if total == 1 else ' gestionados')
+    if stopped: summary += ' · ' + STRINGS[language][1].lower()
     lines = []
     if plan.get('scheduled') and 'schedule' in config:
         slot = schedule_slot(config, started)
@@ -2052,15 +2290,19 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
         if delay > 15:
             lines.append(('Late start: ' if language == 'en' else 'Inicio tardío: ') + slot.strftime('%Y-%m-%d %H:%M %Z') + ', ' + str(delay) + ' min')
     lines.insert(0, '📬 Triage · ' + started.strftime('%A, %Y-%m-%d, %H:%M %Z') + ' · ' + need + ' · ' + summary)
-    lines += [chat_text(a) + ': not listed this run; ' + plan.get('skip_reasons', {}).get(a, 'pigeon error (listing answer)') for a in plan.get('not_listed', [])]
+    problems = account_problems(plan, listing, store, language)
+    lines[1:1] = problems + list(dict.fromkeys(stop_notes))
     if handled:
         lines += ['', labels['handled']]
-        for verb, groups in handled.items():
-            lines.append(chat_text(verb) + ': ' + str(sum(groups.values())) + ' (' + '; '.join(chat_text(k) + ': ' + str(v) for k, v in groups.items()) + ')')
+        for account, actions in handled.items():
+            lines.append(account_name(plan, account))
+            for outcome in actions:
+                m = outcome['item']
+                lines.append('- ' + outcome['tag'] + ': ' + chat_text(m['sender'])[:160] + ' · ' + chat_text(m['subject'])[:240])
     lines += render_drafts(plan, execute.read(store / 'inbox.json'), observed)
     confirmed = dict(plan, remaining=remaining)
-    lines += [chat_text(a) + ': no new mail' for a in listing.get('quiet', [])]
-    if listing['accounts']: lines += ['', labels['inbox'], ''] + render_remaining(confirmed, listing, language)
+    lines += [account_name(plan, a) + ': no new mail' for a in listing.get('quiet', [])]
+    if listing['accounts']: lines += ['', labels['inbox'], ''] + render_remaining(confirmed, listing, language, outcomes=outcomes)
     lines += plan.get('calendar_section', [])
     if notes:
         lines += ['', labels['notes'], ''] + notes
@@ -2195,9 +2437,10 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
             except ValueError as error:
                 raise ValueError(str(path) + ': ' + str(error)) from error
         plan = read(plan_path)
+        require_plan_token(plan, token)
         if plan.get('dry_run'):
             raise ValueError('dry-run plan: commit-state is refused')
-        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled'}, str(plan_path))
+        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token'}, str(plan_path))
         for key in ('actions', 'reasons', 'not_listed'):
             if not isinstance(plan.get(key), list):
                 raise ValueError(str(plan_path) + '.' + key + ': expected an array')
@@ -2320,7 +2563,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
             previous['_drafts'] = records
         number_decisions(store, confirmed, listing)
         language = config.get('language', 'en')
-        report = render_report(confirmed, listing, language)
+        report = render_report(confirmed, listing, language, store)
         marker = '**' + SECTION_LABELS[language]['inbox'] + '**'
         report = report.replace(marker, '\n'.join(render_drafts(plan, read(store / 'inbox.json'), observed)) + '\n' + marker, 1)
         (store / 'report.md').write_text(report, encoding='utf-8')
@@ -2380,15 +2623,30 @@ def provider_failed(value):
 
 
 def provider_error(value):
-    if isinstance(value, dict):
+    nodes = []
+    def collect(node):
+        if isinstance(node, dict):
+            nodes.append(node)
+            for key in ('error', 'value'):
+                collect(node.get(key))
+    collect(value)
+    for node in nodes:
         for key in ('status', 'statusCode', 'code'):
-            code = value.get(key)
+            code = node.get(key)
             if (type(code) is int and code >= 100 and len(str(code)) <= 40) or (isinstance(code, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,40}', code)):
                 return 'provider error (' + str(code) + ')'
-        for key in ('error', 'value'):
-            if isinstance(value.get(key), dict):
-                reason = provider_error(value[key])
-                if reason != 'provider error (no status)': return reason
+    for node in nodes:
+        error = node.get('error')
+        if isinstance(error, dict):
+            message = error.get('message')
+            match = re.search(r'HTTP ([1-5][0-9]{2})(?![0-9])', message) if isinstance(message, str) else None
+            if match:
+                return 'provider error (' + match[1] + ')'
+    for node in nodes:
+        error = node.get('error')
+        kind = error.get('kind') if isinstance(error, dict) else None
+        if isinstance(kind, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,40}', kind):
+            return 'provider error (' + kind + ')'
     return 'provider error (no status)'
 
 
@@ -2721,10 +2979,10 @@ def consume_listing(state, job, value, config, ids_only):
         enqueue(**{k:v for k,v in job.items() if k!='account' and k!='page'},page=page)
 
 
-def quiet_gateway(store, token, config, previous, results=None):
+def quiet_gateway(store, token, config, previous, results=None, *, dry_run=False, progress=None):
     import execute
     path = store/'quiet-gateway.json'
-    state = parse_json(read_text(path),path) if path.exists() else {}
+    state = (progress or {}) if dry_run else (parse_json(read_text(path),path) if path.exists() else {})
     if state.get('token') != token:
         if results is not None: raise ValueError('quiet-check: no pending batch')
         state = dict(token=token,round=0,queue=[],pending=[],observations={},seen={})
@@ -2737,6 +2995,8 @@ def quiet_gateway(store, token, config, previous, results=None):
             if kind=='profile' and a in previous.get('_positions',{}):
                 state['queue'].append(dict(account=a,kind='history',id=previous['_positions'][a]))
             state['observations'][a] = dict(outcome='ok',position=None,arrivals=[]) if kind=='profile' else dict(outcome='ok',ids=[])
+        state['initial'] = list(state['queue'])
+        state['retried'] = []
     if results is not None:
         values = gateway_results(results, len(state['pending']))
         for j,v in zip(state['pending'],values):
@@ -2773,13 +3033,22 @@ def quiet_gateway(store, token, config, previous, results=None):
             except (ValueError,TypeError,KeyError,AttributeError):
                 entry['outcome']='error'
                 entry['reason'] = provider_error(v) if provider_failed(v) else 'pigeon error (listing answer)'
-                print('Quiet check: '+safe_text(a)+': '+entry['reason']+'; full run',file=sys.stderr)
+
         state['pending']=[]
+        failed = {a for a, entry in state['observations'].items() if entry['outcome'] == 'error'}
+        state['queue'] = [j for j in state['queue'] if j['account'] not in failed]
+        for a in config['accounts']:
+            if a in failed and a not in state['retried']:
+                state['retried'].append(a)
+                state['queue'] += [j for j in state['initial'] if j['account'] == a]
+                state['seen'].pop(a, None)
+                state['observations'][a] = dict(outcome='ok',position=None,arrivals=[]) if config['accounts'][a]['provider']=='gmail' else dict(outcome='ok',ids=[])
     if not state['pending']:
         state['pending']=state['queue'][:LISTING_BATCH];state['queue']=state['queue'][LISTING_BATCH:]
         if state['pending']: state['round']+=1
-    execute.atomic(path,state)
+    if not dry_run: execute.atomic(path,state)
     if not state['pending']:
+        if dry_run: return dict(observations=state['observations'])
         observation=store/'quiet-observation.json'
         execute.atomic(observation,state['observations'])
         return observation
@@ -2789,10 +3058,14 @@ def quiet_gateway(store, token, config, previous, results=None):
         if j['kind']=='ids':
             call['input']['input']['query'].update({'$select':['id'],'$top':NEWEST_IDS})
         calls.append(call)
-    return dict(calls=calls,round=state['round'],batches_remaining=(len(state['queue'])+LISTING_BATCH-1)//LISTING_BATCH)
+    response = dict(calls=calls,round=state['round'],batches_remaining=(len(state['queue'])+LISTING_BATCH-1)//LISTING_BATCH)
+    if dry_run: response['progress'] = state
+    return response
 
 
 def record_refusal(arguments, error):
+    if arguments and (arguments[0] == 'dry-run' or arguments[0] == 'quiet-check' and '--dry-run' in arguments):
+        return
     if '--token' not in arguments: return
     try:
         import execute
@@ -2869,6 +3142,8 @@ def _main(argv=None, *, now=None):
     quiet.add_argument('--observation')
     quiet.add_argument('--results', help='Gateway array: docs/quickstart.md#gateway-results')
     quiet.add_argument('--scheduled', action='store_true')
+    quiet.add_argument('--dry-run', action='store_true')
+    quiet.add_argument('--progress', help='Saved dry-run quiet response')
     for command_name in ('plan', 'reply'):
         plan = sub.add_parser(command_name, allow_abbrev=False)
         if command_name == 'plan':
@@ -2968,7 +3243,10 @@ def _main(argv=None, *, now=None):
     elif args.command == 'finish-run':
         print(json.dumps(finish_run(store, args.token, args.plan, args.observation, now=now), ensure_ascii=True))
     elif args.command == 'commit-state':
-        if parse_json(load_inputs([args.plan])[0], args.plan).get('dry_run'):
+        require_lock(store, args.token)
+        plan = parse_json(load_inputs([args.plan])[0], args.plan)
+        require_plan_token(plan, args.token)
+        if plan.get('dry_run'):
             raise ValueError('dry-run plan: commit-state is refused')
         if store_lock_setting(store)['kind'] == 'onedrive':
             result = drive_lock(store, 'commit', args.token, args.lock_observation, now=now)
@@ -2995,7 +3273,12 @@ def _main(argv=None, *, now=None):
                 raise ValueError(str(config_path) + ': ' + str(error)) from error
             now = now or datetime.now(timezone.utc)
             if args.results is not None or (args.observation is None and all(f.get('provider') for f in config['accounts'].values())):
-                result = quiet_gateway(store, args.token, config, previous, args.results)
+                if args.progress and not args.dry_run: raise ValueError('--progress: requires --dry-run')
+                progress = parse_json(load_inputs([args.progress])[0], args.progress).get('progress') if args.progress else None
+                result = quiet_gateway(store, args.token, config, previous, args.results, dry_run=args.dry_run, progress=progress)
+                if args.dry_run and 'observations' in result:
+                    print(json.dumps(quiet_check(store, config, previous, result['observations'], args.scheduled, now, dry_run=True), sort_keys=True))
+                    return
                 if isinstance(result, dict):
                     print(json.dumps(result, ensure_ascii=True))
                 else:
@@ -3014,7 +3297,7 @@ def _main(argv=None, *, now=None):
                     reads[account].update(gateway_account(config, account))
                 print(json.dumps({'reads': reads}, sort_keys=True))
             else:
-                print(json.dumps(quiet_check(store, config, previous, args.observation, args.scheduled, now), sort_keys=True))
+                print(json.dumps(quiet_check(store, config, previous, args.observation, args.scheduled, now, dry_run=args.dry_run), sort_keys=True))
     else:
         sources = [getattr(args, n.replace('-', '_')) or store / (n + ('.md' if n == 'guardrails' else '.toml')) for n in ('config', 'rules', 'never-touch', 'guardrails')]
         protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'numbers.json', 'reply.json', 'reply.txt', 'decisions.jsonl', 'history.log', 'run-message.md', 'quiet-observation.json', 'positions-observation.json', 'quiet-check.json', 'lock-exchange.json', 'lock-observation.json', 'lock-commit-observation.json', 'state-exchange.json', 'finish-exchange.json', 'final-inbox.json', 'state-incoming', 'state-outgoing', 'state-observation.json', 'upload-observation.json', 'state-lock-observation.json', 'tool-paths.json', 'cases.toml', 'run-refusal.json', 'inbox.json', 'config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')}
@@ -3029,6 +3312,8 @@ def _main(argv=None, *, now=None):
                     protected.add(candidate)
         # Keep the gate for the whole read/plan/write interval, excluding takeover.
         try:
+            if getattr(args, 'dry_run', False) and args.report_out:
+                raise ValueError('--report-out: a dry run writes no report; omit --report-out')
             for flag, name in (('--plan-out', args.plan_out), ('--report-out', args.report_out)):
                 if name and Path(name).expanduser().resolve() in protected:
                     raise ValueError(flag + ': expected a path other than an input, state or lock file')
@@ -3088,14 +3373,15 @@ def _main(argv=None, *, now=None):
                 if args.command == 'plan' and config.get('calendars'):
                     data = parse_json(load_inputs([args.calendar])[0], args.calendar) if args.calendar else {}
                     result['calendar_section'] = calendar_section(data, config, now or datetime.now(timezone.utc))
+                result['run_token'] = args.token
                 if getattr(args, 'dry_run', False):
                     result['dry_run'] = True
-                    result['run_token'] = args.token
+                    number_decisions(store, result, listing, read_only=True)
                 else:
                     number_decisions(store, result, listing)
                 result['first_run'] = first_run
                 if args.scheduled: result['scheduled'] = True
-                report = render_report(result, listing, config.get('language', 'en'))
+                report = render_report(result, listing, config.get('language', 'en'), store)
                 if args.scheduled and 'schedule' in config:
                     now = now or datetime.now(timezone.utc)
                     slot = schedule_slot(config, now)

@@ -1,3 +1,4 @@
+from mock_provider import save_plan
 import http.client
 import http.server
 import ipaddress
@@ -130,7 +131,7 @@ class FlowTests(unittest.TestCase):
         execute.atomic(self.store / 'inbox.json', listing)
         plan = triage.build_plan(listing, triage.parse_rules((self.store / 'rules.toml').read_text()), [], {'accounts': {'cedar': {}}})
         plan['first_run'] = True
-        execute.atomic(self.store / 'plan.json', plan)
+        save_plan(self.store, self.token, self.store / 'plan.json', plan)
         return execute.Execution(self.store, self.token, self.store / 'plan.json')
 
     def test_unsafe_unsubscribe_is_decision_without_companion(self):
@@ -279,7 +280,7 @@ class FlowTests(unittest.TestCase):
         (self.store / 'rules.toml').write_text('[[rules]]\nid="leave"\naccounts=["cedar"]\nsubject="Weekly"\naction="unsubscribe"\n')
         plan = triage.build_plan(listing, rules, [], {'accounts': {'cedar': {}}})
         plan['first_run'] = True
-        execute.atomic(self.store / 'plan.json', plan)
+        save_plan(self.store, self.token, self.store / 'plan.json', plan)
         machine = execute.Execution(self.store, self.token, self.store / 'plan.json')
         for _ in range(2):
             machine.step()

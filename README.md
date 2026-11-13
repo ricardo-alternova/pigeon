@@ -4,7 +4,7 @@ pigeon is an MIT-licensed email triage kit. An AI assistant carries calls throug
 
 ## Quick start
 
-Give your hosted assistant this repository and the instruction: "Follow AGENTS.md for one scheduled Inbox triage and send the standard run message." Use [the routine quick start](docs/quickstart.md). Complete [hosted setup](docs/setup.md#hosted-setup), including the [host requirements](docs/setup.md#host-requirements) and [storage choice](docs/setup.md#storage-choice).
+Give your hosted assistant this repository and the instruction: "Follow AGENTS.md for one scheduled Inbox triage and send the standard run message." Use [the routine quick start](docs/quickstart.md). Complete [hosted setup](docs/hosted-setup.md#hosted-setup), including the [host requirements](docs/hosted-setup.md#host-requirements) and [storage choice](docs/hosted-setup.md#storage-choice).
 
 ### Developer machine
 
@@ -29,7 +29,7 @@ trap - EXIT
 ```
 <!-- /quick-start -->
 
-Compare the plain-text report with tests/fixtures/expected-report.md. The demo prints addresses unchanged and uses plain section titles. The final command prints "released". For real mail, follow [setup](docs/setup.md).
+Compare the plain-text report with tests/fixtures/expected-report.md. The demo prints addresses unchanged and uses plain section titles. The final command prints "released". For real mail, follow [hosted setup](docs/hosted-setup.md).
 
 ## Contributions
 

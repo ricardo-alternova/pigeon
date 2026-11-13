@@ -1,3 +1,4 @@
+from mock_provider import save_plan
 import json
 from datetime import datetime, timezone
 import os
@@ -15,6 +16,34 @@ import execute
 
 
 class LockTests(unittest.TestCase):
+    def test_release_cleanup_failure_unlocks(self):
+        from unittest.mock import patch
+        for regular in (True, False):
+            with self.subTest(regular=regular), tempfile.TemporaryDirectory() as tmp:
+                store = Path(tmp)
+                shutil.copyfile(ROOT / 'config/config.example.toml', store / 'config.toml')
+                token = triage.acquire(store)
+                folder = store / triage.SIMULATION_DIR
+                if regular:
+                    folder.write_text('fixture')
+                else:
+                    folder.mkdir()
+                    (folder / 'blocked').mkdir()
+                    (folder / 'blocked' / 'fixture').write_text('fixture')
+                    (folder / 'blocked').chmod(0o500)
+                with patch('shutil.rmtree', side_effect=PermissionError('private detail')) if not regular else patch('shutil.rmtree', wraps=shutil.rmtree):
+                    result = triage.release(store, token)
+                self.assertFalse((store / 'run.lock').exists())
+                if regular:
+                    self.assertFalse(folder.exists())
+                    self.assertEqual(result, 'released')
+                else:
+                    self.assertEqual(result, 'released; dry-run cleanup failed')
+                    self.assertTrue((folder / 'blocked' / 'fixture').exists())
+                    (folder / 'blocked').chmod(0o700)
+                    triage.clean_simulation(store)
+                    self.assertFalse(folder.exists())
+
     def race(self, stale):
         import fcntl
         with tempfile.TemporaryDirectory() as tmp:
@@ -1042,7 +1071,9 @@ class DriveLockTests(unittest.TestCase):
         from unittest.mock import patch
         token = self.acquire()
         path = self.store / 'plan.json'
-        execute.atomic(path, dict(dry_run=True))
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'never-touch.toml').write_text('allow_empty=true\n')
+        save_plan(self.store, token, path, dict(dry_run=True))
         with patch.object(triage, 'private_store', return_value=self.store), patch.object(triage, 'drive_lock', side_effect=AssertionError('drive call')):
             with self.assertRaisesRegex(ValueError, 'dry-run'):
                 triage.main(['commit-state', '--token', token, '--plan', str(path)])
@@ -1071,7 +1102,7 @@ class DriveLockTests(unittest.TestCase):
         (self.store / 'never-touch.toml').write_text('allow_empty=true\n')
         listing = execute.read(self.store / 'inbox.json')
         plan = triage.build_plan(listing, [], [], triage.state_config(self.store), {})
-        execute.atomic(self.store / 'plan.json', plan)
+        save_plan(self.store, token, self.store / 'plan.json', plan)
         execute.Execution(self.store, token, self.store / 'plan.json').step()
         first = triage.finish_run(self.store, token, self.store / 'plan.json', now=self.now)
         self.assertEqual(first['call']['operation'], 'read')
@@ -1241,6 +1272,33 @@ class DriveLockTests(unittest.TestCase):
             self.observe(self.drive.perform(read['call']))
         self.assertFalse((self.store / 'run.lock').exists())
         self.assertFalse(any(c['operation'] == 'delete' for c in self.drive.calls))
+
+    def test_drive_release_cleanup_failure_unlocks(self):
+        from unittest.mock import patch
+        for regular in (True, False):
+            with self.subTest(regular=regular):
+                created = self.drive.perform(self.start()['call'])
+                read = self.observe(created)
+                token = self.observe(self.drive.perform(read['call']))
+                folder = self.store / triage.SIMULATION_DIR
+                if regular:
+                    folder.write_text('fixture')
+                else:
+                    folder.mkdir()
+                    (folder / 'blocked').mkdir()
+                    (folder / 'blocked' / 'fixture').write_text('fixture')
+                    (folder / 'blocked').chmod(0o500)
+                delete = self.start('release', token)['call']
+                with patch('shutil.rmtree', side_effect=PermissionError('private detail')) if not regular else patch('shutil.rmtree', wraps=shutil.rmtree):
+                    result = self.observe(self.drive.perform(delete), 'release', token)
+                self.assertFalse((self.store / 'run.lock').exists())
+                self.assertFalse((self.store / 'lock-exchange.json').exists())
+                self.assertEqual(result, 'released' if regular else 'released; dry-run cleanup failed')
+                if not regular:
+                    self.assertTrue((folder / 'blocked' / 'fixture').exists())
+                    (folder / 'blocked').chmod(0o700)
+                triage.clean_simulation(self.store)
+                self.assertFalse(folder.exists())
 
     def test_create_tag_never_delete_condition(self):
         created = self.drive.perform(self.start()['call'])
@@ -1639,7 +1697,7 @@ class DriveStateTests(unittest.TestCase):
         listing = execute.read(self.store / 'inbox.json')
         plan = triage.build_plan(listing, [], [], triage.state_config(self.store), {})
         path = self.store / 'plan.json'
-        execute.atomic(path, plan)
+        save_plan(self.store, token, path, plan)
         execute.Execution(self.store, token, path).step()
         first = triage.finish_run(self.store, token, path, now=self.now)
         second = triage.finish_run(self.store, token, path, self.drive.perform(first['call']), now=self.now)

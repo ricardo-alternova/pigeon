@@ -1,5 +1,5 @@
 version = 1
-# Key reference: docs/setup.md#configuration
+# Key reference: docs/hosted-setup.md#configuration
 language = "en"
 relist_inbox = "all"
 # Time zone for schedule slots and the run message.
@@ -13,7 +13,7 @@ inbox_limit = 100
 # weekends = ["10:30", "17:50"]
 # always_full = ["18:10", "17:50"]
 
-# Storage choice: docs/setup.md#storage-choice
+# Storage choice: docs/hosted-setup.md#storage-choice
 # Optional cross-machine lock (omit for the local file lock).
 # [lock]
 # kind = "onedrive"
@@ -29,6 +29,7 @@ inbox_limit = 100
 # Set provider to gmail or outlook to enable scripted listing.
 # provider belongs inside each account table.
 [accounts.cedar]
+name = "cedar"
 # provider = "gmail"
 quiet_kind = "history" # Mailbox supports change history.
 executor_app = "cedar-mail"

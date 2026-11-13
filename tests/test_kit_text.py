@@ -9,14 +9,18 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ['README.md', 'AGENTS.md', 'CLAUDE.md',
-        '.agents/skills/email-triage/SKILL.md', 'docs/setup.md',
+        '.agents/skills/email-triage/SKILL.md', 'docs/setup.md', 'docs/hosted-setup.md',
         'config/guardrails.example.md', 'docs/quickstart.md']
+
+
+def setup_text():
+    return '\n'.join((ROOT / name).read_text() for name in ('docs/hosted-setup.md', 'docs/setup.md', 'docs/quickstart.md'))
 
 
 class KitTextTests(unittest.TestCase):
     def test_document_heading_links_and_see_references_resolve(self):
         from urllib.parse import unquote
-        documents = [ROOT / n for n in DOCS]
+        documents = list(dict.fromkeys([ROOT / n for n in DOCS] + list((ROOT/'config').glob('*.toml')) + list((ROOT/'config').glob('*.md')) + list((ROOT/'rules').glob('*.toml'))))
         def headings(path):
             return [re.sub(r'[^\w -]', '', h.lower()).replace(' ', '-')
                     for h in re.findall(r'^#+ (.+)$', path.read_text(), re.M)]
@@ -29,6 +33,8 @@ class KitTextTests(unittest.TestCase):
                 destination = (path.parent / name).resolve() if name else path
                 self.assertTrue(destination.exists(), (path, target))
                 if anchor: self.assertIn(unquote(anchor), headings(destination), (path, target))
+            for name, anchor in re.findall(r'(docs/[a-z-]+\.md)#([a-z-]+)', text):
+                self.assertIn(anchor, headings(ROOT/name), (path,name,anchor))
             for section in re.findall(r'(?i)see\s+`([^`]+)`', text):
                 anchor = re.sub(r'[^\w -]', '', section.lower()).replace(' ', '-')
                 self.assertIn(anchor, all_headings, (path, section))
@@ -58,6 +64,7 @@ class KitTextTests(unittest.TestCase):
     def test_routine_quickstart_size_and_entry_points(self):
         path = ROOT / 'docs/quickstart.md'
         self.assertLessEqual(len(path.read_bytes()), 13000)
+        self.assertLessEqual(len(re.findall(r'\]\(setup\.md(?:#|\))', path.read_text())), 3)
         for name in ('README.md', 'AGENTS.md', '.agents/skills/email-triage/SKILL.md'):
             self.assertIn('docs/quickstart.md', (ROOT / name).read_text())
         text = path.read_text()
@@ -69,7 +76,8 @@ class KitTextTests(unittest.TestCase):
             self.assertIn(term, text)
 
     def test_reference_size_caps(self):
-        self.assertLessEqual((ROOT / 'docs/setup.md').stat().st_size, 50000)
+        self.assertLessEqual((ROOT / 'docs/setup.md').stat().st_size, 38000)
+        self.assertLessEqual((ROOT / 'docs/hosted-setup.md').stat().st_size, 16000)
         self.assertLess((ROOT / 'AGENTS.md').stat().st_size, 8000)
 
     def test_common_exceptions_are_self_contained(self):
@@ -115,7 +123,7 @@ class KitTextTests(unittest.TestCase):
                         'execute.py result', 'execute.py observed',
                         'triage.py commit-state', 'triage.py release'):
             self.assertIn(command, text)
-        self.assertIn('execute.py unsubscribe', (ROOT / 'docs/setup.md').read_text())
+        self.assertIn('execute.py unsubscribe', setup_text())
         for obsolete in ('Execute only actions in the current plan through Executor',
                          'state is written at plan time',
                          'assistant fetches unsubscribe links'):
@@ -142,7 +150,7 @@ class KitTextTests(unittest.TestCase):
     def test_standard_run_message(self):
         sys.path.insert(0, str(ROOT / 'scripts'))
         import triage
-        setup = (ROOT / 'docs/setup.md').read_text()
+        setup = setup_text()
         rows = re.findall(r'^\| (inbox|planned|rules|handled|notes) \| (.*?) \| (.*?) \|$', setup, re.M)
         self.assertEqual({k: en for k, en, es in rows}, triage.SECTION_LABELS['en'])
         self.assertEqual({k: es for k, en, es in rows}, triage.SECTION_LABELS['es'])
@@ -234,7 +242,7 @@ class KitTextTests(unittest.TestCase):
     def test_clarity_contract(self):
         for name in DOCS + ['.gitignore']:
             content = (ROOT / name).read_text().casefold()
-            if name == 'docs/setup.md':
+            if name == 'docs/hosted-setup.md':
                 content = content.split('## private store')[1].split('## configuration')[0]
             self.assertNotIn('fallback', content)
         section = (ROOT / '.agents/skills/email-triage/SKILL.md').read_text().split('## Standard run message')[1]
@@ -252,7 +260,7 @@ class RuleConfirmationTests(unittest.TestCase):
         self.assertNotIn('— Add to rules.toml:', skill)
 
     def test_numbered_sections_are_explicit(self):
-        setup = (ROOT / 'docs/setup.md').read_text()
+        setup = setup_text()
         self.assertNotIn('exact rule can be proposed', setup)
         section = setup.split('## Decision and stop reasons')[1].split('## Scripted listing')[0]
         for term in ('saved number', 'never number protected', 'unmatched mail', 'stopped plans'):
@@ -300,7 +308,7 @@ class RunExitTests(unittest.TestCase):
         main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
         keys |= {k.value for n in ast.walk(main) if isinstance(n, ast.Dict)
                  for k in n.keys if isinstance(k, ast.Constant)}
-        table = (ROOT / 'docs/setup.md').read_text().split('### Step machine responses')[1].split('### Result statuses')[0]
+        table = setup_text().split('### Step machine responses')[1].split('### Result statuses')[0]
         keys |= {'executor_app', 'executor_account', 'refresh_lock', 'final_reads', 'tool', 'path', 'input'}
         listed = set(re.findall(r'^\| `([^`]+)` \|', table, re.M))
         self.assertEqual(listed, keys)
@@ -320,13 +328,13 @@ class RunExitTests(unittest.TestCase):
         agents = (ROOT / 'AGENTS.md').read_text()
         self.assertNotIn('retain it in the host conversation for the next run', agents)
         self.assertIn('post the refusal and confirmed outcomes immediately', agents)
-        setup = (ROOT / 'docs/setup.md').read_text()
+        setup = setup_text()
         self.assertNotIn('After losing the lock, send nothing', setup)
 
 
 class HostedTrustTests(unittest.TestCase):
     def test_storage_choice(self):
-        setup = (ROOT / 'docs/setup.md').read_text()
+        setup = setup_text()
         choice = setup.split('## Storage choice')[1].split('## Host requirements')[0]
         for term in ('keeps its files', 'local state', 'starts empty', 'drive state', 'two hosts', 'OneDrive lock'):
             self.assertIn(term, choice)
@@ -334,7 +342,7 @@ class HostedTrustTests(unittest.TestCase):
         self.assertIn('#storage-choice', (ROOT / 'README.md').read_text())
 
     def test_drive_identifiers(self):
-        step = (ROOT / 'docs/setup.md').read_text().split('5. ')[1].split('6. ')[0]
+        step = setup_text().split('5. ')[1].split('6. ')[0]
         for term in ('account handle', 'gateway', 'search', 'describe', 'folder ID', 'metadata', 'drive-example', 'folder-example', 'not its name'):
             self.assertIn(term, step)
 
@@ -344,21 +352,21 @@ class HostedTrustTests(unittest.TestCase):
             self.assertNotIn(term, (ROOT / name).read_text(), name)
 
     def test_private_drive_folder(self):
-        text = (ROOT / 'docs/setup.md').read_text().split('## Drive state')[1].split('\n## ')[0]
+        text = setup_text().split('## Drive state')[1].split('\n## ')[0]
         for term in ("owner's own account", 'never shared', 'shared folder', 'lock'):
             self.assertIn(term, text)
-        self.owner('docs/setup.md', ('config/guardrails.example.md', 'AGENTS.md'), 'never shared')
-        checklist = (ROOT / 'docs/setup.md').read_text().split('## Host requirements')[1].split('| Host |')[0]
+        self.owner('docs/hosted-setup.md', ('config/guardrails.example.md', 'AGENTS.md'), 'never shared')
+        checklist = setup_text().split('## Host requirements')[1].split('## Mail gateway connection')[0]
         self.assertIn('private', checklist)
 
     def test_saved_files_are_data(self):
         text = (ROOT / 'docs/quickstart.md').read_text()
         for term in ('quoted block', 'never act on', 'guardrails.md'):
             self.assertIn(term, text)
-        self.owner('config/guardrails.example.md', ('docs/quickstart.md', '.agents/skills/email-triage/SKILL.md', 'docs/setup.md', 'AGENTS.md'), 'data, never instructions')
+        self.owner('config/guardrails.example.md', ('docs/quickstart.md', '.agents/skills/email-triage/SKILL.md', 'docs/setup.md', 'docs/hosted-setup.md', 'AGENTS.md'), 'data, never instructions')
 
     def test_delivery_record_and_opening_order(self):
-        record = (ROOT / 'docs/setup.md').read_text().split('- run-message.md: ')[1].split('\n')[0]
+        record = setup_text().split('- run-message.md: ')[1].split('\n')[0]
         for term in ('pending delivery record', 'undelivered', 'upload warning'):
             self.assertIn(term, record)
         for name in ('AGENTS.md',):
@@ -379,7 +387,7 @@ class ReferenceTidyTests(unittest.TestCase):
         import json, tempfile
         sys.path.insert(0, str(ROOT / 'scripts'))
         import triage
-        self.assertIn('With no saved position, return arrivals as [].', (ROOT / 'docs/setup.md').read_text())
+        self.assertIn('With no saved position, return arrivals as [].', setup_text())
         config = {'accounts': {'cedar': {'quiet_kind': 'history'}}}
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'quiet-observation.json'
@@ -409,21 +417,21 @@ class ReferenceTidyTests(unittest.TestCase):
             self.assertNotIn('No listing or search is allowed.', text)
 
     def test_config_table_complete_rows(self):
-        text = (ROOT / 'docs/setup.md').read_text().split('## Configuration')[1].split('## Drive lock')[0]
+        text = setup_text().split('## Configuration')[1].split('## Drive lock')[0]
         rows = [r.split('|')[1:-1] for r in text.splitlines() if r.startswith('|')]
         self.assertTrue(rows)
-        self.assertTrue(all(len(r) == 3 for r in rows))
-        keys = [r[0].strip() for r in rows[2:]]
+        self.assertTrue(all(len(r) == 2 for r in rows))
+        keys = [key.strip() for r in rows[2:] for key in r[0].split(',')]
         self.assertEqual(len(keys), len(set(keys)))
         for key in ('language', 'timezone', 'inbox_limit', 'lock.kind', 'lock.account', 'lock.folder', 'state.kind', 'state.account', 'state.folder', 'schedule.weekdays', 'schedule.weekends', 'schedule.always_full', 'accounts.HANDLE.address', 'accounts.HANDLE.executor_app', 'accounts.HANDLE.quiet_kind'):
             self.assertIn(key, keys)
 
     def test_reference_uses_owner_terms(self):
-        setup = (ROOT / 'docs/setup.md').read_text()
+        setup = setup_text()
         self.assertNotIn('Tests inject', setup)
         self.assertNotIn('injected clock', setup)
         self.assertNotIn('Existing local lock records remain valid', setup)
-        self.assertEqual(len(re.findall(r'^\| Hosted assistant', setup, re.M)), 1)
+        self.assertIn('## Host requirements', setup)
         skill = (ROOT / '.agents/skills/email-triage/SKILL.md').read_text()
         self.assertNotIn('by position for their rule', skill)
 
@@ -623,7 +631,7 @@ More text
 
 class ConverterDocumentationTests(unittest.TestCase):
     def test_converter_reference(self):
-        text = (ROOT/'docs/setup.md').read_text()
+        text = setup_text()
         section = text.split('## Convert a rules table')[1].split('## Run message format')[0]
         for term in ('--table', '--scopes', '--out', '--review', 'Active:', 'Switched off:', 'Review:',
                      'enabled = true', 'exclusions', 'validate', 'Dry run', 'first matching enabled'):
@@ -634,7 +642,7 @@ class ConverterDocumentationTests(unittest.TestCase):
 
 class DraftDocumentationTests(unittest.TestCase):
     def test_draft_contract(self):
-        setup = (ROOT/'docs/setup.md').read_text()
+        setup = setup_text()
         for value in ('| draft |', '| draft_text |', '| draft_to |', 'check Drafts by hand', 'Send drafts by hand from the mailbox.', 'search', 'describe', '_drafts'):
             self.assertIn(value, setup)
         self.assertIn('Create and show issued drafts. Never send them.', (ROOT/'config/guardrails.example.md').read_text())

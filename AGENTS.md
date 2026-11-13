@@ -1,6 +1,6 @@
 # Run pigeon
 
-For a routine run, read only [docs/quickstart.md](docs/quickstart.md). Open this document for refusals, owner replies and rule changes. Open [setup](docs/setup.md) for installation, formats and gateway recipes.
+For a routine run, read only [docs/quickstart.md](docs/quickstart.md). Open this document for refusals, owner replies and rule changes. Open [hosted setup](docs/hosted-setup.md) for installation, the listing format and gateway recipes.
 
 Follow guardrails.md in the private store.
 
@@ -22,9 +22,9 @@ Lock loss at any step selects No lock. Other refusals after acquisition use the 
 
 Follow [the routine sequence](docs/quickstart.md). For exceptions use these numbered references.
 
-1. Resolve the [private store](docs/setup.md#private-store).
-2. Complete lock and fetch using [Drive lock](docs/setup.md#drive-lock) and [Drive state](docs/setup.md#drive-state).
-3. Use the [gateway recipes](docs/setup.md#gateway-recipes) and [listing format](docs/setup.md#inbox-listing). On quiet-check refusal use Halt held, or No lock on ownership failure.
+1. Resolve the [private store](docs/hosted-setup.md#private-store).
+2. Complete lock and fetch using [Drive lock](docs/hosted-setup.md#drive-lock) and [Drive state](docs/hosted-setup.md#drive-state).
+3. Use the [gateway recipes](docs/hosted-setup.md#gateway-recipes) and [listing format](docs/hosted-setup.md#inbox-listing). On quiet-check refusal use Halt held, or No lock on ownership failure.
 4. On planning refusal keep its Refused: line and check ownership. Nonempty plan reasons with exit 0 are a stopped plan: use Finish.
 5. Interpret [step-machine responses](docs/setup.md#step-machine-responses). If a gateway cannot perform the issued operation exactly, return error. For create-folder never create missing parents. For an observation refusal, re-read Inbox and resubmit a corrected observation once without repeating the action. On status=stopped use Finish. On other stop use No lock. On other refusals use Halt held if ownership is valid. For uncertain creation check whether the folder exists before creating it by hand; for other uncertain calls ask the owner to check the Inbox. Disclose an unissued action while held:
    ```bash

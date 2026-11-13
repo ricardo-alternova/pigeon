@@ -78,9 +78,10 @@ class Execution:
             raise ValueError(str(plan_path) + ': expected a plan path distinct from execution outputs')
         triage.require_fetched(store, token)
         self.plan = read(self.plan_path)
+        triage.require_plan_token(self.plan, token)
         if self.plan.get('dry_run'):
             raise ValueError('dry-run plan: execution is refused; no call issued')
-        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled'}, str(self.plan_path))
+        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token'}, str(self.plan_path))
         for key in ('actions', 'decisions', 'reasons'):
             if not isinstance(self.plan.get(key), list):
                 raise ValueError(str(self.plan_path) + '.' + key + ': expected an array')
@@ -237,7 +238,10 @@ class Execution:
 
     def current_listing(self, listing):
         if 'final_listing' in self.state:
-            return self.state['final_listing']
+            final = self.state['final_listing']
+            failed = final.get('skipped', {})
+            return dict(final, accounts=final['accounts'] | {a:n for a,n in listing['accounts'].items() if a in failed},
+                        messages=final['messages'] + [m for m in listing['messages'] if m['account'] in failed])
         change = self.state.get('outside_change')
         if not change:
             return listing
@@ -685,6 +689,9 @@ def render_summary(store, token, signature=None, plan_path=None):
     if checkpoint is not None and signature is not None and checkpoint['signature'] != signature:
         raise ValueError(str(path) + '.signature: expected current plan')
     results = checkpoint['results'] if checkpoint is not None else []
+    names = {a: f.get('name', a) for a, f in triage.state_config(store)['accounts'].items()}
+    def display(entry):
+        return dict(entry, account=names.get(entry['account'], entry['account']))
     counts = {}
     for entry in results:
         if entry['status'] == 'executed' and entry['action'] != 'create-folder':
@@ -693,18 +700,19 @@ def render_summary(store, token, signature=None, plan_path=None):
     lines = ['Run: ' + triage.safe_text(token), 'Plan: ' + (checkpoint['signature'] if checkpoint else 'no execution checkpoint'), '']
     if checkpoint is None:
         lines += ['No execution step has been recorded for this run.', '']
-    lines += ['**Handled automatically**', '']
+    handled_messages = {(e['account'], e['id']) for e in results if e['status'] == 'executed' and e['action'] != 'create-folder'}
+    lines += ['Handled messages: ' + str(len(handled_messages)), '', '**Handled automatically (actions by verb)**', '']
     lines += [triage.safe_text(v) + ': ' + str(n) for v, n in sorted(counts.items())] or ['none']
     lines += ['', '**Issued calls to check (outcome unknown)**', '']
     pending = checkpoint.get('pending') if checkpoint else None
-    lines += [triage.safe_text(json.dumps({k: pending[k] for k in ('account', 'id', 'action')} | {'status': 'issued_unknown'}, ensure_ascii=True))] if pending else ['none']
+    lines += [triage.safe_text(json.dumps({k: display(pending)[k] for k in ('account', 'id', 'action')} | {'status': 'issued_unknown'}, ensure_ascii=True))] if pending else ['none']
     lines += ['', '**Actions not completed**', '']
     incomplete = []
     if checkpoint:
         for i, call in enumerate(Execution(store, token, plan_path or store / 'plan.json').plan['actions']):
             status = results[i]['status'] if i < len(results) else ('issued_unknown' if pending == call else 'unexecuted')
             if status != 'executed':
-                incomplete.append(triage.safe_text(json.dumps(call | {'status': status}, ensure_ascii=True)))
+                incomplete.append(triage.safe_text(json.dumps(display(call) | {'status': status}, ensure_ascii=True)))
     lines += incomplete or ['none']
     lines += ['', '**Folders requiring your help**', '']
     instructions = []
@@ -715,12 +723,12 @@ def render_summary(store, token, signature=None, plan_path=None):
             result = results[i] if i < len(results) else None
             if (result and result['status'] != 'executed') or pending == call:
                 instruction = 'Check whether this folder exists; create it if absent: ' if pending == call or result['status'] == 'issued_unknown' else 'Create this folder: '
-                instructions.append(triage.safe_text(call['account']) + ': ' + instruction + triage.code_path(call['target_path']) + '; dependent messages stay in Inbox this run.')
+                instructions.append(triage.safe_text(names.get(call['account'], call['account'])) + ': ' + instruction + triage.code_path(call['target_path']) + '; dependent messages stay in Inbox this run.')
     lines += instructions or ['none']
     lines += ['', '**Unplanned calls**', '']
     log = store / 'calls.jsonl'
     unplanned = [triage.parse_json(line, log) for line in triage.read_text(log).splitlines()] if log.exists() else []
-    lines += [triage.safe_text(json.dumps(e, ensure_ascii=True)) for e in unplanned
+    lines += [triage.safe_text(json.dumps(display(e), ensure_ascii=True)) for e in unplanned
               if e['run'] == token and e['outcome'] == 'unplanned'] or ['none']
     atomic_text(store / 'execution-report.md', '\n'.join(lines) + '\n')
 
@@ -746,6 +754,123 @@ def append_log(store, token, call, outcome):
         out.flush()
 
 
+SIMULATED_PATH = 'SIMULATION_ONLY'
+
+
+def simulation_status(response):
+    """Only presentation status crosses from the machine into rehearsal output."""
+    return {key: response[key] for key in ('status', 'done') if key in response}
+
+
+def simulate(store, plan_path, fail=None, positions_path=None):
+    """Run the existing machine against a disposable private-store copy."""
+    import copy
+    import shutil
+    observation = read(positions_path) if positions_path is not None else None
+    plan = read(plan_path)
+    triage.require_plan_token(plan, triage.read_lock(store)['token'])
+    triage.clean_simulation(store)
+    if plan.get('dry_run') is not True:
+        raise ValueError('simulation: expected a dry-run plan')
+    token = plan.get('run_token')
+    triage.require_lock(store, token)
+    triage.require_fetched(store, token)
+    # This also verifies the dry plan against the current private inputs.
+    triage._render_message(store, token, plan_path, None)
+    if fail is not None and (fail < 1 or fail > len(plan['actions'])):
+        raise ValueError('--fail: expected an action position in the dry-run plan')
+    positions = None
+    if positions_path is not None:
+        if observation.get('dry_run') is not True or 'positions' not in observation:
+            raise ValueError('simulation: expected a dry-run quiet decision')
+        positions = observation['positions']
+        triage.validate_positions(positions, triage.state_config(store))
+    scratch = store / triage.SIMULATION_DIR
+    scratch.mkdir(mode=0o700)
+    try:
+        for name in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md',
+                     'state.json', 'inbox.json', 'run.lock', 'state-exchange.json',
+                     'quiet-check.json', 'tool-paths.json', 'numbers.json', 'decisions.jsonl',
+                     'calls.jsonl', 'unsubscribe-failures.json'):
+            if (store / name).is_file():
+                shutil.copyfile(store / name, scratch / name)
+        simulated_token = 'simulation-' + secrets.token_hex(24)
+        held = read(scratch / 'run.lock')
+        atomic(scratch / 'run.lock', held | dict(token=simulated_token))
+        for name in ('state-exchange.json', 'quiet-check.json'):
+            if (scratch / name).exists():
+                value = read(scratch / name)
+                if name == 'quiet-check.json' and value.get('token') != token:
+                    (scratch / name).unlink()
+                else:
+                    atomic(scratch / name, value | dict(token=simulated_token))
+        if positions is not None:
+            atomic(scratch / 'quiet-check.json', dict(token=simulated_token, decision={}, positions=positions))
+        real_plan = {k: v for k, v in plan.items() if k != 'dry_run'}
+        real_plan['run_token'] = simulated_token
+        path = scratch / 'simulation-plan.json'
+        atomic(path, real_plan)
+        machine = Execution(scratch, simulated_token, path)
+        listing = read(scratch / 'inbox.json')
+        final = copy.deepcopy(listing)
+        stages = []
+        position = 0
+        while True:
+            response = machine.step()
+            if response.get('done') or 'final_reads' in response:
+                break
+            calls = response.get('calls') or [response.get('call', response)]
+            # Single-call responses carry the action directly.
+            if machine.state['pending'] is not None and 'calls' not in response:
+                calls = [machine.state['pending']]
+            stages.append(dict(simulated_calls=[dict(action=c['action'], position=position+i, path=SIMULATED_PATH)
+                                                for i, c in enumerate(calls, 1)]))
+            values = []
+            simulated_results = []
+            for call in calls:
+                position += 1
+                ok = position != fail
+                simulated_results.append(dict(action=call['action'], position=position, outcome='confirmed' if ok else 'failed'))
+                values.append(dict(ok=True, value=dict(id='simulation-item-' + str(position))) if ok else
+                              dict(ok=False, error=dict(kind='CloudFizzle', message='HTTP 503')))
+                if ok and call['action'] in triage.REMOVALS:
+                    final['messages'] = [m for m in final['messages'] if (m['account'], m['id']) != (call['account'], call['id'])]
+            stages.append(dict(simulated_results=simulated_results))
+            if 'calls' in response:
+                result_path = scratch / 'simulation-results.json'
+                atomic(result_path, values)
+                stages.append(dict(result=simulation_status(machine.batch_result(result_path))))
+                pending = machine.state['pending']
+                if pending is not None and pending['action'] == 'create-folder' and values[0]['ok']:
+                    ident = values[0]['value']['id']
+                    folders = listing.get('folders', {}).get(pending['account'], []) + [dict(id=ident, name=pending['target_path'])]
+                    stages.append(dict(result=simulation_status(machine.step(AssistantProvider(dict(outcome='ok', folder_id=ident, folders=folders))))))
+            else:
+                pending = machine.state['pending']
+                ok = values[0]['ok']
+                if pending['action'] == 'unsubscribe':
+                    machine.record(pending, 'executed' if ok else 'failed')
+                    machine.state['pending'] = None
+                    machine.save()
+                else:
+                    observation = dict(outcome='ok' if ok else 'error',
+                                       inbox_ids=[m['id'] for m in final['messages'] if m['account']==pending['account']])
+                    if pending['action']=='create-folder' and ok:
+                        observation['folder_id']='simulation-folder-' + str(position)
+                    if pending['action']=='create-draft' and ok:
+                        observation['draft_id']='simulation-draft-' + str(position)
+                    stages.append(dict(result=simulation_status(machine.step(AssistantProvider(observation)))))
+        if not plan['reasons']:
+            stages.append(dict(final=simulation_status(machine.final(final))))
+        triage.commit_state(scratch, simulated_token, path, lock_verified=True)
+        state = read(scratch / 'state.json')
+        stages.append(dict(commit_preview=dict(counts={a:state[a] for a in plan['counts'] if a in state},
+                                               positions=state.get('_positions', {}))))
+        return dict(dry_run=True, token=simulated_token, stages=stages)
+    finally:
+        triage.clean_simulation(store)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -764,8 +889,15 @@ def main():
             command.add_argument('--plan', help='Current plan path; defaults to private plan.json')
             for key in ('account', 'id', 'verb'):
                 command.add_argument('--' + key, required=True)
+    simulation = sub.add_parser('dry-run', allow_abbrev=False)
+    simulation.add_argument('--plan', required=True)
+    simulation.add_argument('--fail', type=int, help='Fail the Nth planned action, counting from 1')
+    simulation.add_argument('--positions', help='Dry-run quiet decision JSON')
     args = parser.parse_args()
     store = triage.private_store()
+    if args.command == 'dry-run':
+        print(json.dumps(simulate(store, args.plan, args.fail, args.positions), ensure_ascii=True))
+        return
     if args.command == 'observed':
         with triage.lock_gate(store):
             triage.require_lock(store, args.token)

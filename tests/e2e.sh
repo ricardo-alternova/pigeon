@@ -202,11 +202,19 @@ for dry in (True, False):
     assert json.loads(observed(blocks[3], outcomes, token, 'state-observation.json'))['done']
     (store/'inbox.json').write_text(json.dumps(original))
     before = {n: (store/n).read_bytes() if (store/n).exists() else None for n in ('state.json','numbers.json','calls.jsonl','history.log','decisions.jsonl')}
-    run(blocks[7] + (' --dry-run' if dry else ''), token)
+    plan_command = blocks[7]
+    if dry: plan_command = plan_command.replace(' --report-out /absolute/private-store/report.md', '') + ' --dry-run'
+    run(plan_command, token)
     plan = json.loads((store/'plan.json').read_text())
     assert plan['first_run']
     if dry:
         rehearsal = plan['actions']
+        simulation_command = re.search(r'`(PIGEON_HOME=[^`]*execute.py dry-run [^`]*)`', Path('docs/quickstart.md').read_text()).group(1)
+        for suffix in ('', ' --fail 1'):
+            simulation = json.loads(run(simulation_command + suffix, token))
+            assert 'commit_preview' in simulation['stages'][-1]
+            assert all('calls' not in stage for stage in simulation['stages'])
+            assert all(c['path']=='SIMULATION_ONLY' for stage in simulation['stages'] for c in stage.get('simulated_calls',[]))
         message = run(blocks[11].split(' --results')[0], token)
         assert message.startswith('📬 Triage · ') and 'Dry run' in message and 'would' in message
         assert all(((store/n).read_bytes() if (store/n).exists() else None) == raw for n,raw in before.items())

@@ -66,6 +66,8 @@ class MockGateway:
         self.exchanges = 0
 
     def batch(self, calls):
+        if any(c.get("path") == "SIMULATION_ONLY" for c in calls):
+            raise ValueError("simulation placeholder is not a gateway path")
         self.exchanges += 1
         return [dict(ok=True, value=self.answer(c)) for c in calls]
 
@@ -122,3 +124,32 @@ class MockGateway:
                          childFolderCount=sum(y['name'].startswith(x['name']+'/') and y['name'].count('/')==x['name'].count('/')+1 for y in folders))
                     for i,x in enumerate(folders) if x['name'].startswith(parent) and '/' not in x['name'][len(parent):]]
         start=q.get('$skip',0); return dict(value=rows[start:start+q.get('$top',100)])
+
+
+def save_plan(store, token, path, plan):
+    """Make a command-generated dry plan, then apply this test's plan mutations."""
+    import contextlib
+    import tempfile
+    import os
+    from unittest.mock import patch
+    import execute
+    import triage
+    if 'run_token' in plan:
+        execute.atomic(path, plan)
+        return
+    output = store / 'fixture-plan.json'
+    guardrails = store / 'guardrails.md'
+    missing = not guardrails.exists()
+    if missing:
+        guardrails.write_text('Fixture policy\n')
+    try:
+        with tempfile.TemporaryFile(mode='w+', dir=store) as sink, patch.dict(os.environ, PIGEON_HOME=str(store)), contextlib.redirect_stdout(sink):
+            triage.main(['plan', '--token', token, '--inbox', str(store/'inbox.json'),
+                         '--plan-out', str(output), '--dry-run'])
+        generated = execute.read(output)
+        plan['run_token'] = generated['run_token']
+        execute.atomic(path, plan)
+    finally:
+        output.unlink(missing_ok=True)
+        if missing:
+            guardrails.unlink()

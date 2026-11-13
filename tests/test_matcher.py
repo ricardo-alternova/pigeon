@@ -1,3 +1,4 @@
+from mock_provider import save_plan
 import importlib.util
 import json
 from pathlib import Path
@@ -290,8 +291,8 @@ class MatcherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             triage.number_decisions(Path(tmp), plan, self.listing)
         report = triage.render_report(plan, self.listing)
-        self.assertIn('1. cedar:', report)
-        self.assertNotIn('3. cedar:', report)
+        self.assertIn('1. s0@example.net', report)
+        self.assertNotIn('3. s0@example.net', report)
 
     def test_output_privacy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -599,7 +600,7 @@ class RemainingInboxTests(unittest.TestCase):
             triage.number_decisions(store, again, self.listing)
             report = triage.render_report(again, self.listing)
             self.assertNotIn('élise', report)
-            self.assertIn('marble: 1 previously listed', report)
+            self.assertIn('marble: 1\n1 previously listed', report)
             self.assertIn('keeper', report)
             self.assertEqual(again['remaining'][1]['number'], plan['remaining'][1]['number'])
 
@@ -950,9 +951,69 @@ class ListingTests(unittest.TestCase):
             if call['input']['accountId']=='cedar-example':
                 value.update(ok=True,value={'error':{'code':404}})
         path=self.store/'quiet-results.json'; execute.atomic(path,values)
+        retry = triage.quiet_gateway(self.store,self.token,self.config,previous,path)
+        self.assertTrue(all(c['input']['accountId']=='cedar-example' for c in retry['calls']))
+        execute.atomic(path,[dict(ok=False,error=dict(code=404)) for c in retry['calls']])
         observed=execute.read(triage.quiet_gateway(self.store,self.token,self.config,previous,path))
         self.assertEqual(observed['cedar']['outcome'], 'error')
         self.assertEqual(observed['cedar']['reason'], 'provider error (404)')
+
+    def test_quiet_twice_failed_prints_each_reason_once(self):
+        import execute, io
+        from contextlib import redirect_stderr
+        previous={'_positions':{'cedar':'100','marble':[]}}
+        output=io.StringIO()
+        path=self.store/'quiet-results.json'
+        with redirect_stderr(output):
+            response=triage.quiet_gateway(self.store,self.token,self.config,previous)
+            for attempt in range(2):
+                values=self.gateway.batch(response['calls'])
+                for call,value in zip(response['calls'],values):
+                    if call['input']['accountId']=='cedar-example':
+                        value.clear()
+                        value.update(ok=False,error=dict(kind='CloudFizzle',message='HTTP 502 PRIVATE_PROVIDER_TEXT'))
+                execute.atomic(path,values)
+                response=triage.quiet_gateway(self.store,self.token,self.config,previous,path)
+            positions,quiet,accounts=triage.read_observation(response,self.config,previous['_positions'],partial=True)
+        self.assertEqual(output.getvalue().count('cedar: provider error (502); full run'),1)
+        self.assertNotIn('PRIVATE_PROVIDER_TEXT',output.getvalue())
+        self.assertNotIn('cedar',positions)
+        self.assertFalse(quiet)
+
+    def test_quiet_dry_run_leaves_store_identical(self):
+        import execute
+        from datetime import datetime, timezone
+        previous={'_positions':{'cedar':'100','marble':[]}}
+        before={p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
+        first=triage.quiet_gateway(self.store,self.token,self.config,previous,dry_run=True)
+        values=self.gateway.batch(first['calls'])
+        path=self.store.parent/('quiet-results-'+self.store.name+'.json')
+        self.addCleanup(path.unlink,missing_ok=True)
+        execute.atomic(path,values)
+        result=triage.quiet_gateway(self.store,self.token,self.config,previous,path,dry_run=True,progress=first['progress'])
+        decision=triage.quiet_check(self.store,self.config,previous,result['observations'],True,datetime.now(timezone.utc),dry_run=True)
+        self.assertIn('positions',decision)
+        self.assertEqual(before,{p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()})
+        from mock_provider import MockGateway
+        with self.assertRaisesRegex(ValueError,'simulation placeholder'):
+            self.gateway.batch([dict(path='SIMULATION_ONLY')])
+
+    def test_quiet_retry_success_only_reissues_failed_account(self):
+        import execute
+        previous={'_positions':{'cedar':'100','marble':[]}}
+        first=triage.quiet_gateway(self.store,self.token,self.config,previous)
+        values=self.gateway.batch(first['calls'])
+        for call,value in zip(first['calls'],values):
+            if call['input']['accountId']=='cedar-example':
+                value.clear()
+                value.update(ok=False,error=dict(kind='CloudFizzle',message='HTTP 502 private detail'))
+        path=self.store/'quiet-results.json'
+        execute.atomic(path,values)
+        retry=triage.quiet_gateway(self.store,self.token,self.config,previous,path)
+        self.assertTrue(all(c['input']['accountId']=='cedar-example' for c in retry['calls']))
+        execute.atomic(path,self.gateway.batch(retry['calls']))
+        observation=triage.quiet_gateway(self.store,self.token,self.config,previous,path)
+        self.assertEqual(execute.read(observation)['cedar']['outcome'],'ok')
 
     def test_ids_only_and_quiet_gateway(self):
         (self.store/'inbox.json').write_text(json.dumps(self.listing))
@@ -980,6 +1041,11 @@ class ListingTests(unittest.TestCase):
         identity=next(i for i,c in enumerate(first['calls']) if c['path'].endswith('meUserGetUser'))
         values[identity]=dict(ok=True,value={'mail':'other@example.net'})
         path=self.store/'quiet-results.json';path.write_text(json.dumps(values))
+        retry=triage.quiet_gateway(self.store,self.token,self.config,previous,path)
+        values=self.gateway.batch(retry['calls'])
+        for call,value in zip(retry['calls'],values):
+            if call['path'].endswith('meUserGetUser'): value['value']={'mail':'other@example.org'}
+        path.write_text(json.dumps(values))
         observed=json.loads(triage.quiet_gateway(self.store,self.token,self.config,previous,path).read_text())
         self.assertNotEqual(observed['marble'].get('outcome'),'ok')
 
@@ -1121,7 +1187,7 @@ class GatewayRobustnessTests(unittest.TestCase):
                 triage.validate_inputs({'accounts':{},'messages':[]}, {'accounts':{'cedar':{'executor_app':app}}}, {})
 
     def test_folder_recipe_strings(self):
-        recipe = (ROOT/'docs/setup.md').read_text()
+        recipe = (ROOT/'docs/hosted-setup.md').read_text()
         self.assertIn('includeHiddenFolders: "true"', recipe)
         for ident in (None,'folder-a'):
             call = triage.mail_call(self.config['accounts']['marble'],'folders',id=ident)
@@ -1135,7 +1201,7 @@ class GatewayRobustnessTests(unittest.TestCase):
             for i,c in enumerate(calls):
                 if c['input']['accountId'] == 'cedar-example':
                     issued.append(c['path'])
-                    values[i] = {'ok':False,'error':{'error':{'status':503,'message':'PRIVATE_PROVIDER_TEXT'}}}
+                    values[i] = {'ok':False,'error':{'kind':'CloudFizzle','message':'HTTP 503 PRIVATE_PROVIDER_TEXT'}}
             return values
         self.gateway.batch = failing
         result,_ = self.finish()
@@ -1189,7 +1255,7 @@ class GatewayRobustnessTests(unittest.TestCase):
         plan=triage.build_plan(listing,[],[],self.config,previous)
         plan_path=self.store/'plan.json'
         triage.number_decisions(self.store,plan,listing)
-        execute.atomic(plan_path,plan)
+        save_plan(self.store, self.token, plan_path, plan)
         self.assertEqual(execute.Execution(self.store,self.token,plan_path).step(),{'done':True})
         triage.commit_state(self.store,self.token,plan_path)
         state=execute.read(self.store/'state.json')
@@ -1240,7 +1306,7 @@ class GatewayRobustnessTests(unittest.TestCase):
         listing=execute.read(self.store/'inbox.json')
         plan=triage.build_plan(listing,[],[],self.config,previous)
         triage.number_decisions(self.store,plan,listing)
-        path=self.store/'plan.json';execute.atomic(path,plan)
+        path=self.store/'plan.json';save_plan(self.store, self.token, path, plan)
         self.assertEqual(execute.Execution(self.store,self.token,path).step(),{'done':True})
         triage.commit_state(self.store,self.token,path)
         message=triage.render_message(self.store,self.token,path,None)

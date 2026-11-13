@@ -1,79 +1,8 @@
 # Set up pigeon
 
-## Hosted setup
-
-Keep the first run attended:
-
-1. Give the assistant a checkout of this repository and the instruction: "Follow AGENTS.md for one scheduled Inbox triage and send the standard run message." Confirm a POSIX system with Python 3.11+, git and Bash in its command environment.
-2. Check [host requirements](#host-requirements).
-3. Create the [private store](#private-store) with `python3 scripts/triage.py setup`. Before step 1 of every run, the host supplies config.toml and guardrails.md into the private store from its own lasting storage.
-4. Connect and authenticate the [mail gateway](#mail-gateway-connection). Replace fictional [account settings](#configuration), [rules](#rules) and never-touch entries with your private values; review the guardrails before using mail.
-5. Follow the [storage choice](#storage-choice). When drive state is needed, configure [drive lock](#drive-lock) and [drive state](#drive-state): set lock.kind to onedrive and state.kind to onedrive or gdrive, with private account handles and parent folder IDs. Find the private account handle in gateway connection details or search/describe input schemas (example: drive-example). Find the parent folder ID in drive details or gateway metadata (example: folder-example); use its ID, not its name or sharing URL. Provision those parent folders yourself; apply the private-folder rule under [Drive state](#drive-state). For an empty state folder supply local rules.toml and never-touch.toml for the first run; subsequent runs fetch them after locking.
-6. Follow the [first-run procedure](#first-real-run-and-commands) and [quick start](quickstart.md). Check chat delivery and answer a numbered item.
-7. Enable [scheduling](#scheduling) after delivery/replies work.
-
-## Storage choice
-
-If the host keeps its files, use local state/lock. If it starts empty or two hosts share mailboxes, use drive state and the OneDrive lock. Choose OneDrive or Google Drive state; only OneDrive locks.
-
-## Host requirements
-
-- [ ] Schedule: demonstrate a task started on schedule and one started when asked.
-- [ ] Chat: receive a test message and reply in the same conversation.
-- [ ] Storage: demonstrate the [storage choice](#storage-choice); when using drive state, verify the folder is private as required under [Drive state](#drive-state).
-- [ ] Gateway: discover mail and drive tool schemas and verify configured account identities; only the calls allowed by [guardrails](../config/guardrails.example.md) may be carried by the assistant.
-
-
-
-| Host | Requirements |
-| --- | --- |
-| Hosted assistant | Scheduler, reply conversation, private store and gateway connection. |
-| Developer machine | Local scheduler, assistant conversation, private store and gateway. |
-
 ## Developer machine
 
-Run the [sample-mail demo](../README.md#developer-machine), then follow [storage choice](#storage-choice), private store, gateway and attended setup before scheduling.
-
-## Mail gateway connection
-
-Connect and authenticate mail accounts before scheduling. Use Executor search/describe to discover connected app paths and input shapes. Verify fixed linked-account identity; never choose an arbitrary account. Use exactly accounts.HANDLE.executor_account when configured for every read, listing and action in that account. Stop if the gateway does not offer that ID. Keep connection details private.
-
-## Private store
-
-Keep account handles, app slugs, private rules, listings, state, reports and logs in the private store. Keep your real private store outside every git work tree. Default: ~/.config/pigeon/. Create it with `python3 scripts/triage.py setup`. To use another folder outside git, set PIGEON_HOME to it before setup. An empty PIGEON_HOME is refused. The planner refuses a store or output path inside a git work tree unless git ignores it. Restrict permissions to your user, including reports and credentials.
-
-Run `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py validate` after editing the four safety files. Correct every reported problem before taking a lock.
-
-Keep run artifacts in this store; use [State and execution files](#state-and-execution-files). For local locks, refresh before 45 minutes; allow takeover only after the ten-minute expiry margin. Only the matching holder releases. Follow [Lock refresh](quickstart.md#lock-refresh).
-
-## Configuration
-
-config.toml is required, including for lock. The private config.toml uses these keys:
-
-| Key | Meaning | Default |
-| --- | --- | --- |
-| version | Integer format version; omit for 1. Refuse versions above 1 in config.toml and state.json. Print the version with validate. | 1 |
-| language | Report section language; en or es. Reasons and Inbox count line stay English. | en |
-| relist_inbox | List all remaining Inbox items, or new_plus_count for new items plus per-account counts of earlier items. | all |
-| timezone | IANA time zone for slots and run messages. | UTC |
-| inbox_limit | Positive integer maximum Inbox messages across accounts. | 100 |
-| lock.kind | Lock backend: local or onedrive. Local permits no other lock keys. | local |
-| lock.account | Required for onedrive: private account handle, 1–512 ASCII letters, digits, underscore, hyphen, dot, colon or exclamation mark. | None |
-| lock.folder | Required for onedrive: parent folder ID, same limits as lock.account. | None |
-| state.kind | State backend: local, onedrive or gdrive. Drive state requires lock.kind="onedrive"; local permits no other state keys. | local |
-| state.account | Required for drive state: private account handle, same limits as lock.account. | None |
-| state.folder | Required for drive state: parent folder ID, same limits as lock.account. | None |
-| schedule.weekdays | Required when schedule is present: nonempty array of unique HH:MM local slots. | No schedule |
-| schedule.weekends | Required when schedule is present: nonempty array of unique HH:MM local slots. | No schedule |
-| schedule.always_full | Required when schedule is present: unique slots drawn from weekdays or weekends; may be empty. | No schedule |
-| accounts | Required table with one subtable per private account handle, also used in rules and listings. Missing accounts are reported; no configured account listed or an unconfigured account stops the run. | None |
-| accounts.HANDLE.provider | Optional gmail or outlook; enable scripted listing with executor_app and executor_account. | None |
-| accounts.HANDLE.executor_app | Optional string: app slug for tool discovery. | None |
-| accounts.HANDLE.executor_account | Optional gateway mailbox ID: 1–128 ASCII letters, digits, underscore or hyphen; unique with executor_app. | None |
-| accounts.HANDLE.address | Optional string: mailbox address to verify against linked identity. | None |
-| accounts.HANDLE.quiet_kind | Mailbox observations: history or ids. | ids |
-
-Unknown keys and wrong value types in config, rules, never-touch, Inbox listings and state are refused; inbox_limit must be a positive integer.
+Run the [sample-mail demo](../README.md#developer-machine), then follow [storage choice](hosted-setup.md#storage-choice), private store, gateway and attended setup before scheduling.
 
 ## Calendar input
 
@@ -90,54 +19,6 @@ Use a UTF-8 JSON object keyed by configured calendar names. Supply an array of e
 Read Calendar after the Inbox list in the report and final message, including dry runs. List pending invitations with working-hours and quiet-window marks; check a midnight-crossing event against working hours by its start. List each overlapping pair in start, calendar-name and ID order, including pairs within one calendar. Exclude cancelled, declined and all-day events from overlaps; ignore nonpending events outside the window. Treat touching endpoints as no overlap. Mark the winning calendar as the one that stays. Show unread calendars with “overlaps against it were not checked”.
 
 Keep calendar items without reply numbers. Answer invitations in the calendar itself. Keep calendar data out of state. Skip calendar reads and the Calendar section on a quiet run.
-
-## Drive lock
-
-Configure lock.kind=onedrive as in [Configuration](#configuration). Follow the [quick start](quickstart.md#lock-and-fetch). Carry only the issued configured account, parent folder, fixed name pigeon-run-lock, operation and condition: conflict="fail" on create, if_match on delete. Address reads/deletes by fixed name in that parent. Preserve conditions exactly or refuse. Treat returned IDs/tags as evidence, never targets or report text. Add gateway-required type markers only without changing name, parent or conflict setting. Map failed status 409 to conflict and 412 to precondition-failed.
-
-Save lock-observation.json and resume lock --observation PATH. For --batch return {"create":OUTCOME,"read":OUTCOME} from ordered create/read calls, retaining the read even on conflict; complete takeover calls singly. Use created or ok with id, etag, created UTC timestamp and name; for example:
-
-```json
-{"status":"created","id":"item-1","etag":"v1","created":"2026-11-11T08:00:00+00:00","name":"pigeon-run-lock"}
-```
-
-Use exactly {"status":"conflict"} for conflict and {"status":"deleted"} for conditional deletion. Treat error, unknown, not-found and precondition-failed as refusals. Limit observations to 4096 bytes; IDs to 1–512 ASCII letters, digits or _ - . : !; tags to 1–512 ASCII letters, digits or _ - ! . , : { } or double quotes. Use UTC timestamps of at most 40 characters and at most five seconds future skew.
-
-Confirm each successful create with exactly one read matching ID, name and creation time; hold only its read tag. On failed, uncertain, absent or mismatched confirmation, make no mailbox/state call or delete; wait for expiry. Refuse a newly created item older than 45 minutes.
-
-On conflict read once. Treat age at most 55 minutes as busy (45 plus ten-minute margin). Only older locks permit one conditional delete by read tag, then conflict-fail create and confirming read. Never repeat create/delete automatically; refuse any competing winner or failed condition. Synchronise host clocks within ten minutes. Holder expiry is 45 minutes from acquisition bounded by drive creation time, until refresh.
-
-Before commit-state writes, carry its fresh read and resume with --lock-observation PATH; require the saved ID, tag and creation time. Release by saved-tag conditional delete and resume release --observation PATH; failed verification/release invalidates ownership.
-
-After an uncertain acquisition, wait 45 minutes from the script-recorded start, then start fresh with conflict fail; never replay the old call. Let the drive decide busy/takeover. Finish and release before changing backends. Follow [Lock refresh](quickstart.md#lock-refresh); on OneDrive carry conditional delete, conflict-fail recreation and confirming read, retaining the token only after confirmation and preserving the original run start time.
-
-## Drive state
-
-Keep drive state readable/writable only by the owner's own account, never shared or in a shared folder. Apply this to the lock folder too.
-
-Immediately after locking, fetch before reading state or calling mail. Download exactly the printed names to state-incoming: numbers.json, unsubscribe-secret, unsubscribe-failures.json, decisions.jsonl, calls.jsonl, history.log, run-message.md, rules.toml, never-touch.toml, tool-paths.json, state.json. Keep plans, checkpoints, observations, config.toml and guardrails.md local. Follow [storage guardrails](../config/guardrails.example.md).
-
-Return a JSON object keyed by exactly those names with fetched, absent or failed strings. Confirm absence through the gateway; classify uncertainty as failed. Require readable regular nonsymlink files, at most 4194304 bytes, valid UTF-8 and valid format. Refuse missing/unexpected files before installation. Start absent script-owned files empty. Preserve local rules when absent remotely; supply local rules for an empty folder. For "drive store empty but local records exist", correct a changed state.folder; otherwise copy local state.json, numbers.json and logs to that folder and start fresh. Keep state-incoming free of links/subfolders; the next fetch removes leftover regular files.
-
-For send-state carry a fresh matching lock read, even after commit, and resume with --lock-observation PATH. Upload each issued changed-file snapshot from state-outgoing, numbers first and counts last; include absent rules from local copies. Return upload-observation.json as {"status":"done","size":123} with the actual integer drive size, or {"status":"failed"}. Bound fetch/upload observations to 4096 bytes; never derive names from observations.
-
-Never retry failed, uncertain or size-mismatched uploads or send again after failure. Deliver the returned warning first, keep local files, then release conditionally. Start the next run from drive state. Use zero-byte remote run-message.md to clear the pending message. Keep calls.jsonl, history.log and decisions.jsonl to the script-owned 262144-byte newest-whole-line tails; never trim during execution, reporting, reply commit or send.
-
-Use `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py finish-run --token TOKEN` only without a message. Complete its lock-read, upload and conditional release through --observation PATH. Otherwise follow [Commit and message](quickstart.md#commit-and-message).
-
-## Quiet observations
-
-Under the lock, carry quiet-check's reads, then submit --observation PATH for skip/full with reason. Use --scheduled only for scheduled runs. Run full on demand, without schedule, at always_full slots or with pending run-message.md. Set an always_full slot for periodic full checks; an empty array permits indefinite quiet skips. Follow [Scheduling](#scheduling).
-
-Supply UTF-8 JSON with exactly every configured account:
-
-```json
-{"cedar":{"outcome":"ok","position":"120","arrivals":[]},"marble":{"outcome":"ok","ids":["item-b","item-a"]}}
-```
-
-Follow [gateway recipes](#gateway-recipes). For history use a 1–128 ASCII-digit position and up to 1000 Inbox arrival IDs since the saved position. With no saved position, return arrivals as []. For ids use at most ten unique newest-first IDs, each 1–512 ASCII letters, digits or _ - = + /. Use error/expired for failed reads/expired history. Run full for unknown fields, missing/extra accounts, wrong types, files over 65536 bytes, unreadable/absent files or decreasing positions. Prove quiet only with empty arrivals or unchanged ordered IDs for every account. Expect a full run after actions.
-
-Keep state, plan and report unchanged on skip; append only the script's one UTC history line per token. Follow [Run exits](../AGENTS.md#run-exits) for upload/delivery. Save pre-listing positions only through commit-state for completely listed accounts with confirmed results; preserve failed/skipped/reply positions. Outside always_full, list only changed accounts or those lacking usable positions. Skip only if all are quiet.
 
 ## Rules
 
@@ -261,9 +142,8 @@ Follow [Commit and message](quickstart.md#commit-and-message). Keep plan.json, i
 | notes | Run notes | Notas de ejecución |
 | drafts | Drafts | Drafts |
 | calendar | Calendar | Calendar |
-| decisions | Decisions for the owner | Decisiones para el propietario |
 
-Show every proposed draft, including dry runs, above Inbox decisions: account, kind, forward recipients, original subject and full text. List decisions/questions once in Inbox with reasons; show confirmed counts by rule/folder in Handled. Put stops, failures, skips, uncertainty, unexecuted/unplanned calls and folder help in Run notes. Check uncertain creation before manually creating a folder; leave dependent messages for a fresh run with fresh metadata. Use config.language and config.timezone. For new_plus_count, show protected/new items and count older items per account. Put upload warnings first; keep quiet runs silent.
+Show each message once. Group handled messages by account and list action, sender and subject; show every message with a planned action, including failures. Group the Inbox list by account without repeating its name on item lines. Leave unmatched mail untagged; tag protection, refused rules, unconfirmed actions and stopped runs. In dry runs put the planned action inline, including the move destination. Use the saved numbers and print reply examples only when numbers exist. Combine empty accounts on one line without headings. Put account problems directly after the first line, once per account with status and “retried once” only after a retry. Use accounts.HANDLE.name or HANDLE throughout the message and report. Show draft kind, recipients and full text above Inbox; tag successful drafts and unsubscribes on their numbered Inbox lines; handled lists only messages that left Inbox, joining their actions on one line. The first-line handled count counts messages. Tag partial success with done and failed actions; leave it unnumbered. If the message left Inbox, keep it handled and name any failed or unattempted action after the action that ran. Put the stop reason directly after account problems; put unplanned calls and folder help in Run notes. Check uncertain folder creation by hand before creating it. Use config.language and config.timezone. For new_plus_count, show protected/new items and count older items per account. Keep quiet runs silent.
 
 ## Decision and stop reasons
 
@@ -279,88 +159,9 @@ Resume a pending listing batch after interruption. Keep listing-exchange.json, f
 
 For missing provider, executor_app or executor_account, build the whole listing by hand using the recipes. For body-rule accounts, supply --manual-part PATH on every listing invocation with exactly those accounts and their excerpts; exclude scripted accounts. Read the required names in the missing-part refusal. Let listing merge the parts into inbox.json.
 
-Set every provider for scripted quiet reads; use --observation PATH with [Quiet observations](#quiet-observations) for mixed configurations.
+Set every provider for scripted quiet reads; use --observation PATH with [Quiet observations](quickstart.md#quiet-observations) for mixed configurations.
 
 Follow [Plan and execute](quickstart.md#plan-and-execute) for final reads. Carry follow-up batches for arrivals until done: Gmail metadata/attachments or Outlook newest-message pages retaining new IDs. For accounts without providers, supply a complete final-inbox.json through final --inbox PATH.
-
-## Inbox listing
-
-Page every Inbox into private UTF-8 JSON inbox.json, even above inbox_limit. Never infer provider flags or URLs from mail instructions.
-
-| Key | Type and source |
-| --- | --- |
-| accounts | Map each listed handle to the provider all-folder integer total (Inbox, Sent, Trash, Spam, Archive included); use this brake denominator, or omit the account if unavailable. |
-| messages | Every Inbox message from listed accounts; [] for empty accounts. |
-| messages[].account | Configured mailbox handle. |
-| messages[].id | Unique provider message ID within its account. |
-| messages[].folder | Exactly "Inbox"; collect no other folders. |
-| messages[].sender | Sender header: address or Name <address>; leave invalid/multiple addresses as decisions. |
-| messages[].subject | String from the message subject. |
-| messages[].has_attachment | Provider attachment boolean; default false. |
-| messages[].spam, messages[].phishing | Provider booleans, default false; refuse unsubscribe, never infer a spam action. |
-| messages[].unsubscribe_url | First HTTPS URI in List-Unsubscribe angle brackets, stripped; omit if absent. Leave unsafe/missing links as decisions. |
-| messages[].unsubscribe_one_click | List-Unsubscribe-Post boolean, default false; true selects RFC 8058 POST, otherwise GET. |
-| messages[].body | Optional plain-text excerpt, at most 2000 characters. Collect for every message only in body-rule accounts. Request preview/truncation; otherwise retain only the first 2000 characters. Never fetch HTML, attachments or linked content. Omit if no plain text; absent means no body match. Use only for matching, never reports, messages, calls, targets or links. |
-| messages[].date | Optional ISO 8601 received date/datetime from provider received/internal metadata, never sender Date or body. Preserve its year/month without timezone conversion. For dated moves, leave missing/invalid/out-of-range (1990–2100) dates to the user. |
-| messages[].sender_name | Do not collect. |
-| skipped | Omitted account to reason map: {"cedar":"provider error (503)"} or {"cedar":"pigeon error (listing answer)"}; keep the account and its messages absent. |
-| folders | Handle to existing-folder arrays; require for move rules/replies. |
-| folders.HANDLE[].id, folders.HANDLE[].name | Provider ID and full slash-separated name; include every existing path, never leaf names alone. |
-
-## Gateway recipes
-
-For every call use `{ accountId, input }`. Replace APP in tool paths with accounts.HANDLE.executor_app and accountId with accounts.HANDLE.executor_account from config.toml. Use the [Inbox listing](#inbox-listing) and [quiet observation](#quiet-observations) formats for the saved values.
-
-Prefix action-table tools with tools.APP.; use tools["APP-SLUG"].rest for other app slugs. Pass action calls as printed.
-
-### Gmail
-
-| What the kit needs | Tool | input | Result value | Saved field |
-| --- | --- | --- | --- | --- |
-| History position and all-folder total | tools.APP.gmail.users.getProfile | `{ path: { userId: "me" } }` | historyId; messagesTotal | quiet position; accounts.HANDLE |
-| Arrivals since saved position | tools.APP.gmail.users.history.list | `{ path: { userId: "me" }, query: { startHistoryId, labelId: "INBOX", historyTypes: ["messageAdded", "labelAdded"], maxResults, pageToken } }` | Inbox arrival IDs; follow pageToken until none | quiet arrivals |
-| Inbox message IDs | tools.APP.gmail.users.messages.list | `{ path: { userId: "me" }, query: { labelIds: ["INBOX"], maxResults, pageToken } }` | Message IDs; follow pageToken until none | messages[].id |
-| Attachment flag | tools.APP.gmail.users.messages.list | `{ path: { userId: "me" }, query: { labelIds: ["INBOX"], q: "has:attachment", maxResults, pageToken } }` | Returned IDs; follow pageToken until none | messages[].has_attachment: true for returned IDs, false for other Inbox IDs |
-| Sender, subject, unsubscribe headers and received date | tools.APP.gmail.users.messages.get | `{ path: { userId: "me", id }, query: { format: "metadata", metadataHeaders: ["From", "Subject", "List-Unsubscribe", "List-Unsubscribe-Post"] } }` | payload.headers; internalDate in milliseconds since the epoch | messages[].sender, subject, unsubscribe_url, unsubscribe_one_click; convert internalDate to a UTC ISO 8601 datetime in messages[].date, for example 2026-03-01T00:00:00+00:00 |
-| Existing folders | tools.APP.gmail.users.labels.list | `{ path: { userId: "me" } }` | labels with id, name and type=user | folders.HANDLE; retain full names |
-| Inbox count | tools.APP.gmail.users.labels.get | `{ path: { userId: "me", id: "INBOX" } }` | messagesTotal | Inbox count; keep accounts.HANDLE as the all-folder total |
-
-For post-action verification call tools.APP.gmail.users.messages.get with `{ path: { userId: "me", id }, query: { format: "minimal" } }`. Set in_inbox to whether labelIds contains INBOX. Report the boolean, not the labels.
-
-
-| Action | Tool | input |
-| --- | --- | --- |
-| trash | gmail.users.messages.trash | {path:{userId:"me",id:ID}} |
-| archive | gmail.users.messages.modify | {path:{userId:"me",id:ID},body:{removeLabelIds:["INBOX"]}} |
-| move | gmail.users.messages.modify | {path:{userId:"me",id:ID},body:{removeLabelIds:["INBOX"],addLabelIds:[LABEL_ID]}} |
-| spam | gmail.users.messages.modify | {path:{userId:"me",id:ID},body:{removeLabelIds:["INBOX"],addLabelIds:["SPAM"]}} |
-| create-folder | gmail.users.labels.create | {path:{userId:"me"},body:{name:NAME}} |
-| create-draft | gmail.users.drafts.create | Preserve issued draft_text and draft_to. |
-
-### Outlook
-
-| What the kit needs | Tool | input | Result value | Saved field |
-| --- | --- | --- | --- | --- |
-| Mailbox identity | tools.APP.meUser.meUserGetUser | `{ query: { $select: ["mail", "userPrincipalName"] } }` | Match either value to accounts.HANDLE.address, case-insensitively; on mismatch or failure leave the account out | identity |
-| Inbox listing, attachments and received date | tools.APP.meMailFolder.meMailFoldersListMessages | `{ path: { "mailFolder-id": "inbox" }, query: { $select: ["id", "from", "subject", "receivedDateTime", "hasAttachments"], $orderby: ["receivedDateTime desc"], $top, $skip } }` | id, from, subject, receivedDateTime, hasAttachments; page with $skip until a page is short | messages[].id, sender, subject, date, has_attachment |
-| Inbox count | tools.APP.meMailFolder.meGetMailFolders | `{ path: { "mailFolder-id": "inbox" }, query: { $select: ["totalItemCount"] } }` | totalItemCount | Inbox count |
-| All-folder total | tools.APP.meMailFolder.meListMailFolders; tools.APP.meMailFolder.meMailFoldersListChildFolders for each folder that has children | `{ query: { $select: ["id", "displayName", "totalItemCount", "childFolderCount"], $top, includeHiddenFolders: "true" } }` for meListMailFolders; `{ path: { "mailFolder-id": id }, query: { $select: ["id", "displayName", "totalItemCount", "childFolderCount"], $top, $skip, includeHiddenFolders: "true" } }` | Page with $skip until short; follow childFolderCount, join full paths; sum totalItemCount over every folder | accounts.HANDLE |
-| Quiet check (no history position) | tools.APP.meMailFolder.meMailFoldersListMessages | `{ path: { "mailFolder-id": "inbox" }, query: { $select: ["id"], $orderby: ["receivedDateTime desc"], $top: 10, $skip: 0 } }` | Ten newest Inbox IDs | quiet ids, newest first |
-
-For post-action verification read the issued message by ID with the gateway’s discovered message-read tool. Compare parentFolderId with the Inbox folder ID from meGetMailFolders (select id). Set in_inbox to that comparison. If the ID does not exist after removal, report in_inbox=false. Treat any other failure as a failed reading. The final whole Inbox reading still decides. Report the boolean, not the folder ID.
-
-Copy Outlook IDs containing = + and / unchanged.
-
-
-| Action | Tool | input |
-| --- | --- | --- |
-| trash | meMessage.meMessagesMessageMove | {path:{"message-id":ID},body:{DestinationId:"deleteditems"}} |
-| archive | meMessage.meMessagesMessageMove | {path:{"message-id":ID},body:{DestinationId:"archive"}} |
-| move | meMessage.meMessagesMessageMove | {path:{"message-id":ID},body:{DestinationId:FOLDER_ID}} |
-| spam | meMessage.meMessagesMessageMove | {path:{"message-id":ID},body:{DestinationId:"junkemail"}} |
-| create-folder | meMailFolder.meCreateMailFolders or meMailFolder.meMailFoldersCreateChildFolders | {body:{displayName:NAME}}; for child add path:{"mailFolder-id":PARENT}. |
-| create-draft | meMessage.meMessagesMessageCreateReply or meMessage.meMessagesMessageCreateForward | path:{"message-id":ID}; preserve issued draft_text and draft_to. |
-| message-read | meMessage.meGetMessages | {path:{"message-id":ID},query:{$select:["id","parentFolderId"]}} |
 
 ## First real run and commands
 
@@ -395,7 +196,7 @@ Keep every file in the private store. Keep the original inbox.json and plan inpu
 - execution-report.md: handled counts, unfinished actions, folder help and disclosed unplanned calls. Follow AGENTS.md for delivery.
 - history.log: quiet skips and abandoned lock exchanges.
 - run-message.md: pending delivery record, containing an undelivered chat message or an upload warning; follow [Commit and message](quickstart.md#commit-and-message).
-- quiet-observation.json: pre-listing [observations](#quiet-observations).
+- quiet-observation.json: pre-listing [observations](quickstart.md#quiet-observations).
 - run.lock and .lock-gate: local coordination; never remove them to bypass ownership.
 
 Commit only under the held lock with this run's plan and checkpoint. Planning writes no state; preserve previous state until commit, even after completed mail actions. Refuse malformed state. Follow [Commit and message](quickstart.md#commit-and-message) and [Gateway results](quickstart.md#gateway-results).
@@ -466,7 +267,7 @@ Use a small fast model for the routine run: carry calls, save results, post mess
 
 ## Scheduling
 
-Use the host scheduler. Set schedule.weekdays/weekends to its local slots in timezone; these keys classify runs, never start them. Use always_full for full-run slots. Measure lateness from the latest local slot at/before the command, including preceding days. Count either repeated-time occurrence, omit nonexistent times. Use the script clock, never drive time; show slot/delay above 15 minutes immediately after the 📬 first line.
+Use the host scheduler. Set schedule.weekdays/weekends to its local slots in timezone; these keys classify runs, never start them. Use always_full for full-run slots. Measure lateness from the latest local slot at/before the command, including preceding days. Count either repeated-time occurrence, omit nonexistent times. Use the script clock, never drive time; show slot/delay above 15 minutes after the 📬 first line and account problems.
 
 Start in the checkout with PIGEON_HOME set and instruction: "Follow AGENTS.md for one scheduled Inbox triage and send the standard run message." Grant minimum file, command and gateway permissions, no bypass flags. For replies instruct: "Follow AGENTS.md’s Replies to numbered items procedure using my reply verbatim."
 
@@ -497,3 +298,15 @@ The client allows HTTPS on port 443 only, checks every DNS answer for public add
 The planner makes unsafe unsubscribe links and provider-flagged spam or phishing decisions for the user; it plans neither the request nor its companion action. Reports show safe planned unsubscribe destinations as hosts; mail values remain plain text on their item lines. Do not write unsubscribe rules for senders you suspect of spam or phishing; use spam instead. See the status table for local refusals and remembered failures.
 
 The network request releases the store gate. Ownership and the unchanged checkpoint are checked before saving its outcome or failure memory. Lost ownership leaves the issued call uncertain.
+
+## Storage validation
+
+Limit lock observations to 4096 bytes; IDs to 1–512 ASCII letters, digits or _ - . : !; tags to 1–512 ASCII letters, digits or _ - ! . , : { } or double quotes. Use UTC timestamps of at most 40 characters and at most five seconds future skew.
+
+Require fetched files to be readable regular nonsymlink files, at most 4194304 bytes, valid UTF-8 and valid format. Refuse missing/unexpected files before installation. Start absent script-owned files empty. Keep state-incoming free of links/subfolders; the next fetch removes leftover regular files.
+
+Keep calls.jsonl, history.log and decisions.jsonl to the script-owned 262144-byte newest-whole-line tails; never trim during execution, reporting, reply commit or send.
+
+## Quiet observation validation
+
+For history use a 1–128 ASCII-digit position and up to 1000 Inbox arrival IDs. For ids use at most ten unique newest-first IDs, each 1–512 ASCII letters, digits or _ - = + /. Run full for unknown fields, missing/extra accounts, wrong types, files over 65536 bytes, unreadable/absent files or decreasing positions. Prove quiet only with empty arrivals or unchanged ordered IDs for every account.
