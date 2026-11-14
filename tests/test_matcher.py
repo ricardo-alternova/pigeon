@@ -294,8 +294,8 @@ class MatcherTests(unittest.TestCase):
         self.batch(1, verb='report')
         plan = self.plan()
         with tempfile.TemporaryDirectory() as tmp:
-            triage.number_decisions(Path(tmp), plan, self.listing)
-        report = triage.render_report(plan, self.listing)
+            outcomes = triage.number_decisions(Path(tmp), plan, self.listing)
+        report = triage.render_report(plan, self.listing, outcomes=outcomes)
         self.assertIn('1. s0@example.net', report)
         self.assertNotIn('3. s0@example.net', report)
 
@@ -787,6 +787,69 @@ class ListingTests(unittest.TestCase):
             result = self.exchange(self.gateway.batch(result['calls']))
         return result,sizes
 
+    def test_r139_dry_listing_preserves_open_question(self):
+        import os, execute
+        execute.atomic(self.store/'inbox.json',self.listing)
+        env = dict(os.environ,PIGEON_HOME=str(self.store))
+        plan = subprocess.run(['python3','scripts/triage.py','plan','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--plan-out',str(self.store/'plan.json')],env=env,capture_output=True,text=True)
+        self.assertEqual(plan.returncode,0,plan.stderr)
+        self.assertEqual(execute.read(self.store/'plan.json')['approval_state'],'awaiting approval')
+        before = {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
+        self.listing['messages'][0]['subject'] = 'Dry only'
+        folder = self.store/'.dry-run'
+        folder.mkdir(mode=0o700,exist_ok=True)
+        def cli(*args):
+            result = subprocess.run(['python3','scripts/triage.py','listing','--dry-run','--token',self.token,*args],env=env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            return json.loads(result.stdout)
+        response = cli()
+        first = True
+        while not response.get('done'):
+            path = folder/'gateway-results.json'
+            values = self.gateway.batch(response['calls'])
+            if first: values[0] = dict(ok=False,error=dict(code=503))
+            first = False
+            execute.atomic(path,values)
+            response = cli('--results',str(path))
+        self.assertIn('Dry only',[m['subject'] for m in execute.read(folder/'inbox.json')['messages']])
+        self.assertEqual(before,{p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()})
+        listing = execute.read(folder/'inbox.json')
+        preview = dict(triage.build_plan(listing,[],[],self.config),dry_run=True)
+        self.assertIn('retried once, succeeded','\n'.join(triage.account_problems(preview,listing,self.store,'en')))
+
+    def test_round5_nested_status_and_retry_cli(self):
+        import subprocess, os, execute
+        for failed_twice in (False, True):
+            self.setUp()
+            def cli(*args):
+                result = subprocess.run(['python3', 'scripts/triage.py', 'listing', '--token', self.token, *args], env=dict(os.environ, PIGEON_HOME=str(self.store)), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+            response = cli()
+            first = True
+            while not response.get('done'):
+                values = self.gateway.batch(response['calls'])
+                for call, value in zip(response['calls'], values):
+                    if call['input']['accountId'] == 'cedar-example' and (first or failed_twice):
+                        value.clear()
+                        value.update(ok=False, error=dict(kind='ToolFailure', response=dict(status=502), message='PRIVATE_PROVIDER_TEXT'))
+                was_first = first
+                first = False
+                path = self.store/'gateway.json'
+                execute.atomic(path, values)
+                response = cli('--results', str(path))
+                if was_first:
+                    self.assertEqual(response.get('retries', {}).get('cedar'), 'retried once, retry pending')
+            expected = 'retried once, still failing' if failed_twice else 'retried once, succeeded'
+            self.assertEqual(response.get('retries', {}).get('cedar'), expected)
+            if failed_twice: self.assertEqual(response['failed']['cedar'], 'provider error (502)')
+            listing = execute.read(self.store/'inbox.json')
+            plan = triage.build_plan(listing, [], [], self.config, {})
+            text = '\n'.join(triage.account_problems(plan, listing, self.store, 'en'))
+            self.assertIn(expected, text)
+            self.assertNotIn('PRIVATE_PROVIDER_TEXT', text)
+            self.assertIn(expected, triage.message_opening(self.store))
+
     def test_roundtrip_paging_splitting_resume(self):
         result,sizes = self.finish()
         actual = json.loads((self.store/'inbox.json').read_text())
@@ -963,6 +1026,40 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(observed['cedar']['outcome'], 'error')
         self.assertEqual(observed['cedar']['reason'], 'provider error (404)')
 
+    def test_r137_response_status_listing_final_and_quiet(self):
+        import execute
+        for final in (False, True):
+            with self.subTest(final=final):
+                self.setUp()
+                if final: execute.atomic(self.store/'inbox.json', self.listing)
+                result = self.exchange(ids_only=final)
+                for _ in range(20):
+                    if result.get('done'): break
+                    values = self.gateway.batch(result['calls'])
+                    for call, value in zip(result['calls'], values):
+                        if call['input']['accountId']=='cedar-example':
+                            value.update(ok=True, value={'response':{'status':403}})
+                    result = self.exchange(values, ids_only=final)
+                self.assertTrue(result.get('done'))
+                self.assertEqual(result['failed'], {'cedar':'provider error (403)'})
+                listing = execute.read(self.store/('final-inbox.json' if final else 'inbox.json'))
+                self.assertNotIn('cedar', listing['accounts'])
+                self.assertEqual(len(listing['messages']), 120)
+        self.setUp()
+        previous = {'_positions':{'cedar':'100','marble':[]}}
+        first = triage.quiet_gateway(self.store,self.token,self.config,previous)
+        values = self.gateway.batch(first['calls'])
+        for call, value in zip(first['calls'], values):
+            if call['input']['accountId']=='cedar-example':
+                value.update(ok=True,value={'response':{'status':404}})
+        path=self.store/'quiet-results.json'; execute.atomic(path,values)
+        retry = triage.quiet_gateway(self.store,self.token,self.config,previous,path)
+        self.assertTrue(all(c['input']['accountId']=='cedar-example' for c in retry['calls']))
+        execute.atomic(path,[dict(ok=True,value=dict(response=dict(status=404))) for c in retry['calls']])
+        observed=execute.read(triage.quiet_gateway(self.store,self.token,self.config,previous,path))
+        self.assertEqual(observed['cedar']['outcome'], 'error')
+        self.assertEqual(observed['cedar']['reason'], 'provider error (404)')
+
     def test_quiet_twice_failed_prints_each_reason_once(self):
         import execute, io
         from contextlib import redirect_stderr
@@ -1019,6 +1116,8 @@ class ListingTests(unittest.TestCase):
         execute.atomic(path,self.gateway.batch(retry['calls']))
         observation=triage.quiet_gateway(self.store,self.token,self.config,previous,path)
         self.assertEqual(execute.read(observation)['cedar']['outcome'],'ok')
+        decision = triage.quiet_check(self.store, self.config, previous, observation, False, triage.datetime.now(triage.timezone.utc))
+        self.assertEqual(decision['retries'], {'cedar': 'retried once, succeeded'})
 
     def test_ids_only_and_quiet_gateway(self):
         (self.store/'inbox.json').write_text(json.dumps(self.listing))
@@ -1323,3 +1422,199 @@ class GatewayRobustnessTests(unittest.TestCase):
             triage.reply_plan(self.store,listing,[],self.config,previous,[dict(number=7,verb='trash',target=None)])
         self.assertIn('Run failed at plan',triage.render_message(self.store,self.token,self.store/'absent.json',None))
         self.assertIn('Run failed at message',triage.render_message(self.store,self.token,self.store/'gateway.json',None))
+
+
+class ListingIdentityFieldsTests(unittest.TestCase):
+    setUp = MatcherTests.setUp
+    def test_optional_identity_fields(self):
+        for key in ('conversation_id', 'internet_message_id'):
+            self.listing['messages'][0][key] = 'invented-id'
+            triage.validate_inputs(self.listing, self.config, {})
+            for value in (None, 1, [], {}):
+                self.listing['messages'][0][key] = value
+                with self.assertRaisesRegex(ValueError, key):
+                    triage.validate_inputs(self.listing, self.config, {})
+            del self.listing['messages'][0][key]
+
+    def test_provider_identity_fields(self):
+        gmail = dict(provider='gmail', executor_app='cedar', executor_account='cedar')
+        outlook = gmail | dict(provider='outlook')
+        self.assertIn('Message-ID', triage.mail_call(gmail, 'message', id='m1')['input']['input']['query']['metadataHeaders'])
+        select = triage.mail_call(outlook, 'ids')['input']['input']['query']['$select']
+        self.assertIn('conversationId', select)
+        self.assertIn('internetMessageId', select)
+
+    def test_identity_fields_survive_listing_parser(self):
+        for provider in ('gmail', 'outlook'):
+            config = dict(accounts={'cedar':dict(provider=provider)})
+            state = dict(data={'cedar':dict(total=1, messages=[], ids=[], seen={})}, queue=[])
+            if provider == 'gmail':
+                job = dict(account='cedar', kind='message', id='m1')
+                value = dict(id='m1', threadId='thread1', labelIds=['INBOX'], internalDate='1000',
+                             payload=dict(headers=[dict(name='Message-ID', value='<m1@example.net>')]))
+            else:
+                job = dict(account='cedar', kind='ids')
+                value = dict(value=[dict(id='m1', conversationId='thread1', internetMessageId='<m1@example.net>',
+                                        subject='Fixture', receivedDateTime='2026-03-01T00:00:00+00:00',
+                                        hasAttachments=False, **{'from':dict(emailAddress=dict(address='a@example.net'))})])
+            triage.consume_listing(state, job, value, config, False)
+            message = state['data']['cedar']['messages'][0]
+            self.assertEqual(message['conversation_id'], 'thread1')
+            self.assertEqual(message['internet_message_id'], '<m1@example.net>')
+
+
+class PresentationGroupTests(unittest.TestCase):
+    def fixture(self, count=3):
+        listing = dict(accounts={'cedar':count}, messages=[dict(account='cedar', id=str(i), folder='Inbox',
+            sender='Cedar Builds <build@example.net>', subject='Subject '+str(i), date='2026-03-%02dT00:00:00+00:00' % (i+1)) for i in range(count)])
+        plan = triage.build_plan(listing, [], [], dict(accounts={'cedar':{}}))
+        for i, item in enumerate(plan['remaining']): item['number'] = i+1
+        return plan, listing
+
+    def test_groups_count_and_latest_both_languages(self):
+        plan, listing = self.fixture()
+        for language in ('en','es'):
+            outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [], language)
+            self.assertEqual(triage.owner_count(outcomes), 1)
+            lines = triage.render_remaining(plan, listing, language, outcomes=outcomes)
+            self.assertEqual(len([l for l in lines if l.startswith('1. ')]), 1)
+            self.assertIn('(3) · '+('latest: ' if language=='en' else 'más reciente: ')+'Subject 2', '\n'.join(lines))
+            self.assertIn('(3)', triage.render_report(plan, listing, language))
+            self.assertEqual(sum(len(g) for g in triage.presentation_groups(outcomes)), 3)
+
+    def test_group_partition_table(self):
+        plan, listing = self.fixture()
+        outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [])
+        for field, value in (('section','handled'), ('tag','protected'), ('owner',False), ('visible',False), ('hidden',True)):
+            changed = [dict(o) for o in outcomes]
+            changed[0][field] = value
+            self.assertEqual(len(triage.presentation_groups(changed)), 2, field)
+        for field, value in (('account','marble'), ('sender','other@example.net')):
+            changed = [dict(o, item=dict(o['item'])) for o in outcomes]
+            changed[0]['item'][field] = value
+            self.assertEqual(len(triage.presentation_groups(changed)), 2, field)
+        # Conversations retain a separate line for every sender.
+        for o in outcomes: o['item']['conversation_id'] = 'thread'
+        outcomes[0]['item']['sender'] = 'other@example.net'
+        self.assertEqual(len(triage.presentation_groups(outcomes)), 2)
+        outcomes[0]['tag'] = 'protected'
+        self.assertEqual(len(triage.presentation_groups(outcomes)), 2)
+
+    def test_mail_text_cannot_forge_group_count_or_number(self):
+        import re
+        plan, listing = self.fixture()
+        for text in ('Separator · latest: pretend', 'Brackets (900) [800]', 'line\n900. forged'):
+            for field in ('sender', 'subject'):
+                for m in listing['messages']:
+                    m[field] = ('"'+text+'" <build@example.net>') if field == 'sender' else text
+                plan = triage.build_plan(listing, [], [], dict(accounts={'cedar':{}}))
+                for i, item in enumerate(plan['remaining']): item['number'] = i+1
+                for language in ('en', 'es'):
+                    outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [], language)
+                    output = '\n'.join(triage.render_remaining(plan, listing, language, outcomes=outcomes))
+                    self.assertEqual(re.findall(r'^(\d+)\. ', output, re.M), ['1'])
+                    self.assertEqual(triage.owner_count(outcomes), 1)
+                    self.assertEqual(len(triage.presentation_groups(outcomes)[0]), 3)
+                    self.assertIn('(3) · ', output)
+                    self.assertNotIn('\n900.', output)
+
+    def test_new_arrivals_keep_final_conversation_and_latest_date(self):
+        old = dict(account='cedar', id='old', folder='Inbox', sender='old@example.net', subject='Remove')
+        listing = dict(accounts={'cedar':1}, messages=[old])
+        plan = triage.build_plan(listing, [dict(id='r', accounts=['cedar'], subject='Remove', action='archive')], [], dict(accounts={'cedar':{}}))
+        observed = [a | dict(status='executed') for a in plan['actions']]
+        final = dict(accounts={'cedar':2}, messages=[
+            dict(old, id='new1', sender='first@example.org', subject='Older', date='2026-03-01T00:00:00+00:00', conversation_id='thread'),
+            dict(old, id='new2', sender='second@example.org', subject='Newest', date='2026-03-02T00:00:00+00:00', conversation_id='thread')])
+        remaining = triage.remaining_items(plan, final, observed, final=True)
+        for i, item in enumerate(remaining): item['number'] = i+1
+        for language in ('en', 'es'):
+            outcomes = triage.message_outcomes(plan, listing, remaining, observed, language, final_listing=final)
+            self.assertEqual(triage.owner_count(outcomes), 2)
+            text = '\n'.join(triage.render_remaining(plan, final, language, outcomes=outcomes))
+            self.assertIn('second@example.org · Newest', text)
+            self.assertEqual(sum(len(g) for g in triage.presentation_groups(outcomes)), 3)
+            self.assertEqual(sum(o['section'] == 'handled' for o in outcomes), 1)
+
+
+class CrossAccountIdentityTests(unittest.TestCase):
+    def test_identity_requires_raw_metadata(self):
+        from scripts import triage
+        first = {'account': 'cedar', 'sender': 'a@example.com', 'subject': 'Hello',
+                 'internet_message_id': '<shared@example.com>'}
+        second = dict(first, account='birch')
+        self.assertTrue(triage.same_message(first, second))
+        second['sender'] = 'other@example.org'
+        self.assertFalse(triage.same_message(first, second))
+        second['sender'] = first['sender']
+        second['internet_message_id'] = '<other@example.com>'
+        self.assertFalse(triage.same_message(first, second))
+
+    def test_cross_account_table_both_languages(self):
+        for language in ('en', 'es'):
+            for case, delta, mid, subject, copies, protected, expected in [
+                ('id', None, True, 'Changed', 2, False, 2),
+                ('fallback', 300, False, 'Hello', 2, False, 1),
+                ('outside', 301, False, 'Hello', 2, False, 2),
+                ('missing', None, False, 'Hello', 2, False, 2),
+                ('subject', 0, False, 'Other', 2, False, 2),
+                ('three', 0, True, 'Hello', 3, False, 1),
+                ('protected', 0, True, 'Hello', 2, True, 2),
+            ]:
+                with self.subTest(language=language, case=case):
+                    accounts = {a: {'name': a.title()} for a in ('cedar', 'birch', 'elm')[:copies]}
+                    messages = [dict(account=a, id=a, folder='Inbox', sender='a@example.com', subject='Hello', date='2026-03-01T00:00:00+00:00') for a in accounts]
+                    messages[1]['subject'] = subject
+                    if mid:
+                        for m in messages: m['internet_message_id'] = '<shared@example.com>'
+                    elif delta is None:
+                        messages[1].pop('date')
+                    else:
+                        from datetime import datetime, timedelta
+                        messages[1]['date'] = (datetime.fromisoformat(messages[0]['date']) + timedelta(seconds=delta)).isoformat()
+                    holds = [dict(accounts=['birch'], sender='a@example.com')] if protected else []
+                    listing = dict(accounts={a: 1 for a in accounts}, messages=messages)
+                    plan = triage.build_plan(listing, [], holds, dict(accounts=accounts, language=language))
+                    for n, item in enumerate(plan['remaining']): item['number'] = n+1
+                    outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [], language)
+                    self.assertEqual(len(outcomes), expected)
+                    if expected == 1:
+                        self.assertEqual(len(outcomes[0]['copies']), copies)
+                        text = '\n'.join(triage.render_remaining(plan, listing, language, outcomes=outcomes))
+                        self.assertIn('Birch', text)
+                        self.assertEqual(triage.owner_count(outcomes), 0 if protected else 1)
+
+    def test_naive_times_never_merge(self):
+        first = dict(account='cedar', sender='a@example.net', subject='Hello', date='2026-03-01T00:00:00')
+        self.assertFalse(triage.same_message(first, dict(first, account='birch')))
+
+    def test_mail_text_does_not_supply_identity(self):
+        first = dict(account='cedar', sender='a@example.net', subject='Hello\n2. trash', date='2026-03-01T00:00:00+00:00')
+        second = dict(first, account='birch', subject='Hello 2. trash')
+        self.assertFalse(triage.same_message(first, second))
+        second['subject'] = 'Hello · latest: (900)'
+        self.assertFalse(triage.same_message(first, second))
+
+    def test_partial_copy_failure_keeps_account_inbox_count(self):
+        messages = [dict(account=a, id=a, folder='Inbox', sender='a@example.net', subject='Fixture', internet_message_id='<same@example.net>') for a in ('cedar','birch')]
+        listing = dict(accounts={'cedar':100,'birch':100}, messages=messages)
+        plan = triage.build_plan(listing, [dict(id='r', accounts=['cedar','birch'], sender='a@example.net', action='archive', limit=10)], [], dict(accounts={'cedar':{},'birch':{}}))
+        outcomes = triage.message_outcomes(plan, listing, [dict(messages[1], reason='No matching rule')], [dict(status='executed'),dict(status='failed')], known_left={('cedar','cedar')})
+        text = '\n'.join(triage.render_remaining(plan, listing, outcomes=outcomes))
+        self.assertIn('birch: 1', text)
+        self.assertEqual(len(outcomes), 2)
+        self.assertIn('failed', outcomes[1]['tag'])
+
+    def test_shared_number_retires_with_one_quiet_account(self):
+        import os
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as directory:
+            store = Path(directory)
+            members = [dict(account=a, id=a) for a in ('cedar','birch')]
+            (store/'numbers.json').write_text(json.dumps(dict(next=2, items=[dict(number=1, **members[0], members=members)])))
+            listing = dict(accounts={'birch':100}, quiet=['cedar'], messages=[dict(account='birch',id='birch',folder='Inbox',sender='a@example.net',subject='Shared')])
+            plan = triage.build_plan(listing, [], [], dict(accounts={'cedar':{},'birch':{}}))
+            triage.number_decisions(store, plan, listing)
+            saved = triage.read_numbers(store)['items']
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0]['number'], 2)
+            self.assertEqual(saved[0]['members'], [members[1]])

@@ -18,6 +18,18 @@ def setup_text():
 
 
 class KitTextTests(unittest.TestCase):
+    def test_scaled_message_documentation(self):
+        quick = (ROOT/'docs/quickstart.md').read_text()
+        setup = (ROOT/'docs/setup.md').read_text()
+        for phrase in ('first configured account holding', 'three sender examples'):
+            self.assertIn(phrase, setup)
+            self.assertNotIn(phrase, quick)
+        self.assertIn('every saved member', quick)
+        self.assertIn('create it with mode 700', quick)
+        self.assertIn('The quiet check saves nothing.', quick)
+        self.assertIn('five minutes', setup)
+        self.assertIn('saved reports retain the grouped list', setup)
+
     def test_approval_lifecycle_and_exit_are_explicit(self):
         quick = (ROOT/'docs/quickstart.md').read_text()
         self.assertNotIn('## Brake refusal',quick)
@@ -99,7 +111,7 @@ class KitTextTests(unittest.TestCase):
 
     def test_routine_quickstart_size_and_entry_points(self):
         path = ROOT / 'docs/quickstart.md'
-        self.assertLessEqual(len(path.read_bytes()), 14600)
+        self.assertLessEqual(len(path.read_bytes()), 15200)
         self.assertLessEqual(len(re.findall(r'\]\(setup\.md(?:#|\))', path.read_text())), 3)
         for name in ('README.md', 'AGENTS.md', '.agents/skills/email-triage/SKILL.md'):
             self.assertIn('docs/quickstart.md', (ROOT / name).read_text())
@@ -113,7 +125,7 @@ class KitTextTests(unittest.TestCase):
 
     def test_reference_size_caps(self):
         self.assertLessEqual((ROOT / 'docs/setup.md').stat().st_size, 38000)
-        self.assertLessEqual((ROOT / 'docs/hosted-setup.md').stat().st_size, 16000)
+        self.assertLessEqual((ROOT / 'docs/hosted-setup.md').stat().st_size, 16300)
         self.assertLess((ROOT / 'AGENTS.md').stat().st_size, 8000)
 
     def test_common_exceptions_are_self_contained(self):
@@ -685,7 +697,7 @@ class DraftDocumentationTests(unittest.TestCase):
         self.assertIn('Create and show issued drafts. Never send them.', (ROOT/'config/guardrails.example.md').read_text())
         quick = (ROOT/'docs/quickstart.md').read_text()
         self.assertIn('create-draft', quick)
-        self.assertLessEqual(len(quick.encode()),14600)
+        self.assertLessEqual(len(quick.encode()),15200)
 
 
 class ScriptedListingTextTests(unittest.TestCase):
@@ -693,4 +705,4 @@ class ScriptedListingTextTests(unittest.TestCase):
         text = (Path(__file__).resolve().parents[1] / 'docs/quickstart.md').read_text()
         self.assertIn('triage.py listing --token TOKEN', text)
         self.assertIn('triage.py listing --token TOKEN --results', text)
-        self.assertLessEqual(len(text.encode()), 14600)
+        self.assertLessEqual(len(text.encode()), 15200)

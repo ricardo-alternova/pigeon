@@ -70,6 +70,8 @@ Keep inputs fixed. Stopped plans have no actions. Awaiting approval uses [Approv
 PIGEON_HOME=/absolute/private-store python3 scripts/execute.py next --token TOKEN --plan /absolute/private-store/plan.json
 ```
 
+With no actions, next answers done at once, takes no final reading; continue to commit and message.
+
 Pass calls unchanged once. Without path/input use [action recipes](hosted-setup.md#gateway-recipes). Save and report results:
 
 ```bash
@@ -102,6 +104,7 @@ Resume lock reads with --lock-observation PATH.
 PIGEON_HOME=/absolute/private-store python3 scripts/triage.py message --token TOKEN --plan /absolute/private-store/plan.json --results /absolute/private-store/results.json
 ```
 
+
 Post its output unchanged. Hold the lock. If posting succeeds run `rm -f /absolute/private-store/run-message.md`; if posting fails save the output there. Then run send-state.
 
 ## Release
@@ -130,9 +133,9 @@ Resume listing --results until done; plan/execute/commit/message even if all acc
 
 ## Approval question
 
-On awaiting approval, retain question_id. Commit and message; relay every word, including the last line. Release; end the turn. Never answer for the owner or treat silence as an answer.
+Retain question_id. Commit and message; relay every word, including the last line. Release; end the turn. Never answer for the owner or treat silence as an answer.
 
-On reply, acquire/fetch; save the owner's answer unchanged in reply.txt. RUN_ID is question_id; the owner never types it:
+On proceed or skip, acquire and fetch only; keep inbox.json unchanged; save the owner's answer unchanged in reply.txt. RUN_ID is question_id; the owner never types it:
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py reply --token TOKEN --inbox /absolute/private-store/inbox.json --reply /absolute/private-store/reply.txt --plan-out /absolute/private-store/plan.json --question RUN_ID`
 
@@ -203,17 +206,17 @@ Replace ACCOUNT/kind/tool with account/operation/discovered path. Continue only 
 
 ## Numbered reply
 
-Acquire, fetch, validate and list afresh; omit quiet-check, position reads and --scheduled. Keep positions unchanged. Save the user's text verbatim in reply.txt. Accept number plus trash, archive, spam, move to an existing folder path, leave, yes or no; separate with commas, semicolons or line breaks. Never create reply folders.
+For numbered replies, acquire, fetch, validate and list afresh; omit quiet-check, position reads and --scheduled. Keep positions unchanged. Save the user's text verbatim in reply.txt. Accept number plus trash, archive, spam, move to an existing folder path, leave, yes or no; separate with commas, semicolons or line breaks. Never create reply folders. A group or shared number acts on every saved member in each account; gone group members are skipped.
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py reply --token TOKEN --inbox /absolute/private-store/inbox.json --reply /absolute/private-store/reply.txt --plan-out /absolute/private-store/plan.json --report-out /absolute/private-store/report.md`
 
-Continue next/result/final, Commit and message, Release. Retain numbers, account, sender, subject and outcomes. Post refusals and ask for a supported reply. Never reuse retired numbers or act on unlisted accounts. Keep rule edits separate and follow [Writing a rule](../AGENTS.md#writing-a-rule).
+Continue next/result/final, Commit and message, Release. Keep committed numbers and reply outcomes. Post refusals and ask for a supported reply. Never reuse retired numbers or act on unlisted accounts. Keep rule edits separate and follow [Writing a rule](../AGENTS.md#writing-a-rule).
 
 ## Dry run
 
-Acquire and fetch as above. Add --dry-run to quiet-check; save responses in /absolute/private-store/.dry-run (create it with mode 700). Pass --progress RESPONSE_FILE with --results RESULTS_FILE until decision and positions print. On skip end the rehearsal and release; on full list as above. The quiet check saves nothing.
+Acquire and fetch as above. Use --dry-run on quiet-check; save responses in /absolute/private-store/.dry-run (create it with mode 700). Pass --progress RESPONSE_FILE with --results RESULTS_FILE until decision and positions print. On skip end the rehearsal and release; on full list as above with --dry-run; it writes .dry-run/inbox.json. For an account without a provider, hand-build the full listing in .dry-run/inbox.json. The quiet check saves nothing.
 
-Add --dry-run to plan with --plan-out /absolute/private-store/rehearsal.json; omit --report-out. After planning, resave the dry quiet decision in .dry-run for --positions. Render with message --token TOKEN --plan PLAN as above. To simulate actions, run `PIGEON_HOME=/absolute/private-store python3 scripts/execute.py dry-run --plan /absolute/private-store/rehearsal.json`; add --fail N to fail the Nth planned action, counting from 1; add --positions PATH for the dry quiet decision. For an awaiting dry plan, use the printed question_id as RUN_ID with --approve RUN_ID on the disposable copy. Read simulated_calls (SIMULATION_ONLY), simulated_results and commit_preview counts/positions. Pass none of this output to the gateway or a real run. Deliver/release; skip commit-state/send-state. Replies do nothing.
+Add --dry-run to plan with --inbox /absolute/private-store/.dry-run/inbox.json and --plan-out /absolute/private-store/rehearsal.json; omit --report-out. Save the dry quiet decision in .dry-run for --positions. Render with message --token TOKEN --plan PLAN. Simulate with `PIGEON_HOME=/absolute/private-store python3 scripts/execute.py dry-run --plan /absolute/private-store/rehearsal.json`; add --fail N to fail the Nth planned action, from 1; add --positions PATH for the dry quiet decision. For an awaiting dry plan, use question_id as RUN_ID with --approve RUN_ID in simulation. Read simulated_calls (SIMULATION_ONLY), simulated_results and commit_preview. Never pass simulation output to the gateway or a real run. Deliver/release; skip commit-state/send-state. Replies do nothing.
 
 ## Quiet observations
 

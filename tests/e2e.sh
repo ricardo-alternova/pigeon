@@ -73,7 +73,7 @@ while True:
 
 run(blocks[10],token)
 message=run(blocks[11],token)
-assert '2 handled' in message and 'Still in Inbox' in message
+assert '1 handled' in message and 'Still in Inbox' in message
 run(re.search(r'`(rm -f [^`]+run-message\.md)`',text).group(1),token)
 assert not (store/'run-message.md').exists()
 assert json.loads(run(blocks[12],token))['done']
@@ -201,9 +201,12 @@ for dry in (True, False):
     outcomes = {c['name']: drive.file_call(c)['status'] for c in downloads}
     assert json.loads(observed(blocks[3], outcomes, token, 'state-observation.json'))['done']
     (store/'inbox.json').write_text(json.dumps(original))
-    before = {n: (store/n).read_bytes() if (store/n).exists() else None for n in ('state.json','numbers.json','calls.jsonl','history.log','decisions.jsonl')}
+    before = {n: (store/n).read_bytes() if (store/n).exists() else None for n in ('state.json','numbers.json','calls.jsonl','history.log','decisions.jsonl','inbox.json','plan.json')}
     plan_command = blocks[7]
     if dry:
+        (store/'.dry-run').mkdir(mode=0o700,exist_ok=True)
+        (store/'.dry-run/inbox.json').write_text(json.dumps(original))
+        plan_command = plan_command.replace('/inbox.json','/.dry-run/inbox.json')
         plan_command = plan_command.replace(' --report-out /absolute/private-store/report.md', '').replace('/plan.json', '/rehearsal.json') + ' --dry-run'
     run(plan_command, token)
     plan = json.loads((store/('rehearsal.json' if dry else 'plan.json')).read_text())
@@ -402,7 +405,7 @@ assert final_message.count('Keep this renewal?') == 1
 
 assert 'extra' in (store/'execution-report.md').read_text()
 command(5, token)
-assert json.loads((store/'state.json').read_text()) == {'version': 1, 'cedar': 1, 'marble': 0}
+assert json.loads((store/'state.json').read_text()) == {'_next_number': 2, '_run_counter': 1, 'version': 1, 'cedar': 1, 'marble': 0}
 command(6, token)
 assert not (store/'run.lock').exists()
 
@@ -455,7 +458,7 @@ documented(3, token)
 documented(4, token)
 documented(7, token)
 documented(8, token)
-listing['messages'] = [dict(account='cedar', id='reply-'+str(i), folder='Inbox', sender='helper@example.org', subject='Question '+str(i)) for i in range(3)]
+listing['messages'] = [dict(account='cedar', id='reply-'+str(i), folder='Inbox', sender='helper'+str(i)+'@example.org', subject='Question '+str(i)) for i in range(3)]
 listing['accounts']['cedar'] = 100
 listing['folders'] = {'cedar': [dict(id='billing', name='Billing')]}
 token = documented(0).strip()
@@ -465,11 +468,12 @@ assert json.loads(documented(2, token, on_demand=True))['decision'] == 'full'
 (store/'inbox.json').write_text(json.dumps(listing))
 documented(3, token, on_demand=True)
 plan = json.loads((store/'plan.json').read_text())
-numbers = [d['number'] for d in plan['decisions']]
-assert numbers == list(range(numbers[0], numbers[0] + 3))
-assert all(str(n)+'. ' in (store/'report.md').read_text() for n in numbers)
+assert not re.findall(r'^\d+\. ',(store/'report.md').read_text(),re.M)
 documented(4, token)
 documented(7, token)
+numbers = [i['number'] for i in json.loads((store/'numbers.json').read_text())['items']]
+assert numbers == list(range(numbers[0], numbers[0] + 3))
+assert all(str(n)+'. ' in (store/'report.md').read_text() for n in numbers)
 documented(8, token)
 # Fake fresh gateway listing is identical. No real gateway is contacted.
 token = documented(9).strip()
@@ -671,8 +675,18 @@ for iteration in (1, 2, 3, 4):
         assert json.loads(run(store, blocks[7], token))['call']['operation'] == 'read'
         observed(store, blocks[7] + ' --lock-observation /absolute/private-store/lock-commit-observation.json', dict(status='ok', **item), token, 'lock-commit-observation.json')
         current = {n:json.loads((store/n).read_text()) for n in ('numbers.json','state.json')}
+        assert current['numbers.json']['committed_run'] == token
+        assert all(i['run_token'] == token for i in current['numbers.json']['items'])
+        assert current['numbers.json']['_run_counter'] == current['state.json']['_run_counter']
+        current['numbers.json'].pop('_run_counter')
+        current['state.json'].pop('_run_counter')
+        current['numbers.json']['items'] = [{k:i[k] for k in ('number','account','id','members')} for i in current['numbers.json']['items']]
+        current['numbers.json'].pop('committed_run')
+        current['numbers.json'].pop('answers')
         if previous is not None: assert current == previous
         previous = current
+        if iteration in (2, 3):
+            assert json.loads((store/'numbers.json').read_text())['answers'] == [dict(account='cedar',id='item-a',verb='yes')]
         if iteration == 2:
             assert json.loads((store/'decisions.jsonl').read_text())['parts'][0]['outcome'] == 'answered'
     if iteration == 3: (store/'run-message.md').write_text('Delivery failed\n')
@@ -691,10 +705,10 @@ for iteration in (1, 2, 3, 4):
             outcome = dict(status='done',size=len(raw))
         result = json.loads(observed(store, find('send-state', 'upload-observation.json'), outcome, token, 'upload-observation.json'))
     if iteration == 1: assert uploaded[0] == 'numbers.json' and uploaded[-1] == 'state.json'
-    if iteration == 2: assert set(uploaded) <= {'state.json', 'decisions.jsonl'}
+    if iteration == 2: assert set(uploaded) <= {'numbers.json', 'state.json', 'decisions.jsonl'}
     if iteration == 4: assert uploaded == ['history.log']
     if iteration == 3:
-        assert uploaded == ['run-message.md']
+        assert uploaded == ['numbers.json', 'run-message.md', 'state.json']
         assert (store/'run-message.md').read_text().splitlines()[0] == result['warning']
     print('run', iteration, 'delete pigeon-run-lock if_match=v1 -> guardrails.example.md:9 conditional lock delete')
     assert json.loads(run(store, blocks[8], token))['call']['operation'] == 'delete'

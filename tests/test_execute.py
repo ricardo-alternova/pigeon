@@ -30,6 +30,1506 @@ class ExecuteTests(unittest.TestCase):
         save_plan(self.store, self.token, self.path, self.plan)
 
 
+    def test_restored_numbers_never_reuse_lost_message_numbers(self):
+        for published_shape in (False, True):
+            with self.subTest(published_shape=published_shape):
+                self.setUp()
+                (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                (self.store/'rules.toml').write_text('rules=[]\n')
+                self.listing['messages'] = [dict(account='cedar',id=name,folder='Inbox',sender=name+'@example.org',subject=name) for name in ['ann','bob']]
+                execute.atomic(self.store/'inbox.json',self.listing)
+                self.assertEqual(self.plan_cli().returncode,0)
+                self.commit_numbered_run()
+                old = (self.store/'numbers.json').read_bytes()
+                self.listing['messages'] += [dict(self.listing['messages'][0],id=name,sender=name+'@example.org',subject=name) for name in ['cid','dan']]
+                execute.atomic(self.store/'inbox.json',self.listing)
+                self.assertEqual(self.plan_cli().returncode,0)
+                self.commit_numbered_run()
+                lost = triage.read_numbers(self.store)
+                dan = next(i['number'] for i in lost['items'] if i['id']=='dan')
+                (self.store/'numbers.json').write_bytes(old)
+                if published_shape:
+                    state = execute.read(self.store/'state.json')
+                    state.pop('_run_counter',None)
+                    execute.atomic(self.store/'state.json',state)
+                self.listing['messages'] = self.listing['messages'][1:] + [dict(self.listing['messages'][0],id='eve',sender='eve@example.org',subject='eve')]
+                execute.atomic(self.store/'inbox.json',self.listing)
+                self.assertEqual(self.plan_cli().returncode,0)
+                self.commit_numbered_run()
+                current = triage.read_numbers(self.store)
+                new = [i for i in current['items'] if i['number'] >= json.loads(old)['next']]
+                self.assertTrue(all(i['number'] >= lost['next'] for i in new))
+                (self.store/'reply.txt').write_text(str(dan)+' trash')
+                self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+                self.assertFalse(execute.read(self.path)['actions'])
+                self.assertIn('Unknown number',str(execute.read(self.path)['reasons']))
+
+    def test_r151_kept_reasons_two_runs(self):
+        for rule, expected in [
+            ('action="move"\ntarget="Missing"', 'Move target is ambiguous or missing'),
+            ('action="unsubscribe"', 'Unsafe unsubscribe'),
+            ('action="report"', 'Rule requests a decision'),
+            ('', 'Draft waiting since 2026-01-01T00:00:00+00:00; draft may exist; check Drafts by hand'),
+        ]:
+            with self.subTest(reason=expected):
+                self.setUp()
+                (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                (self.store/'rules.toml').write_text('rules=[]\n')
+                self.assertEqual(self.plan_cli().returncode, 0)
+                self.commit_numbered_run()
+                data = triage.read_numbers(self.store)
+                data['answers'] = [dict(account='cedar', id=str(i), verb='leave') for i in range(4)]
+                execute.atomic(self.store/'numbers.json', data)
+                if rule:
+                    (self.store/'rules.toml').write_text('[[rules]]\nid="notice"\naccounts=["cedar"]\nsender="a@example.net"\n'+rule+'\n')
+                else:
+                    state = execute.read(self.store/'state.json')
+                    state['_drafts'] = [dict(account='cedar',id=str(i),created='2026-01-01T00:00:00+00:00',draft_id=None,rule='notice') for i in range(4)]
+                    execute.atomic(self.store/'state.json', state)
+                for run in range(2):
+                    self.assertEqual(self.plan_cli().returncode, 0)
+                    self.machine().step()
+                    triage.commit_state(self.store,self.token,self.path)
+                    message = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path)).stdout
+                    for text in (message, (self.store/'report.md').read_text()):
+                        self.assertIn(expected + '; Kept by owner reply', text)
+                    triage.release(self.store,self.token)
+                    self.token = triage.acquire(self.store)
+
+    def test_r151_stale_rehearsal_executes(self):
+        self.test_r149_stale_dry_run()
+        result = self.run_cli('execute.py','dry-run','--plan',str(self.store/'rehearsal.json'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_r151_counter_files(self):
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        for name in ('decisions.jsonl', 'numbers.json', 'state.json'):
+            for value in (str(2**53), str(2**53+1), '9'*5000):
+                with self.subTest(file=name, digits=len(value)):
+                    self.setUp()
+                    (self.store/'rules.toml').write_text('rules=[]\n')
+                    (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                    raw = ('{"run":"old","time":"2026-01-01T00:00:00+00:00","parts":[],' if name=='decisions.jsonl' else '{"next":1,"items":[],"answers":[],' if name=='numbers.json' else '{"cedar":4,')
+                    (self.store/name).write_text(raw+'"_run_counter":'+value+'}\n')
+                    result = self.plan_cli()
+                    if name=='decisions.jsonl' and value != str(2**53):
+                        self.assertEqual(result.returncode,0,result.stderr)
+                        self.commit_numbered_run()
+                    elif value == str(2**53):
+                        self.assertEqual(result.returncode,0,result.stderr)
+                        self.machine().step()
+                        result = self.run_cli('triage.py','commit-state','--token',self.token,'--plan',str(self.path))
+                        self.assertNotEqual(result.returncode,0)
+                        self.assertIn(name,result.stderr)
+                        self.assertNotIn('Traceback',result.stderr)
+                    else:
+                        self.assertNotEqual(result.returncode,0)
+                        self.assertIn(name,result.stderr)
+                        self.assertNotIn('Traceback',result.stderr)
+
+    def test_r149_malformed_log_counters_plan_and_commit(self):
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        for value in ['x', None, True, -1, 1.5, 10 ** 100]:
+            with self.subTest(value=value):
+                (self.store/'decisions.jsonl').write_text(json.dumps(dict(run='old', time='2026-01-01T00:00:00+00:00', parts=[], _run_counter=value))+'\n')
+                result = self.plan_cli()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.commit_numbered_run()
+                self.assertEqual(len(triage.read_numbers(self.store)['items']), 1)
+
+    def test_r149_stale_dry_run(self):
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        execute.atomic(self.store/'state.json', {'cedar':4, '_run_counter':2})
+        execute.atomic(self.store/'numbers.json', dict(next=1, items=[], answers=[], _run_counter=1))
+        before = {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
+        path = self.store/'rehearsal.json'
+        result = self.plan_cli('--dry-run', '--plan-out', str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.run_cli('triage.py','message','--token',self.token,'--plan',str(path)).stdout
+        self.assertIn('Saved numbers were out of date; nothing is grouped', text)
+        self.assertNotIn('(4)', text)
+        self.assertEqual(before, {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file() and p.name in before})
+
+    def test_r147_uncommitted_unsubscribe_memory_does_not_refuse(self):
+        from unittest.mock import patch
+        import contextlib
+        import io
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        result = self.plan_cli()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.commit_numbered_run()
+        (self.store/'rules.toml').write_text('[[rules]]\nid="news"\naccounts=["cedar"]\nsender="a@example.net"\naction="unsubscribe"\nexclusions=[]\n')
+        self.listing['messages'] = [dict(self.listing['messages'][0], unsubscribe_url='https://news.example.net/unsub')]
+        execute.atomic(self.store/'inbox.json', self.listing)
+        result = self.plan_cli()
+        self.assertEqual(result.returncode,0,result.stderr)
+        args = ['--token',self.token,'--plan',str(self.path)]
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        with patch.dict(os.environ,PIGEON_HOME=str(self.store)), patch.object(sys,'argv',['execute.py','unsubscribe',*args]), patch('unsubscribe.request',return_value='failed'), contextlib.redirect_stdout(io.StringIO()):
+            execute.main()
+        self.assertTrue((self.store/'unsubscribe-failures.json').exists())
+        lock = execute.read(self.store/'run.lock')
+        lock['created'] -= 3600
+        execute.atomic(self.store/'run.lock',lock)
+        self.assertNotEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+        triage.release(self.store,self.token)
+        self.token = triage.acquire(self.store)
+        result = self.plan_cli()
+        self.assertEqual(result.returncode,0,result.stderr)
+        result = self.plan_cli()
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_r147_partial_commit_and_account_removal_recover(self):
+        from unittest.mock import patch
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        self.assertEqual(self.plan_cli().returncode, 0)
+        self.commit_numbered_run()
+        self.listing['messages'].append(dict(self.listing['messages'][0],id='arrival'))
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        self.machine().step()
+        with patch.object(triage, 'render_report', side_effect=OSError('Fixture disk full')):
+            with self.assertRaises(OSError):
+                triage.commit_state(self.store, self.token, self.path)
+        triage.release(self.store, self.token)
+        self.token = triage.acquire(self.store)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        self.commit_numbered_run()
+    def test_r147_removed_account_edit_recovers(self):
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'config.toml').write_text('[accounts.cedar]\n[accounts.birch]\n')
+        self.listing['accounts']['birch'] = 100
+        self.listing['messages'].append(dict(self.listing['messages'][0],account='birch',id='other'))
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        self.commit_numbered_run()
+        (self.store/'config.toml').write_text('[accounts.cedar]\n')
+        del self.listing['accounts']['birch']
+        self.listing['messages'] = [m for m in self.listing['messages'] if m['account']=='cedar']
+        execute.atomic(self.store/'inbox.json',self.listing)
+        self.assertNotEqual(self.plan_cli().returncode, 0)
+        state = execute.read(self.store/'state.json')
+        del state['birch']
+        execute.atomic(self.store/'state.json',state)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        self.commit_numbered_run()
+        self.assertEqual(self.plan_cli().returncode, 0)
+
+    def test_r147_counters_legacy_newer_and_recovery(self):
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        for state_counter, number_counter, expected in ((None,None,1),(2,3,1),(5,4,4),(6,6,1)):
+            with self.subTest(state_counter=state_counter, number_counter=number_counter):
+                state = {'cedar':4}
+                if state_counter is not None: state['_run_counter'] = state_counter
+                execute.atomic(self.store/'state.json', state)
+                data = triage.read_numbers(self.store)
+                if number_counter is not None: data['_run_counter'] = number_counter
+                execute.atomic(self.store/'numbers.json', data)
+                self.assertEqual(self.plan_cli().returncode, 0)
+                self.commit_numbered_run()
+                data = triage.read_numbers(self.store)
+                self.assertEqual(len(data['items']), expected)
+                self.assertEqual(data['_run_counter'], execute.read(self.store/'state.json')['_run_counter'])
+
+    def test_r147_spanish_stale_numbers_keep_saved_answers(self):
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'config.toml').write_text('language="es"\n[accounts.cedar]\n')
+        execute.atomic(self.store/'state.json', {'cedar':4,'_run_counter':5})
+        execute.atomic(self.store/'numbers.json', dict(next=1,items=[],_run_counter=2,
+            answers=[dict(account='cedar',id='0',verb='leave')]))
+        result = self.plan_cli()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.machine().step()
+        triage.commit_state(self.store,self.token,self.path)
+        text = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path)).stdout
+        self.assertIn('Los números guardados estaban desactualizados; no se agrupa nada', text)
+        self.assertEqual(len(triage.read_numbers(self.store)['items']),4)
+        self.assertEqual(triage.read_answers(self.store),{('cedar','0'):'leave'})
+
+    def test_final_read_retains_reply_folder_examples(self):
+        machine = self.machine()
+        machine.state['final_listing'] = dict(accounts=self.listing['accounts'], messages=self.listing['messages'], folders={'cedar': []})
+        current = machine.current_listing(self.listing)
+        self.assertEqual(current.get('folders'), self.listing['folders'])
+
+    def test_reply_confirmation_two_accounts_group_and_single(self):
+        for language in ('en', 'es'):
+            for count in (2, 12):
+                self.setUp()
+                (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                (self.store/'config.toml').write_text('language="'+language+'"\n[accounts.cedar]\nname="Cedar"\n[accounts.marble]\nname="Marble"\n')
+                (self.store/'rules.toml').write_text('rules=[]\n')
+                messages = [dict(account='cedar', id=str(i), folder='Inbox', sender='News <news@example.net>', subject='Notice '+str(i)) for i in range(count)]
+                messages.append(dict(account='marble', id='single', folder='Inbox', sender='Friend <friend@example.net>', subject='Hello'))
+                execute.atomic(self.store/'inbox.json', dict(accounts={'cedar':100,'marble':100}, messages=messages))
+                execute.atomic(self.store/'state.json', {'cedar':count,'marble':1})
+                self.assertEqual(self.plan_cli().returncode, 0)
+                self.commit_numbered_run()
+                (self.store/'reply.txt').write_text('1 archive, 2 trash')
+                result = self.run_cli('triage.py', 'reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('1 archive: Cedar: '+str(count), result.stdout)
+                self.assertIn('2 trash: Marble: 1', result.stdout)
+                if count == 12:
+                    self.assertIn('Nothing has run yet.' if language == 'en' else 'Todavía no se ha ejecutado nada.', result.stdout)
+                    self.assertIn('your reply' if language == 'en' else 'tu respuesta', result.stdout)
+                    self.assertIn('proceed' if language == 'en' else 'proceder', result.stdout)
+                    self.assertNotIn('numbered-reply', result.stdout)
+
+    def test_r143_answers_validation_upgrade_and_pruning(self):
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        log = self.store/'decisions.jsonl'
+        log.write_text(json.dumps(dict(parts=[dict(account='cedar',id='kept',verb='leave',outcome='answered')]))+'\n')
+        execute.atomic(self.store/'inbox.json',dict(accounts={'cedar':100},messages=[dict(account='cedar',id='kept',folder='Inbox',sender='boss@example.org',subject='Budget')]))
+        self.assertEqual(self.plan_cli().returncode,0)
+        self.commit_numbered_run()
+        self.assertEqual(triage.read_answers(self.store), {('cedar','kept'):'leave'})
+        log.write_text('')
+        # Hidden mail is still present in the full listing, and dry runs cannot prune.
+        (self.store/'config.toml').write_text('relist_inbox="new_plus_count"\n[accounts.cedar]\n')
+        self.assertEqual(self.plan_cli('--dry-run','--plan-out',str(self.store/'rehearsal.json')).returncode,0)
+        self.assertEqual(triage.read_answers(self.store), {('cedar','kept'):'leave'})
+        for listing in (dict(accounts={},messages=[],quiet=['cedar']),
+                        dict(accounts={},messages=[],skipped={'cedar':'provider error (503)'}),
+                        execute.read(self.store/'inbox.json')):
+            execute.atomic(self.store/'inbox.json',listing)
+            self.assertEqual(self.plan_cli().returncode,0)
+            self.commit_numbered_run()
+            self.assertEqual(triage.read_answers(self.store), {('cedar','kept'):'leave'})
+        execute.atomic(self.store/'inbox.json',dict(accounts={'cedar':100},messages=[]))
+        self.assertEqual(self.plan_cli().returncode,0)
+        self.commit_numbered_run()
+        self.assertEqual(triage.read_answers(self.store), {})
+        data = triage.read_numbers(self.store)
+        data['answers'] = {}
+        execute.atomic(self.store/'numbers.json', data)
+        result = self.plan_cli()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('numbers.json.answers',result.stderr)
+
+    def test_r143_missing_answers_keeps_uncertain_members_separate(self):
+        listing = dict(accounts={'cedar':100}, messages=[dict(account='cedar',id=str(i),folder='Inbox',sender='boss@example.org',subject='Notice '+str(i)) for i in range(3)])
+        plan = triage.build_plan(listing, [], [], {'accounts':{'cedar':{}}})
+        triage.number_decisions(self.store, plan, listing)
+        data = triage.read_numbers(self.store)
+        data.pop('answers')
+        execute.atomic(self.store/'numbers.json',data)
+        again = triage.build_plan(listing, [], [], {'accounts':{'cedar':{}}})
+        triage.number_decisions(self.store, again, listing)
+        self.assertEqual(len(triage.read_numbers(self.store)['items']),3)
+        self.assertEqual(set(triage.read_answers(self.store).values()), {'unknown'})
+
+    def test_r141_saved_groups_use_answers_independently_of_tags(self):
+        from unittest.mock import patch
+        messages = [dict(account='cedar',id=str(i),folder='Inbox',
+                         sender='Boss <boss@example.org>',subject='Notice '+str(i)) for i in range(4)]
+        listing = dict(accounts={'cedar':100},messages=messages)
+        plan = triage.build_plan(listing, [], [], {'accounts':{'cedar':{}}})
+        (self.store/'decisions.jsonl').write_text(json.dumps(dict(parts=[
+            dict(account='cedar',id=str(i),verb=verb,outcome='answered')
+            for i,verb in enumerate(('leave','yes','no'))]))+'\n')
+        original = triage.message_outcomes
+        def same_tags(*args, **kwargs):
+            outcomes = original(*args, **kwargs)
+            for outcome in outcomes:
+                outcome['tag'] = ''
+                outcome['item']['reason'] = 'Run stopped'
+            return outcomes
+        with patch.object(triage,'message_outcomes',side_effect=same_tags):
+            triage.number_decisions(self.store,plan,listing)
+        saved = triage.read_numbers(self.store)['items']
+        self.assertEqual(len(saved),4)
+        self.assertTrue(all(len(i['members'])==1 for i in saved))
+
+    def test_r141_four_run_refused_kept_reproduction(self):
+        import re
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        messages = [dict(account='cedar', id='budget', folder='Inbox',
+                         sender='Boss <boss@example.org>', subject='Budget')]
+        def finish():
+            args = ['--token',self.token,'--plan',str(self.path)]
+            self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+            result = self.run_cli('triage.py','commit-state',*args)
+            self.assertEqual(result.returncode,0,result.stderr)
+            message = self.run_cli('triage.py','message',*args).stdout
+            triage.release(self.store,self.token)
+            self.token = triage.acquire(self.store)
+            return message
+        def reply(text):
+            (self.store/'reply.txt').write_text(text)
+            return self.run_cli('triage.py','reply','--token',self.token,
+                '--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),
+                '--plan-out',str(self.path))
+        execute.atomic(self.store/'inbox.json',dict(accounts={'cedar':100},messages=messages))
+        self.assertEqual(self.plan_cli().returncode,0)
+        self.assertIn('1. Boss',finish())
+        self.assertEqual(reply('1 leave').returncode,0)
+        self.assertIn('Kept by owner reply',finish())
+        log = self.store/'decisions.jsonl'
+        with log.open('a') as out:
+            out.write((json.dumps(dict(run='later', parts=[]))+' '*300+'\n')*1100)
+        triage.trim_logs(self.store)
+        messages.append(dict(messages[0],id='lunch',subject='Lunch'))
+        execute.atomic(self.store/'inbox.json',dict(accounts={'cedar':100},messages=messages))
+        self.assertEqual(reply('9 explode').returncode,0)
+        message = finish()
+        saved = triage.read_numbers(self.store)['items']
+        self.assertEqual([len(i['members']) for i in saved],[1,1],message)
+        budget = next(i for i in saved if i['id']=='budget')
+        line = re.search(r'^'+str(budget['number'])+r'\. (.*)$',message,re.M).group(1)
+        self.assertIn('Kept by owner reply',line)
+        lunch = next(i for i in saved if i['id']=='lunch')
+        self.assertEqual(reply(str(lunch['number'])+' trash').returncode,0)
+        self.assertEqual([(a['account'],a['id']) for a in execute.read(self.path)['actions']],
+                         [('cedar','lunch')])
+
+    def test_r139_three_runs_randomized(self):
+        import random
+        import re
+        import io
+        from unittest.mock import patch
+        class Output(io.StringIO):
+            def reconfigure(self, **kw): pass
+        def command(*args):
+            out = Output()
+            with patch.dict(os.environ, PIGEON_HOME=str(self.store)), patch('sys.stdout', out):
+                triage.main(list(args))
+            return out.getvalue()
+        for seed in tuple(range(150)):
+            with self.subTest(seed=seed):
+                self.setUp()
+                rng = random.Random(seed)
+                (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                (self.store/'rules.toml').write_text('rules=[]\n')
+                messages = [dict(account='cedar', id=str(i), folder='Inbox', sender='Boss <boss@example.org>', subject='Notice '+str(i)) for i in range(rng.randrange(2,5))]
+                answers = {}
+                for run in range(3):
+                    if run == 2:
+                        messages.append(dict(messages[0], id='arrival', subject='Lunch'))
+                    execute.atomic(self.store/'inbox.json', dict(accounts={'cedar':100}, messages=messages))
+                    if run == 1:
+                        (self.store/'reply.txt').write_text(str(saved[0]['number'])+' '+rng.choice(['leave','yes','no']))
+                        command('reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+                    elif run == 2:
+                        (self.store/'reply.txt').write_text(rng.choice(['999999 archive', '9 explode']))
+                        command('reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+                    else:
+                        command('plan','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--plan-out',str(self.path))
+                    args = ['--token',self.token,'--plan',str(self.path)]
+                    machine = execute.Execution(self.store,self.token,self.path)
+                    machine.step()
+                    command('commit-state',*args)
+                    message = command('message',*args)
+                    saved = triage.read_numbers(self.store)['items']
+                    self.assertEqual(re.findall(r'^(\d+)\. ',message,re.M),[str(i['number']) for i in saved],message)
+                    members = [ (m['account'],m['id']) for i in saved for m in i['members'] ]
+                    self.assertEqual(len(members),len(set(members)))
+                    numbered = dict(re.findall(r'^(\d+)\. (.*)$', message, re.M))
+                    for entry in (self.store/'decisions.jsonl').read_text().splitlines() if (self.store/'decisions.jsonl').exists() else []:
+                        for part in json.loads(entry)['parts']:
+                            if part['outcome'] == 'answered':
+                                answers[part['account'],part['id']] = part['verb']
+                    for record in saved:
+                        self.assertEqual(len({answers.get((m['account'],m['id'])) for m in record['members']}), 1)
+                        if run == 2 and any((m['account'],m['id']) in answers for m in record['members']):
+                            self.assertIn('Kept by owner reply', numbered[str(record['number'])])
+
+                    # Compare with the same unanswered plan, before owner tags.
+                    baseline = triage.build_plan(dict(accounts={'cedar':100}, messages=messages), [], [],
+                                                 {'accounts': {'cedar': {}}}, stop_reasons=['Reply refused: fixture'] if run == 2 else [])
+                    reasons = {(d['account'],d['id']):d['reason'] for d in baseline['decisions']}
+                    for record in saved:
+                        for outcome in record['presentation']:
+                            key = (outcome['item']['account'], outcome['item']['id'])
+                            if key in answers:
+                                expected = reasons[key]
+                                self.assertEqual(outcome['tag'], 'Kept by owner reply' if expected == 'No matching rule'
+                                                 else expected + '; Kept by owner reply')
+                        group = record['presentation']
+                        line = numbered[str(record['number'])]
+                        self.assertIn(triage.group_text(group, 'en'), line)
+                        self.assertIn(group[0]['tag'], line)
+                        self.assertEqual(sum(m['account'] == record['account'] for m in record['members']), len(group))
+                        before = (self.store/'numbers.json').read_bytes()
+                        (self.store/'reply.txt').write_text(str(record['number'])+' archive')
+                        probe = self.store/'probe.json'
+                        command('reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(probe))
+                        self.assertEqual({(a['account'],a['id']) for a in execute.read(probe)['actions']},
+                                         {(m['account'],m['id']) for m in record['members']})
+                        self.assertEqual(before, (self.store/'numbers.json').read_bytes())
+                    if run == 1 and seed % 3 == 0:
+                        (self.store/'decisions.jsonl').write_text('')
+                    elif run == 1 and seed % 3 == 1:
+                        with (self.store/'decisions.jsonl').open('a') as log:
+                            log.write((json.dumps(dict(run='later', parts=[]))+' '*300+'\n')*900)
+                        triage.trim_logs(self.store)
+                    triage.release(self.store,self.token)
+                    self.token = triage.acquire(self.store)
+
+    def test_r139_randomized_operations_real_commands(self):
+        import io
+        import random
+        import re
+        from unittest.mock import patch
+        class Output(io.StringIO):
+            def reconfigure(self, **kw): pass
+        def command(script, *args):
+            output = Output()
+            with patch.dict(os.environ,PIGEON_HOME=str(self.store)), patch('sys.stdout',output), patch.object(sys,'argv',[script,*args]):
+                if script == 'triage.py': triage.main(list(args))
+                else: execute.main()
+            return output.getvalue()
+        seen = set()
+        for seed in tuple(range(150)):
+            with self.subTest(seed=seed):
+                self.setUp()
+                rng = random.Random(seed)
+                mode = 'all' if seed % 2 == 0 else 'new_plus_count'
+                language = 'en' if seed // 2 % 2 == 0 else 'es'
+                (self.store/'config.toml').write_text('language="'+language+'"\nrelist_inbox="'+mode+'"\n[accounts.cedar]\nname="Cedar"\n[accounts.birch]\nname="Birch"\n')
+                (self.store/'rules.toml').write_text('rules=[]\n')
+                (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                count = 12 if seed % 8 == 6 else rng.randrange(2,5)
+                world = [dict(account='cedar',id=str(i),folder='Inbox',sender='Boss <boss@example.org>',subject='Notice '+str(i),internet_message_id='<boss-'+str(i)+'@example.org>') for i in range(count)]
+                world += [dict(world[0],account='birch',id='copy'),
+                          dict(account='cedar',id='other',folder='Inbox',sender='Peer <peer@example.net>',subject='Other',internet_message_id='<other@example.net>')]
+                world.append(dict(world[-1],account='birch',id='other-copy'))
+                world.append(dict(account='birch',id='unique',folder='Inbox',sender='Friend <friend@example.net>',subject='Hello'))
+                previous = {}
+                answers = {}
+                issued_members = {}
+                old_numbers = None
+                last_message = []
+                for run in range(3):
+                    if run == 1 and seed % 5 == 0:
+                        world = [m for m in world if not (m['account']=='cedar' and m['id']==str(count-1))]
+                    if run == 2 and seed % 4 == 0:
+                        (self.store/'numbers.json').write_bytes(old_numbers)
+                    if run == 2:
+                        world.append(dict(account='cedar',id='arrival',folder='Inbox',sender='Boss <boss@example.org>',subject='Lunch',date='2026-11-14T15:00:00+00:00'))
+                        if seed % 7 == 0: world = [m for m in world if m['id'] != 'unique']
+                    quiet = run == 1 and seed % 3 == 0
+                    accounts = {'cedar':1000} if quiet else {'cedar':1000,'birch':1000}
+                    def snapshot(final=False):
+                        messages = [dict(m,conversation_id='conversation-'+str(run % 2)) for m in world if m['account'] in accounts]
+                        for m in messages:
+                            if m['id']=='other-copy' and bool(seed % 2) != final:
+                                m.pop('internet_message_id',None)
+                        return dict(accounts=accounts,messages=messages,quiet=['birch'] if quiet else [])
+                    listing = snapshot()
+                    execute.atomic(self.store/'inbox.json',listing)
+                    if run == 1:
+                        verb = ('leave','yes','no','archive','trash','refused','trash','archive')[seed % 8]
+                        (self.store/'reply.txt').write_text('999999 archive' if verb=='refused' else str(selected)+' '+verb)
+                        command('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+                    elif run == 2 and seed % 8 in (0, 1, 2):
+                        (self.store/'reply.txt').write_text(rng.choice(['999999 archive', '9 explode']))
+                        command('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+                    else:
+                        command('triage.py','plan','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--plan-out',str(self.path))
+                    if run == 1:
+                        active = execute.read(self.path)
+                        seen.update(e['verb'] for e in active.get('reply', []))
+                        if any(r.startswith('Reply refused:') for r in active['reasons']): seen.add('refused')
+                        if active.get('approval_state')=='awaiting approval': seen.add('approval')
+                    args = ['--token',self.token,'--plan',str(self.path)]
+                    if execute.read(self.path).get('approval_state')=='awaiting approval':
+                        command('execute.py','next',*args)
+                    else:
+                        for step in range(30):
+                            response = json.loads(command('execute.py','next',*args))
+                            if response.get('done'): break
+                            if 'final_reads' in response:
+                                execute.atomic(self.store/'final.json',snapshot(True))
+                                command('execute.py','final',*args,'--inbox',str(self.store/'final.json'))
+                                continue
+                            account,ident = response['account'],response['id']
+                            world = [m for m in world if (m['account'],m['id']) != (account,ident)]
+                            command('execute.py','result',*args,'--observation',json.dumps(dict(outcome='ok',inbox_ids=[m['id'] for m in world if m['account']==account])))
+                        else: self.fail('step machine did not finish')
+                    if execute.read(self.path).get('approval_state') != 'awaiting approval':
+                        self.assertTrue(all(r['status']=='executed' for r in execute.read(self.store/'results.json')['results']))
+                    command('triage.py','commit-state',*args)
+                    message = command('triage.py','message',*args)
+                    saved = triage.read_numbers(self.store)['items']
+                    for record in saved:
+                        members_now = {(m['account'],m['id']) for m in record['members']}
+                        self.assertEqual(issued_members.setdefault(record['number'], members_now), members_now)
+                    if run == 2 and seed % 4 == 0:
+                        for record in last_message:
+                            (self.store/'reply.txt').write_text(str(record['number'])+' trash')
+                            probe = self.store/'old-message-reply.json'
+                            command('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(probe))
+                            actions = execute.read(probe)['actions']
+                            self.assertTrue({(a['account'],a['id']) for a in actions} <= issued_members[record['number']])
+                    printed = dict(re.findall(r'^(\d+)\. (.*)$',message,re.M))
+                    current = [i for i in saved if i.get('run_token')==self.token]
+                    self.assertEqual(set(printed),{str(i['number']) for i in current},message)
+                    if execute.read(self.path).get('approval_state') != 'awaiting approval':
+                        for record in saved:
+                            if record not in current:
+                                self.assertEqual(record,previous[record['number']])
+                                self.assertTrue(mode=='new_plus_count' or all(m['account'] not in accounts for m in record['members']))
+                        n = len(printed)
+                        phrase = (str(n)+(' needs you' if n==1 else ' need you') if n else 'nothing needs you') if language=='en' else (str(n)+(' requiere tu decisión' if n==1 else ' requieren tu decisión') if n else 'nada requiere tu decisión')
+                        self.assertIn(' · '+phrase+' · ',message.splitlines()[0])
+                    for entry in (self.store/'decisions.jsonl').read_text().splitlines() if (self.store/'decisions.jsonl').exists() else []:
+                        for part in json.loads(entry)['parts']:
+                            if part['outcome'] == 'answered':
+                                answers[part['account'],part['id']] = part['verb']
+                    for record in saved:
+                        self.assertEqual(len({answers.get((m['account'],m['id'])) for m in record['members']}), 1)
+                    previous = {i['number']:i for i in saved}
+                    members = [(m['account'],m['id']) for i in saved for m in i['members']]
+                    self.assertEqual(len(members),len(set(members)))
+                    if run == 0: selected = next(i['number'] for i in saved if i['id']=='0' and i['account']=='cedar')
+                    fresh = self.store/'fresh-reply.json'
+                    execute.atomic(fresh,snapshot(True))
+                    for record in current:
+                        group = record['presentation']
+                        line = printed[str(record['number'])]
+                        self.assertIn(triage.group_text(group,language),line)
+                        self.assertIn(group[0]['tag'],line)
+                        self.assertEqual(len(group),sum(m['account']==record['account'] for m in record['members']))
+                        before = (self.store/'numbers.json').read_bytes()
+                        (self.store/'reply.txt').write_text(str(record['number'])+' archive')
+                        probe = self.store/('probe-'+str(run)+'-'+str(record['number'])+'.json')
+                        command('triage.py','reply','--token',self.token,'--inbox',str(fresh),'--reply',str(self.store/'reply.txt'),'--plan-out',str(probe))
+                        self.assertEqual({(a['account'],a['id']) for a in execute.read(probe)['actions']},
+                                         {(m['account'],m['id']) for m in record['members']})
+                        self.assertEqual(before,(self.store/'numbers.json').read_bytes())
+                    if run == 1 and seed % 3 == 0:
+                        (self.store/'decisions.jsonl').write_text('')
+                    elif run == 1 and seed % 3 == 1:
+                        with (self.store/'decisions.jsonl').open('a') as log:
+                            log.write((json.dumps(dict(run='later', parts=[]))+' '*300+'\n')*900)
+                        triage.trim_logs(self.store)
+                    if run == 0: old_numbers = (self.store/'numbers.json').read_bytes()
+                    last_message = current
+                    triage.release(self.store,self.token)
+                    self.token = triage.acquire(self.store)
+
+        self.assertTrue({'leave','yes','no','archive','trash','refused','approval'} <= seen,seen)
+
+    def test_r139_hidden_numbers_survive_arrival(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'config.toml').write_text('relist_inbox="new_plus_count"\n[accounts.cedar]\nname="Cedar"\n')
+        self.listing = dict(accounts={'cedar':100}, messages=[
+            dict(account='cedar', id=ident, folder='Inbox', sender=sender+'@example.net', subject=subject)
+            for ident,sender,subject in [('a','ann','Contract'),('b','bob','Invoice')]])
+        def finish():
+            args = ['--token',self.token,'--plan',str(self.path)]
+            self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+            result = self.run_cli('triage.py','commit-state',*args)
+            self.assertEqual(result.returncode,0,result.stderr)
+            message = self.run_cli('triage.py','message',*args).stdout
+            triage.release(self.store,self.token)
+            self.token = triage.acquire(self.store)
+            return message
+        execute.atomic(self.store/'inbox.json',self.listing)
+        self.assertEqual(self.plan_cli().returncode,0)
+        self.assertIn('1. ann@example.net',finish())
+        original = triage.read_numbers(self.store)['items']
+        self.listing['messages'].append(dict(account='cedar',id='c',folder='Inbox',sender='cid@example.net',subject='Lunch'))
+        execute.atomic(self.store/'inbox.json',self.listing)
+        self.assertEqual(self.plan_cli().returncode,0)
+        message = finish()
+        self.assertIn('3. cid@example.net',message)
+        self.assertIn('2 previously listed',message)
+        saved = triage.read_numbers(self.store)['items']
+        self.assertEqual([i['number'] for i in saved],[1,2,3])
+        self.assertEqual(saved[:2],original)
+        (self.store/'reply.txt').write_text('1 archive')
+        reply = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+        self.assertEqual(reply.returncode,0,reply.stderr)
+        self.assertEqual([(a['account'],a['id']) for a in execute.read(self.path)['actions']],[('cedar','a')])
+        args = ['--token',self.token,'--plan',str(self.path)]
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        self.assertEqual(self.run_cli('execute.py','result',*args,'--observation',json.dumps(dict(outcome='ok',inbox_ids=['b','c']))).returncode,0)
+        execute.atomic(self.store/'final.json',dict(self.listing,messages=self.listing['messages'][1:]))
+        self.assertEqual(self.run_cli('execute.py','final',*args,'--inbox',str(self.store/'final.json')).returncode,0)
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+        self.assertNotIn(1,[i['number'] for i in triage.read_numbers(self.store)['items']])
+
+    def test_r139_audit_leave_reproduction(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        self.listing = dict(accounts={'cedar':100},messages=[
+            dict(account='cedar',id=subject.lower(),folder='Inbox',sender='Boss <boss@example.org>',subject=subject,date=date)
+            for subject,date in [('Budget','2026-11-14T08:00:00+00:00'),('Plan','2026-11-14T09:00:00+00:00')]])
+        execute.atomic(self.store/'inbox.json',self.listing)
+        self.assertEqual(self.plan_cli().returncode,0)
+        self.commit_numbered_run()
+        (self.store/'reply.txt').write_text('1 leave')
+        self.assertEqual(self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path)).returncode,0)
+        self.commit_numbered_run()
+        self.listing['messages'].append(dict(self.listing['messages'][0],id='lunch',subject='Lunch',date='2026-11-14T10:00:00+00:00'))
+        execute.atomic(self.store/'inbox.json',self.listing)
+        self.assertEqual(self.plan_cli().returncode,0)
+        args=['--token',self.token,'--plan',str(self.path)]
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+        message=self.run_cli('triage.py','message',*args).stdout
+        self.assertIn('2. Boss <boss@example.org> (2) · latest: Plan (Kept by owner reply)',message)
+        self.assertIn('3. Boss <boss@example.org> · Lunch',message)
+        saved=triage.read_numbers(self.store)['items']
+        self.assertEqual([[m['id'] for m in i['members']] for i in saved],[['budget','plan'],['lunch']])
+        triage.release(self.store,self.token)
+        self.token=triage.acquire(self.store)
+        (self.store/'reply.txt').write_text('2 trash')
+        self.assertEqual(self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path)).returncode,0)
+        self.assertEqual([a['id'] for a in execute.read(self.path)['actions']],['budget','plan'])
+
+    def test_r139_saved_line_rejects_hidden_or_mistyped_records(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        self.assertEqual(self.plan_cli().returncode,0)
+        self.commit_numbered_run()
+        original = triage.read_numbers(self.store)
+        for field,value in [('visible',False),('hidden',True),('remaining',False),('saved_number',True),('unexpected',True)]:
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(original))
+                changed['items'][0]['presentation'][0][field] = value
+                with self.assertRaisesRegex(ValueError,'numbers.json'):
+                    triage.read_numbers(self.store,changed)
+        for field,value in [('number',0),('subject','Other')]:
+            with self.subTest(item_field=field):
+                changed = json.loads(json.dumps(original))
+                changed['items'][0]['presentation'][0]['item'][field] = value
+                with self.assertRaisesRegex(ValueError,'numbers.json'):
+                    triage.read_numbers(self.store,changed)
+
+
+    def r139_reply_question(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        self.listing = dict(accounts={'cedar':1000},messages=[
+            dict(account='cedar',id=str(i),folder='Inbox',sender='Boss <boss@example.org>',subject='Notice '+str(i)) for i in range(12)])
+        self.listing['messages'].append(dict(account='cedar',id='peer',folder='Inbox',sender='Peer <peer@example.net>',subject='Hello'))
+        execute.atomic(self.store/'inbox.json',self.listing)
+        self.assertEqual(self.plan_cli().returncode,0)
+        self.commit_numbered_run()
+        before = (self.store/'numbers.json').read_bytes()
+        self.listing['messages'].append(dict(self.listing['messages'][-1],id='arrival',subject='Lunch'))
+        execute.atomic(self.store/'inbox.json',self.listing)
+        (self.store/'reply.txt').write_text('1 trash')
+        result = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+        self.assertEqual(result.returncode,0,result.stderr)
+        plan = execute.read(self.path)
+        self.assertEqual(plan['approval_state'],'awaiting approval')
+        return before,plan
+
+    def test_r139_approval_reply_preserves_numbers(self):
+        import re
+        before,plan = self.r139_reply_question()
+        self.assertEqual(before,(self.store/'numbers.json').read_bytes())
+        args = ['--token',self.token,'--plan',str(self.path)]
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+        saved = execute.read(self.store/'numbers.json')
+        self.assertEqual(saved['_run_counter'], execute.read(self.store/'state.json')['_run_counter'])
+        self.assertEqual({k:v for k,v in saved.items() if k != '_run_counter'}, {k:v for k,v in json.loads(before).items() if k != '_run_counter'})
+        before = (self.store/'numbers.json').read_bytes()
+        message = self.run_cli('triage.py','message',*args).stdout
+        self.assertFalse(re.findall(r'^\d+\. ',message,re.M))
+        (self.store/'reply.txt').write_text('skip')
+        skipped = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path),'--question',plan['run_id'])
+        self.assertEqual(skipped.returncode,0,skipped.stderr)
+        self.assertEqual(before,(self.store/'numbers.json').read_bytes())
+        (self.store/'reply.txt').write_text('2 leave')
+        old_reply = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+        self.assertEqual(old_reply.returncode,0,old_reply.stderr)
+        self.assertEqual([e['id'] for e in execute.read(self.path)['reply']],['peer'])
+
+
+    def test_r139_rehearsal_preserves_open_question_and_inbox(self):
+        before,plan = self.r139_reply_question()
+        args = ['--token',self.token,'--plan',str(self.path)]
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+        triage.release(self.store,self.token)
+        self.token = triage.acquire(self.store)
+        folder = self.store/'.dry-run'
+        folder.mkdir(mode=0o700,exist_ok=True)
+        dry_inbox = folder/'inbox.json'
+        execute.atomic(dry_inbox,dict(accounts={'cedar':1000},messages=[
+            dict(account='cedar',id='rehearsal',folder='Inbox',sender='Peer <peer@example.net>',subject='Rehearsal only')]))
+        original = {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
+        rehearsal = self.store/'rehearsal.json'
+        result = self.run_cli('triage.py','plan','--dry-run','--token',self.token,'--inbox',str(dry_inbox),'--plan-out',str(rehearsal))
+        self.assertEqual(result.returncode,0,result.stderr)
+        message = self.run_cli('triage.py','message','--token',self.token,'--plan',str(rehearsal))
+        self.assertIn('Rehearsal only',message.stdout)
+        simulated = self.run_cli('execute.py','dry-run','--plan',str(rehearsal))
+        self.assertEqual(simulated.returncode,0,simulated.stderr)
+        self.assertEqual(original,{p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file() and p != rehearsal})
+        self.assertTrue(dry_inbox.exists())
+        self.assertIn('--inbox /absolute/private-store/.dry-run/inbox.json',Path('docs/quickstart.md').read_text())
+        (self.store/'reply.txt').write_text('proceed')
+        reply = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path),'--question',plan['run_id'])
+        self.assertEqual(reply.returncode,0,reply.stderr)
+        args = ['--token',self.token,'--plan',str(self.path),'--approve',plan['run_id']]
+        request = self.run_cli('execute.py','next',*args)
+        self.assertIn('approval_reads',request.stdout)
+        fresh = self.store/'approval-inbox.json'
+        execute.atomic(fresh,self.listing)
+        approved = self.run_cli('execute.py','next',*args,'--inbox',str(fresh))
+        self.assertEqual(approved.returncode,0,approved.stderr)
+        self.assertEqual(json.loads(approved.stdout)['id'],'0')
+
+    def test_r139_rehearsal_needs_no_real_inbox(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        dry_inbox = self.store/'dry-inbox.json'
+        execute.atomic(dry_inbox,dict(accounts={'cedar':1000},messages=[dict(account='cedar',id='dry',folder='Inbox',sender='peer@example.net',subject='Rehearsal only')]))
+        (self.store/'inbox.json').unlink()
+        rehearsal = self.store/'rehearsal.json'
+        result = self.run_cli('triage.py','plan','--dry-run','--token',self.token,'--inbox',str(dry_inbox),'--plan-out',str(rehearsal))
+        self.assertEqual(result.returncode,0,result.stderr)
+        message = self.run_cli('triage.py','message','--token',self.token,'--plan',str(rehearsal))
+        self.assertIn('Rehearsal only',message.stdout)
+        result = self.run_cli('execute.py','dry-run','--plan',str(rehearsal))
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.store/'inbox.json').exists())
+        self.assertFalse((self.store/'numbers.json').exists())
+        self.assertFalse((self.store/'state.json').exists())
+
+    def test_r139_refused_reply_never_numbers_protected_sender(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'never-touch.toml').write_text('[[rules]]\nsender="help@example.net"\n')
+        self.listing = dict(accounts={'cedar':100}, messages=[
+            dict(account='cedar',id='protected',folder='Inbox',sender='Help Desk <help@example.net>',subject='Ticket'),
+            dict(account='cedar',id='normal',folder='Inbox',sender='Peer <peer@example.net>',subject='Hello')])
+        execute.atomic(self.store/'inbox.json',self.listing)
+        execute.atomic(self.store/'state.json',{'cedar':2})
+        (self.store/'reply.txt').write_text('999 archive')
+        reply = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+        self.assertEqual(reply.returncode,0,reply.stderr)
+        self.assertIn('Unknown number',reply.stdout)
+        args = ['--token',self.token,'--plan',str(self.path)]
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        result = self.run_cli('triage.py','commit-state',*args)
+        self.assertEqual(result.returncode,0,result.stderr)
+        saved = triage.read_numbers(self.store)['items']
+        self.assertNotIn('protected',[m['id'] for i in saved for m in i['members']])
+        message = self.run_cli('triage.py','message',*args).stdout
+        self.assertIn('Ticket (Protected by never-touch)',message)
+        self.assertNotRegex(message,r'(?m)^\d+\. .*Ticket')
+
+    def test_r135_quiet_overlap_real_commands(self):
+        self.check_quiet_overlap(None)
+
+    def test_r135_quiet_overlap_randomized(self):
+        for seed in range(100):
+            with self.subTest(seed=seed):
+                self.setUp()
+                self.check_quiet_overlap(seed)
+
+    def check_quiet_overlap(self, seed):
+        import random
+        import re
+        rng = random.Random(seed)
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'config.toml').write_text('[accounts.cedar]\nname="Cedar"\n[accounts.birch]\nname="Birch"\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        def msg(account, ident, subject, **extra):
+            return dict(account=account, id=ident, folder='Inbox', sender='News <news@example.net>', subject=subject, **extra)
+        shared = dict(internet_message_id='<s1@example.net>', date='2026-11-10T08:00:00+00:00')
+        first = [msg('cedar','x1','Shared',**shared), msg('cedar','x2','Your invoice'), msg('birch','y1','Shared',**shared)]
+        second = [msg('birch','y1','Shared',**shared), msg('birch','y2','Weekly')]
+        if seed is not None:
+            for i in range(rng.randrange(5)):
+                first.append(msg('cedar','extra'+str(i),'Notice '+str(i)))
+            for i in range(rng.randrange(5)):
+                second.append(msg('birch','new'+str(i),'Update '+str(i)))
+            rng.shuffle(first)
+            rng.shuffle(second)
+        args = ['--token',self.token,'--plan',str(self.path)]
+        old_number = None
+        for messages, accounts, quiet in ((first, {'cedar':100,'birch':100}, []), (second, {'birch':100}, ['cedar'])):
+            listing = dict(accounts=accounts,messages=messages,quiet=quiet)
+            if seed is None:
+                execute.atomic(self.store/'inbox.json',listing)
+                result = self.plan_cli()
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+                result = self.run_cli('triage.py','commit-state',*args)
+                self.assertEqual(result.returncode,0,result.stderr)
+                message = self.run_cli('triage.py','message',*args).stdout
+            else:
+                plan = triage.build_plan(listing, [], [], {'accounts':{'cedar':{},'birch':{}}})
+                outcomes = triage.number_decisions(self.store,plan,listing)
+                message = '\n'.join(triage.render_remaining(plan,listing,outcomes=outcomes))
+            saved = triage.read_numbers(self.store)['items']
+            printed = re.findall(r'^(\d+)\. ',message,re.M)
+            self.assertEqual(printed,[str(i['number']) for i in saved],message)
+            expected = {(m['account'],m['id']) for m in messages}
+            actual = {(m['account'],m['id']) for i in saved for m in i['members']}
+            self.assertEqual(actual,expected,message)
+            self.assertEqual(len(saved),1)
+            self.assertIn('('+str(len(first)-1 if not quiet else len(second))+')',message)
+            if quiet:
+                self.assertNotEqual(saved[0]['number'],old_number)
+            else:
+                old_number = saved[0]['number']
+            triage.release(self.store,self.token)
+            self.token = triage.acquire(self.store)
+            args = ['--token',self.token,'--plan',str(self.path)]
+        if seed is not None:
+            return
+        (self.store/'reply.txt').write_text(str(old_number)+' trash')
+        refused = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+        self.assertIn('Unknown number',refused.stdout+refused.stderr)
+        number = triage.read_numbers(self.store)['items'][0]['number']
+        (self.store/'reply.txt').write_text(str(number)+' trash')
+        reply = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+        self.assertEqual(reply.returncode,0,reply.stderr)
+        plan = execute.read(self.path)
+        self.assertEqual({(a['account'],a['id']) for a in plan['actions']},expected)
+
+    def test_r131_identity_and_outcome_real_commands(self):
+        for different_subject, different_outcome in ((True, False), (False, True)):
+            self.setUp()
+            (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+            (self.store/'config.toml').write_text('[accounts.cedar]\nname="Cedar"\n[accounts.birch]\nname="Birch"\n')
+            (self.store/'rules.toml').write_text('[[rules]]\nid="t"\naccounts=["cedar"]\nsubject="Shared"\naction="trash"\nexclusions=[]\n' if different_outcome else 'rules=[]\n')
+            messages = [dict(account=a, id=a, folder='Inbox', sender='News <news@example.net>', subject='Shared', internet_message_id='<shared@example.net>') for a in ('cedar','birch')]
+            if different_subject: messages[1]['subject'] = 'Contract'
+            self.listing = dict(accounts={'cedar':100,'birch':100}, messages=messages)
+            execute.atomic(self.store/'inbox.json', self.listing)
+            result = self.plan_cli()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = ['--token', self.token, '--plan', str(self.path)]
+            if different_outcome:
+                self.assertEqual(self.run_cli('execute.py', 'next', *args).returncode, 0)
+                self.assertEqual(self.run_cli('execute.py', 'result', *args, '--observation', json.dumps(dict(outcome='ok', inbox_ids=[]))).returncode, 0)
+                execute.atomic(self.store/'final.json', dict(self.listing, messages=[messages[1]]))
+                self.assertEqual(self.run_cli('execute.py', 'final', *args, '--inbox', str(self.store/'final.json')).returncode, 0)
+            self.assertEqual(self.run_cli('execute.py', 'next', *args).returncode, 0)
+            self.assertEqual(self.run_cli('triage.py', 'commit-state', *args).returncode, 0)
+            message = self.run_cli('triage.py', 'message', *args).stdout
+            import re
+            printed = re.findall(r'^(\d+)\. ', message, re.M)
+            saved = triage.read_numbers(self.store)['items']
+            self.assertEqual(printed, [str(i['number']) for i in saved], message)
+            self.assertIn('Contract' if different_subject else 'Shared', message)
+            self.assertEqual(len(saved), 2 if different_subject else 1)
+
+    def test_r131_final_optional_metadata_real_commands(self):
+        import re
+        for initial in (True, False):
+            with self.subTest(initial=initial):
+                self.setUp()
+                (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                (self.store/'config.toml').write_text('[accounts.cedar]\n[accounts.birch]\n')
+                (self.store/'rules.toml').write_text('[[rules]]\nid="t"\naccounts=["cedar"]\nsubject="junk"\naction="trash"\nexclusions=[]\n')
+                messages = [dict(account=a, id=a, folder='Inbox', sender='News <news@example.net>', subject='Sale') for a in ('cedar','birch')]
+                if initial:
+                    for m in messages: m['internet_message_id']='<sale@example.net>'
+                self.listing = dict(accounts={'cedar':100,'birch':100}, messages=messages+[dict(messages[0], id='junk', subject='junk')])
+                execute.atomic(self.store/'inbox.json',self.listing)
+                result=self.plan_cli()
+                self.assertEqual(result.returncode,0,result.stderr)
+                args=['--token',self.token,'--plan',str(self.path)]
+                self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+                self.assertEqual(self.run_cli('execute.py','result',*args,'--observation',json.dumps(dict(outcome='ok',inbox_ids=['cedar']))).returncode,0)
+                final=[{k:v for k,v in m.items() if k!='internet_message_id'} for m in messages]
+                if not initial:
+                    for m in final: m['internet_message_id']='<sale@example.net>'
+                execute.atomic(self.store/'final.json',dict(self.listing,messages=final))
+                self.assertEqual(self.run_cli('execute.py','final',*args,'--inbox',str(self.store/'final.json')).returncode,0)
+                self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+                self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+                message=self.run_cli('triage.py','message',*args).stdout
+                saved=triage.read_numbers(self.store)['items']
+                self.assertEqual(re.findall(r'^(\d+)\. ',message,re.M),[str(i['number']) for i in saved],message)
+                members = [dict(account=a,id=a) for a in ('cedar','birch')]
+                self.assertEqual([i['members'] for i in saved], [[m] for m in members] if initial else [members])
+                self.assertEqual('also in:' in message,not initial,message)
+
+    def test_r131_handled_and_planned_grouping(self):
+        for language in ('en','es'):
+            self.setUp()
+            (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+            (self.store/'config.toml').write_text('language="'+language+'"\n[accounts.cedar]\n')
+            (self.store/'rules.toml').write_text('[[rules]]\nid="t"\naccounts=["cedar"]\nsubject="Handled"\naction="archive"\nlimit=50\n')
+            messages=[dict(account='cedar',id=str(i),folder='Inbox',sender='News <news@example.net>',subject='Handled '+str(i),date='2026-03-%02dT00:00:00+00:00'%(i+1)) for i in range(3)]
+            self.listing=dict(accounts={'cedar':100},messages=messages)
+            execute.atomic(self.store/'inbox.json',self.listing)
+            self.assertEqual(self.plan_cli('--report-out',str(self.store/'planned.md')).returncode,0)
+            self.assertIn('News <news@example.net> (3)',(self.store/'planned.md').read_text())
+            args=['--token',self.token,'--plan',str(self.path)]
+            ids=[m['id'] for m in messages]
+            for m in messages:
+                self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+                ids.remove(m['id'])
+                self.assertEqual(self.run_cli('execute.py','result',*args,'--observation',json.dumps(dict(outcome='ok',inbox_ids=ids))).returncode,0)
+            execute.atomic(self.store/'final.json',dict(self.listing,messages=[]))
+            self.assertEqual(self.run_cli('execute.py','final',*args,'--inbox',str(self.store/'final.json')).returncode,0)
+            self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+            self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+            message=self.run_cli('triage.py','message',*args).stdout
+            self.assertIn('News <news@example.net> (3)',message)
+            self.assertIn('Handled 2',message)
+            self.assertIn('News <news@example.net> (3)',(self.store/'report.md').read_text())
+
+    def test_r131_pending_report_has_no_numbers_and_singular_counts(self):
+        for language in ('en','es'):
+            self.setUp()
+            (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+            (self.store/'config.toml').write_text('language="'+language+'"\ninbox_limit=1\n[accounts.cedar]\n[accounts.birch]\n')
+            (self.store/'rules.toml').write_text('rules=[]\n')
+            self.listing=dict(accounts={'cedar':100,'birch':100},messages=[dict(account=a,id=a,folder='Inbox',sender=a+'@example.net',subject='Question') for a in ('cedar','birch')])
+            execute.atomic(self.store/'inbox.json',self.listing)
+            result=self.plan_cli('--report-out',str(self.store/'pending.md'))
+            self.assertEqual(result.returncode,0,result.stderr)
+            import re
+            self.assertFalse(re.findall(r'^\d+\. ',(self.store/'pending.md').read_text(),re.M))
+            args=['--token',self.token,'--plan',str(self.path)]
+            message=self.run_cli('triage.py','message',*args).stdout
+            self.assertIn('1 message in Inbox' if language=='en' else '1 mensaje en Recibidos',message)
+            self.assertNotIn('numbered lines',message)
+            self.assertNotIn('líneas numeradas',message)
+            single=dict(self.listing,messages=self.listing['messages'][:1],accounts={'cedar':100})
+            plan=triage.build_plan(single,[],[],dict(accounts={'cedar':{}}))
+            self.assertIn('Inbox: 1 message' if language=='en' else 'Inbox: 1 mensaje',triage.render_report(plan,single,language))
+
+    def test_r131_reply_singular_both_languages(self):
+        for language in ('en','es'):
+            self.setUp()
+            (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+            (self.store/'config.toml').write_text('language="'+language+'"\n[accounts.cedar]\n')
+            (self.store/'rules.toml').write_text('rules=[]\n')
+            self.assertEqual(self.plan_cli().returncode,0)
+            self.commit_numbered_run()
+            number=triage.read_numbers(self.store)['items'][0]['number']
+            self.listing['messages']=self.listing['messages'][:1]
+            execute.atomic(self.store/'inbox.json',self.listing)
+            (self.store/'reply.txt').write_text(str(number)+' archive')
+            answer=self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+            self.assertEqual(answer.returncode,0,answer.stderr)
+            self.assertIn('cedar: 1 message' if language=='en' else 'cedar: 1 mensaje',answer.stdout)
+            self.assertNotIn('1 messages' if language=='en' else '1 mensajes',answer.stdout)
+
+    def test_r131_removed_reply_group_has_no_invisible_saved_number(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        self.assertEqual(self.plan_cli().returncode,0)
+        self.commit_numbered_run()
+        (self.store/'reply.txt').write_text('1 archive')
+        execute.atomic(self.store/'state.json',{'cedar':4})
+        result=self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+        self.assertEqual(result.returncode,0,result.stderr)
+        args=['--token',self.token,'--plan',str(self.path)]
+        ids=[m['id'] for m in self.listing['messages']]
+        for m in self.listing['messages']:
+            self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+            ids.remove(m['id'])
+            self.assertEqual(self.run_cli('execute.py','result',*args,'--observation',json.dumps(dict(outcome='ok',inbox_ids=ids))).returncode,0)
+        execute.atomic(self.store/'final.json',dict(self.listing,messages=[]))
+        self.assertEqual(self.run_cli('execute.py','final',*args,'--inbox',str(self.store/'final.json')).returncode,0)
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+        self.assertEqual(triage.read_numbers(self.store)['items'],[])
+
+    def test_r137_failed_reply_group_retires_number(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        self.assertEqual(self.plan_cli().returncode,0)
+        self.commit_numbered_run()
+        (self.store/'reply.txt').write_text('1 archive')
+        execute.atomic(self.store/'state.json',{'cedar':4})
+        result=self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+        self.assertEqual(result.returncode,0,result.stderr)
+        args=['--token',self.token,'--plan',str(self.path)]
+        ids=[m['id'] for m in self.listing['messages']]
+        for m in self.listing['messages']:
+            self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+            if m['id'] != '3': ids.remove(m['id'])
+            self.assertEqual(self.run_cli('execute.py','result',*args,'--observation',json.dumps(dict(outcome='error' if m['id']=='3' else 'ok',inbox_ids=ids))).returncode,0)
+        execute.atomic(self.store/'final.json',dict(self.listing,messages=[self.listing['messages'][-1]]))
+        self.assertEqual(self.run_cli('execute.py','final',*args,'--inbox',str(self.store/'final.json')).returncode,0)
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+        self.assertEqual(triage.read_numbers(self.store)['items'],[])
+
+    def test_r137_reply_question_stale_commits(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        self.listing['messages'] = [dict(self.listing['messages'][0], id=str(i)) for i in range(12)]
+        execute.atomic(self.store/'inbox.json', self.listing)
+        execute.atomic(self.store/'state.json', {'cedar':12})
+        self.assertEqual(self.plan_cli().returncode, 0)
+        self.commit_numbered_run()
+        (self.store/'reply.txt').write_text('1 trash')
+        reply = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+        self.assertEqual(reply.returncode,0,reply.stderr)
+        plan = execute.read(self.path)
+        self.assertEqual(plan['approval_state'],'awaiting approval')
+        args = ['--token',self.token,'--plan',str(self.path)]
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+        triage.release(self.store,self.token)
+        self.token=triage.acquire(self.store)
+        args = ['--token',self.token,'--plan',str(self.path)]
+        approved = ['next',*args,'--approve',plan['run_id']]
+        self.assertIn('approval_reads',self.run_cli('execute.py',*approved).stdout)
+        fresh=self.store/'approval-inbox.json'
+        execute.atomic(fresh,dict(self.listing,messages=self.listing['messages'][1:]))
+        answer=self.run_cli('execute.py',*approved,'--inbox',str(fresh))
+        self.assertEqual(json.loads(answer.stdout)['status'],'stale',answer.stderr)
+        committed=self.run_cli('triage.py','commit-state',*args)
+        self.assertEqual(committed.returncode,0,committed.stderr)
+        self.assertIn('Inbox changed since the question',self.run_cli('triage.py','message',*args).stdout)
+        self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_r137_pending_folder_creation_is_folded(self):
+        for language in ('en','es'):
+            self.setUp()
+            self.dated()
+            (self.store/'guardrails.md').write_text('Fixture guardrails')
+            (self.store/'config.toml').write_text('language="'+language+'"\ninbox_limit=1\n[accounts.cedar]\n')
+            self.assertEqual(self.plan_cli().returncode,0)
+            message=self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path)).stdout
+            self.assertNotIn('create-folder',message)
+            self.assertIn('2',message)
+            self.assertEqual(sum(' · rule ' in line or ' · regla ' in line for line in message.splitlines()),1,message)
+
+    def test_r137_foreign_approval_account_names_cause(self):
+        plan=self.awaiting()
+        (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n[accounts.birch]\n')
+        args=['next','--token',self.token,'--plan',str(self.path),'--approve',plan['run_id']]
+        self.assertEqual(self.run_cli('execute.py',*args).returncode,0)
+        fresh=self.store/'approval-inbox.json'
+        execute.atomic(fresh,dict(self.listing,accounts={'cedar':100,'birch':1}))
+        answer=self.run_cli('execute.py',*args,'--inbox',str(fresh))
+        self.assertNotEqual(answer.returncode,0)
+        self.assertIn('outside planned accounts',answer.stderr)
+        self.assertIn('birch',answer.stderr)
+        self.assertNotIn('; ;',answer.stderr)
+        self.assertFalse(answer.stderr.strip().endswith(':'))
+        self.assertEqual(self.run_cli('execute.py',*args).returncode,0)
+        execute.atomic(fresh,dict(self.listing,skipped={'birch':'provider error (503)'}))
+        answer=self.run_cli('execute.py',*args,'--inbox',str(fresh))
+        self.assertNotEqual(answer.returncode,0)
+        self.assertIn('outside planned accounts',answer.stderr)
+        self.assertNotIn('; ;',answer.stderr)
+
+    def test_r137_flagged_messages_print_separately(self):
+        import re
+        for flag in ('spam','phishing'):
+            self.setUp()
+            (self.store/'guardrails.md').write_text('Fixture guardrails')
+            (self.store/'rules.toml').write_text('rules=[]\n')
+            self.listing['messages']=[dict(self.listing['messages'][0],id=str(i),subject='Notice',**({flag:True} if i else {})) for i in range(3)]
+            execute.atomic(self.store/'inbox.json',self.listing)
+            self.assertEqual(self.plan_cli().returncode,0)
+            args=['--token',self.token,'--plan',str(self.path)]
+            self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+            self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+            message=self.run_cli('triage.py','message',*args).stdout
+            self.assertEqual(len(re.findall(r'^\d+\. ',message,re.M)),3,message)
+            self.assertEqual([len(i['members']) for i in triage.read_numbers(self.store)['items']],[1,1,1])
+
+    def test_r137_dry_quiet_retry_outcome_real_commands(self):
+        (self.store/'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
+        execute.atomic(self.store/'state.json',{})
+        args=['quiet-check','--token',self.token,'--dry-run']
+        for succeeds in (True,False):
+            first=self.run_cli('triage.py',*args)
+            progress=self.store/'progress.json'
+            results=self.store/'gateway-results.json'
+            execute.atomic(progress,json.loads(first.stdout))
+            execute.atomic(results,[dict(ok=False,error=dict(code=503))])
+            retry=self.run_cli('triage.py',*args,'--progress',str(progress),'--results',str(results))
+            execute.atomic(progress,json.loads(retry.stdout))
+            execute.atomic(results,[dict(ok=True,value=dict(historyId='100')) if succeeds else dict(ok=False,error=dict(code=503))])
+            answer=self.run_cli('triage.py',*args,'--progress',str(progress),'--results',str(results))
+            self.assertEqual(answer.returncode,0,answer.stderr)
+            self.assertEqual(json.loads(answer.stdout)['retries'],{'cedar':'retried once, succeeded' if succeeds else 'retried once, still failing'})
+            self.assertFalse((self.store/'quiet-gateway.json').exists())
+
+    def test_group_numbers_are_consecutive_and_save_members(self):
+        import re
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        self.listing['messages'].append(dict(self.listing['messages'][0], id='single', sender='single@example.org'))
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        self.commit_numbered_run()
+        numbers = triage.read_numbers(self.store)
+        self.assertEqual([i['number'] for i in numbers['items']], [1, 2])
+        self.assertEqual(numbers['items'][0]['members'], [dict(account='cedar', id=str(i)) for i in range(4)])
+        self.assertNotIn('group', numbers['items'][0])
+
+    def test_cross_account_reply_saves_and_acts_on_each_copy(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'config.toml').write_text('[accounts.cedar]\nname="Cedar"\n[accounts.birch]\nname="Birch"\n')
+        self.listing = dict(accounts={'cedar':100, 'birch':100}, messages=[
+            dict(account=a, id=a, folder='Inbox', sender='a@example.net', subject='Shared', internet_message_id='<shared@example.net>')
+            for a in ('cedar','birch')])
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        self.commit_numbered_run()
+        saved = triage.read_numbers(self.store)['items']
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]['members'], [dict(account=a, id=a) for a in ('cedar','birch')])
+        (self.store/'reply.txt').write_text(str(saved[0]['number'])+' archive')
+        result = self.run_cli('triage.py', 'reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'),
+                              '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(execute.read(self.path)['actions']), 2)
+        args = ['--token', self.token, '--plan', str(self.path)]
+        for _ in range(2):
+            self.assertEqual(self.run_cli('execute.py', 'next', *args).returncode, 0)
+            self.assertEqual(self.run_cli('execute.py', 'result', *args, '--observation', json.dumps(dict(outcome='ok', inbox_ids=[]))).returncode, 0)
+        execute.atomic(self.store/'final.json', dict(self.listing, messages=[]))
+        self.assertEqual(self.run_cli('execute.py', 'final', *args, '--inbox', str(self.store/'final.json')).returncode, 0)
+        self.assertEqual(self.run_cli('execute.py', 'next', *args).returncode, 0)
+        self.assertEqual(self.run_cli('triage.py', 'commit-state', *args).returncode, 0)
+        message = self.run_cli('triage.py', 'message', *args).stdout
+        self.assertIn('in: Cedar, Birch', message)
+        self.assertNotIn('also in:', message)
+
+    def test_group_outcomes_computed_once_per_command(self):
+        from unittest.mock import patch
+        import contextlib
+        def command(*args):
+            with patch.dict(os.environ, PIGEON_HOME=str(self.store)), patch.object(triage, 'message_outcomes', wraps=triage.message_outcomes) as outcomes, tempfile.TemporaryFile(mode='w+', dir=self.store) as output, contextlib.redirect_stdout(output):
+                triage.main(list(args))
+                self.assertEqual(outcomes.call_count, 1)
+        for language in ('en', 'es'):
+            for limit in (1, 100):
+                self.setUp()
+                (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                (self.store/'rules.toml').write_text('rules=[]\n')
+                (self.store/'config.toml').write_text('language="'+language+'"\ninbox_limit='+str(limit)+'\n[accounts.cedar]\n')
+                command('plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path))
+                self.machine().step()
+                command('commit-state', '--token', self.token, '--plan', str(self.path))
+
+
+    def test_approval_summary_table_both_languages(self):
+        for language in ('en','es'):
+            for multiple, dry in ((False,False), (True,False), (True,True)):
+                with self.subTest(language=language, multiple=multiple, dry=dry):
+                    self.setUp()
+                    (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                    config = 'language="'+language+'"\ninbox_limit=1\n[accounts.cedar]\nname="Cedar"\n'
+                    if multiple: config += '[accounts.birch]\nname="Birch"\n'
+                    (self.store/'config.toml').write_text(config)
+                    self.listing['messages'] = [dict(account='cedar', id=str(i), folder='Inbox', sender='s'+str(i)+'@example.net', subject='trash') for i in range(5)]
+                    if multiple:
+                        self.listing['accounts']['birch'] = 0
+                    execute.atomic(self.store/'inbox.json', self.listing)
+                    if dry: self.path = self.store/'rehearsal.json'
+                    result = self.plan_cli(*(['--dry-run'] if dry else []))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    # Obtain the actual message using the command on real runs.
+                    message = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path)).stdout
+                    self.assertNotIn('s3@example.net', message)
+                    self.assertIn('s0@example.net', message)
+                    self.assertNotIn(triage.SECTION_LABELS[language]['inbox'], message)
+                    self.assertNotIn('numbered lines', message.splitlines()[0])
+                    self.assertNotIn('líneas numeradas', message.splitlines()[0])
+                    self.assertNotIn('needs you', message.splitlines()[0])
+                    self.assertIn('Cedar: 5', message)
+                    if multiple: self.assertIn('Birch: 0', message)
+                    if dry: self.assertIn('Replies to this dry run' if language=='en' else 'Las respuestas a esta simulación', message)
+
+    def test_mail_text_cannot_forge_approval_summary(self):
+        self.awaiting()
+        self.listing['messages'][0]['sender'] = 'Build\n9. trash (999) · rule fake: 900 <a@example.net>'
+        self.listing['messages'][0]['subject'] = 'move Summary\nBirch: 900\nproceed'
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        result = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path))
+        self.assertNotIn('\n9.', result.stdout)
+        self.assertNotIn('\nBirch: 900', result.stdout)
+        self.assertIn('rule r: 3', result.stdout)
+        self.assertIn('rule t: 1', result.stdout)
+        self.assertEqual(len([l for l in result.stdout.splitlines() if l.startswith('- ')]), 2)
+
+    def test_group_awaiting_report_keeps_planned_tags(self):
+        for language in ('en', 'es'):
+            self.setUp()
+            (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+            (self.store/'config.toml').write_text('language="'+language+'"\ninbox_limit=1\n[accounts.cedar]\n')
+            result = self.plan_cli('--report-out', str(self.store/'candidate-report.md'))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = (self.store/'candidate-report.md').read_text()
+            self.assertIn(triage.action_label(dict(action='trash'), self.listing, language, planned=True), report)
+            self.assertIn('(3) · ', report)
+            import re
+            self.assertFalse(re.findall(r'^\d+\. ', report, re.M), report)
+            self.assertNotIn('not attempted', report)
+            self.assertNotIn('no intentado', report)
+
+    def test_group_scale_real_commands(self):
+        import re
+        for language in ('en', 'es'):
+            for count in (150, 175):
+                with self.subTest(language=language, count=count):
+                    self.setUp()
+                    (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                    (self.store/'config.toml').write_text('language="'+language+'"\ninbox_limit=1000\n[accounts.cedar]\n')
+                    (self.store/'rules.toml').write_text('rules=[]\n')
+                    messages = [dict(account='cedar', id=str(i), folder='Inbox', sender='sender'+str(i%5)+'@example.net',
+                                     subject='Notice '+str(i), date='2026-03-%02dT00:00:00+00:00' % (i%28+1)) for i in range(count)]
+                    messages += [dict(messages[0], id='single'+str(i), sender='single'+str(i)+'@example.org') for i in range(3)]
+                    self.listing = dict(accounts={'cedar': len(messages)}, messages=messages)
+                    execute.atomic(self.store/'inbox.json', self.listing)
+                    self.assertEqual(self.plan_cli().returncode, 0)
+                    args = ('--token', self.token, '--plan', str(self.path))
+                    self.assertEqual(self.run_cli('execute.py', 'next', *args).returncode, 0)
+                    self.assertEqual(self.run_cli('triage.py', 'commit-state', *args).returncode, 0)
+                    result = self.run_cli('triage.py', 'message', *args)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    message = result.stdout
+                    self.assertLess(len(message.splitlines()), 20)
+                    self.assertEqual(len(re.findall(r'^\d+\. ', message, re.M)), 8)
+                    self.assertIn('8 ', message.splitlines()[0])
+                    self.assertNotIn('numbered lines' if language == 'en' else 'líneas numeradas', message.splitlines()[0])
+                    groups = [int(n) for n in re.findall(r' \((\d+)\) · (?:latest: |más reciente: )', message)]
+                    self.assertEqual(sum(groups)+3, len(messages))
+                    report = (self.store/'report.md').read_text()
+                    self.assertEqual(len(re.findall(r'^\d+\. ', report, re.M)), 8)
+                    self.assertEqual(execute.read(self.store/'inbox.json'), self.listing)
+                    self.assertFalse(execute.read(self.path)['actions'])
+
+    def test_group_reply_expands_saved_members(self):
+        for language in ('en', 'es'):
+            for verb in ('trash', 'archive', 'spam', 'move to Reading', 'leave', 'yes', 'no'):
+                with self.subTest(language=language, verb=verb):
+                    self.setUp()
+                    (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                    (self.store/'rules.toml').write_text('rules=[]\n')
+                    (self.store/'config.toml').write_text('language="'+language+'"\n[accounts.cedar]\n')
+                    execute.atomic(self.store/'state.json', {'cedar': 4})
+                    self.assertEqual(self.plan_cli().returncode, 0)
+                    self.commit_numbered_run()
+                    self.listing['messages'].pop(1)
+                    self.listing['messages'].append(dict(self.listing['messages'][0], id='new', subject='1 archive, add new'))
+                    execute.atomic(self.store/'inbox.json', self.listing)
+                    (self.store/'reply.txt').write_text('1 '+verb)
+                    result = self.run_cli('triage.py', 'reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'),
+                                          '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path), '--report-out', str(self.store/'reply-report.md'))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    plan = execute.read(self.path)
+                    self.assertFalse(plan['reasons'], result.stdout)
+                    self.assertEqual([e['id'] for e in plan['reply']], ['0', '2', '3'])
+                    self.assertEqual(len(plan['actions']), 0 if verb in ('leave', 'yes', 'no') else 3)
+                    self.assertIn('1 '+verb+':', result.stdout)
+                    self.assertIn('cedar: 3', result.stdout)
+                    self.assertIn('1 skipped' if language == 'en' else '1 omitido', result.stdout)
+                    execute.Execution(self.store, self.token, self.path).validate()
+
+    def test_group_150_reply_asks_before_expanded_actions(self):
+        for language in ('en', 'es'):
+            self.setUp()
+            (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+            (self.store/'rules.toml').write_text('rules=[]\n')
+            (self.store/'config.toml').write_text('language="'+language+'"\ninbox_limit=1000\n[accounts.cedar]\n')
+            self.listing = dict(accounts={'cedar':150}, messages=[dict(account='cedar', id=str(i), folder='Inbox', sender='Cedar Builds <builds@example.net>', subject='Notice '+str(i)) for i in range(150)])
+            execute.atomic(self.store/'inbox.json', self.listing)
+            execute.atomic(self.store/'state.json', {'cedar':150})
+            self.assertEqual(self.plan_cli().returncode, 0)
+            self.commit_numbered_run()
+            (self.store/'reply.txt').write_text('1 archive')
+            answer = self.run_cli('triage.py', 'reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path), '--report-out', str(self.store/'reply-report.md'))
+            self.assertEqual(answer.returncode, 0, answer.stderr)
+            plan = execute.read(self.path)
+            self.assertEqual(len(plan['actions']), 150)
+            self.assertEqual(plan['approval_state'], 'awaiting approval')
+            thresholds = {t['kind']:t for t in plan['approval_thresholds']}
+            self.assertEqual(thresholds['destructive']['count'], 150)
+            self.assertEqual(thresholds['rule']['count'], 150)
+            self.assertEqual(thresholds['brake']['count'], 150)
+            refused = self.run_cli('execute.py', 'next', '--token', self.token, '--plan', str(self.path))
+            self.assertNotIn('calls', json.loads(refused.stdout))
+            self.assertFalse((self.store/'calls.jsonl').exists())
+            (self.store/'reply.json').unlink()
+            triage.release(self.store, self.token)
+            self.token = triage.acquire(self.store)
+            approved = self.approve_cli(plan['run_id'])
+            self.assertEqual(approved.returncode, 0, approved.stderr)
+            self.assertEqual(json.loads(approved.stdout)['id'], '0')
+
+    def test_group_reply_edge_cases_real_commands(self):
+        for case in ('mixed', 'all-gone', 'protected', 'foreign', 'above', 'replay'):
+            with self.subTest(case=case):
+                self.setUp()
+                (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                (self.store/'rules.toml').write_text('rules=[]\n')
+                self.listing['messages'].append(dict(self.listing['messages'][0], id='single', sender='single@example.org'))
+                execute.atomic(self.store/'inbox.json', self.listing)
+                execute.atomic(self.store/'state.json', {'cedar':5})
+                self.assertEqual(self.plan_cli().returncode, 0)
+                self.commit_numbered_run()
+                def reply(text):
+                    execute.atomic(self.store/'inbox.json', self.listing)
+                    (self.store/'reply.txt').write_text(text)
+                    answer = self.run_cli('triage.py', 'reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path), '--report-out', str(self.store/'reply-report.md'))
+                    self.assertEqual(answer.returncode, 0, answer.stderr)
+                    return execute.read(self.path), answer.stdout
+                if case == 'mixed':
+                    plan, text = reply('1 archive, 2 leave')
+                    self.assertEqual(len(plan['actions']), 4)
+                    self.assertEqual(len(plan['reply']), 5)
+                    self.assertIn('1 archive: cedar: 4 messages; 0 skipped', text)
+                    self.assertIn('2 leave: cedar: 1 message; 0 skipped', text)
+                    execute.Execution(self.store, self.token, self.path).validate()
+                elif case == 'all-gone':
+                    self.listing['messages'] = self.listing['messages'][-1:]
+                    plan, text = reply('1 archive')
+                    self.assertEqual(plan['actions'], [])
+                    self.assertIn('4 skipped as gone', text)
+                    execute.Execution(self.store, self.token, self.path).validate()
+                elif case == 'protected':
+                    self.listing['messages'][1]['sender'] = 'protected@example.org'
+                    (self.store/'never-touch.toml').write_text('[[rules]]\nsender="protected@example.org"\n')
+                    plan, text = reply('1 archive')
+                    self.assertEqual(plan['actions'], [])
+                    self.assertIn('protected by never-touch', text)
+                elif case == 'foreign':
+                    for message in self.listing['messages'][:-1]:
+                        message['id'] = 'new-'+message['id']
+                    execute.atomic(self.store/'inbox.json', self.listing)
+                    self.assertEqual(self.plan_cli().returncode, 0)
+                    self.commit_numbered_run()
+                    current = triage.read_numbers(self.store)['items'][0]['number']
+                    plan, text = reply('1 archive')
+                    self.assertEqual(plan['actions'], [])
+                    self.assertIn('Unknown number', text)
+                    current = triage.read_numbers(self.store)['items'][0]['number']
+                    plan, text = reply(str(current)+' archive')
+                    self.assertEqual(len(plan['actions']), 4)
+                elif case == 'above':
+                    plan, text = reply('3 archive')
+                    self.assertEqual(plan['actions'], [])
+                    self.assertIn('Unknown number', text)
+                else:
+                    plan, text = reply('1 archive')
+                    self.assertEqual(len(plan['actions']), 4)
+                    for ident in ('0', '1', '2', '3'):
+                        machine = execute.Execution(self.store, self.token, self.path)
+                        self.assertEqual(machine.step()['id'], ident)
+                        machine.step(MockProvider([ident]))
+                    execute.Execution(self.store, self.token, self.path).step()
+                    triage.commit_state(self.store, self.token, self.path, self.store/'results.json')
+                    before = (self.store/'calls.jsonl').read_bytes()
+                    self.listing['messages'] = self.listing['messages'][-1:]
+                    plan, text = reply('1 archive')
+                    self.assertEqual(plan['actions'], [])
+                    self.assertEqual((self.store/'calls.jsonl').read_bytes(), before)
+
+    def test_group_number_members_reject_overlap(self):
+        execute.atomic(self.store/'numbers.json', dict(next=3, items=[
+            dict(number=1, account='cedar', id='0', members=[dict(account='cedar', id='0'), dict(account='cedar', id='1')]),
+            dict(number=2, account='cedar', id='2', members=[dict(account='cedar', id='2'), dict(account='cedar', id='1')])]))
+        with self.assertRaisesRegex(ValueError, 'duplicate message'):
+            triage.read_numbers(self.store)
+
+    def test_group_numbers_follow_printed_account_order(self):
+        import re
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'config.toml').write_text('[accounts.cedar]\n[accounts.marble]\n')
+        self.listing['accounts']['marble'] = 2
+        self.listing['messages'].insert(0, dict(self.listing['messages'][0], account='marble', id='marble-0'))
+        self.listing['messages'].insert(2, dict(self.listing['messages'][0], id='marble-1'))
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        args = ('--token', self.token, '--plan', str(self.path))
+        self.assertEqual(self.run_cli('execute.py', 'next', *args).returncode, 0)
+        self.assertEqual(self.run_cli('triage.py', 'commit-state', *args).returncode, 0)
+        message = self.run_cli('triage.py', 'message', *args).stdout
+        self.assertEqual(re.findall(r'^(\d+)\. ', message, re.M), ['1', '2'])
+        saved = triage.read_numbers(self.store)['items']
+        self.assertEqual([len(i['members']) for i in saved], [4, 2])
+
+    def test_round5_simulation_repeat_preserves_decision(self):
+        for order in ((1, None), (None, 1)):
+            self.setUp()
+            self.awaiting()
+            self.path = self.store/'rehearsal.json'
+            config = self.store/'config.toml'
+            config.write_text(config.read_text() + '[accounts.marble]\n')
+            self.listing['accounts']['marble'] = 0
+            execute.atomic(self.store/'inbox.json', self.listing)
+            self.assertEqual(self.plan_cli('--dry-run').returncode, 0)
+            plan = execute.read(self.path)
+            folder = self.store/'.dry-run'
+            folder.mkdir(exist_ok=True)
+            quiet = folder/'decision.json'
+            execute.atomic(quiet, dict(dry_run=True, positions={'cedar':['0'], 'marble':[]}))
+            before = quiet.read_bytes()
+            for fail in order:
+                args = ['dry-run', '--plan', str(self.path), '--approve', plan['run_id'], '--positions', str(quiet)]
+                if fail: args += ['--fail', str(fail)]
+                result = self.run_cli('execute.py', *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('commit_preview', result.stdout)
+                self.assertEqual(quiet.read_bytes(), before)
+
+    def test_round5_simulation_multiple_planned_accounts(self):
+        self.awaiting()
+        config = self.store/'config.toml'
+        config.write_text(config.read_text() + '[accounts.marble]\n[accounts.ash]\n')
+        rules = self.store/'rules.toml'
+        rules.write_text(rules.read_text().replace('["cedar"]', '["cedar","marble"]'))
+        self.listing['accounts'].update(marble=100, ash=0)
+        self.listing['folders']['marble'] = self.listing['folders']['cedar']
+        self.listing['messages'] += [dict(m, account='marble') for m in self.listing['messages'][:]]
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.path = self.store/'rehearsal.json'
+        self.assertEqual(self.plan_cli('--dry-run').returncode, 0)
+        plan = execute.read(self.path)
+        answer = self.run_cli('execute.py', 'dry-run', '--plan', str(self.path), '--approve', plan['run_id'])
+        self.assertEqual(answer.returncode, 0, answer.stderr)
+        self.assertIn('commit_preview', answer.stdout)
+
+    def test_round5_second_next_refuses_pending_batch(self):
+        (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
+        config = self.store/'config.toml'
+        config.write_text(config.read_text() + 'provider="gmail"\nexecutor_app="cedar-mail"\nexecutor_account="cedar-example"\n')
+        self.assertEqual(self.plan_cli().returncode, 0)
+        args = ('next', '--token', self.token, '--plan', str(self.path))
+        self.assertEqual(self.run_cli('execute.py', *args).returncode, 0)
+        checkpoint = next(self.store.glob('execution-*.json'))
+        before = checkpoint.read_bytes()
+        files = {p.name: p.read_bytes() for p in self.store.iterdir() if p.is_file()}
+        result = self.run_cli('execute.py', *args)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('expected result --results before another next', result.stderr)
+        self.assertEqual(checkpoint.read_bytes(), before)
+        self.assertEqual({p.name: p.read_bytes() for p in self.store.iterdir() if p.is_file()}, files)
+
+    def test_round5_dry_awaiting_markers(self):
+        self.awaiting()
+        self.path = self.store/'rehearsal.json'
+        for language in ('en', 'es'):
+            config = self.store/'config.toml'
+            config.write_text('language="' + language + '"\ninbox_limit=1\n[accounts.cedar]\n')
+            self.assertEqual(self.plan_cli('--dry-run').returncode, 0)
+            result = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path))
+            self.assertIn('Dry run' if language == 'en' else 'Simulación', result.stdout)
+            self.assertIn('Replies to this dry run are not acted on' if language == 'en' else 'Las respuestas a esta simulación no se aplican', result.stdout)
+
     def awaiting(self):
         execute.atomic(self.store/'state.json', {})
         (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
@@ -58,7 +1558,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertFalse((self.store/'calls.jsonl').exists())
 
     def test_approval_fresh_reading_stale_failure_and_arrival(self):
-        for kind in ('stale', 'stale-es', 'failure', 'arrival'):
+        for kind in ('stale', 'stale-es', 'stale-refreshed', 'failure', 'arrival'):
             with self.subTest(kind=kind):
                 self.setUp()
                 plan = self.awaiting()
@@ -71,6 +1571,8 @@ class ExecuteTests(unittest.TestCase):
                     config.write_text('language="es"\n' + config.read_text())
                 if kind == 'failure': fresh['skipped'] = {'cedar': 'provider error (503)'}; fresh['accounts'] = {}; fresh['messages'] = []
                 if kind == 'arrival': fresh['messages'].append(dict(fresh['messages'][0], id='new'))
+                if kind == 'stale-refreshed':
+                    execute.atomic(self.store/'inbox.json', fresh)
                 path = self.store/'fresh.json'
                 execute.atomic(path, fresh)
                 answer = self.run_cli('execute.py', *args, '--inbox', str(path))
@@ -85,9 +1587,13 @@ class ExecuteTests(unittest.TestCase):
                     self.assertFalse((self.store/'calls.jsonl').exists())
                     self.assertNotIn('approval approved:', history)
                     committed = self.run_cli('triage.py', 'commit-state', '--token', self.token, '--plan', str(self.path))
-                    self.assertEqual(committed.returncode, 0, committed.stderr)
+                    if kind != 'stale-refreshed':
+                        self.assertEqual(committed.returncode, 0, committed.stderr)
                     message = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path))
-                    self.assertIn('bandeja de entrada cambió' if kind == 'stale-es' else 'Inbox changed since the question', message.stdout)
+                    if kind != 'stale-refreshed':
+                        self.assertIn('Recibidos cambió' if kind == 'stale-es' else 'Inbox changed since the question', message.stdout)
+                    self.assertNotIn('nothing needs you', message.stdout)
+                    self.assertNotIn('nada requiere tu decisión', message.stdout)
                     self.assertNotIn('Still in Inbox', message.stdout)
                     self.assertNotIn('a@example.net', message.stdout)
                     self.assertNotIn('cedar: 100', message.stdout)
@@ -124,7 +1630,7 @@ class ExecuteTests(unittest.TestCase):
                 if kind == 'new': ids.append('new')
                 value = dict(messages=[dict(id=i) for i in ids])
                 entry = dict(ok=True, value=value)
-                if kind == 'error': entry = dict(ok=False, error=dict(code=503))
+                if kind == 'error': entry = dict(ok=False, error=dict(kind='ToolFailure', response=dict(status=503)))
                 if kind == 'embedded': entry = dict(ok=True, value=dict(error=dict(code=503)))
                 result_path = self.store/'approval-results.json'
                 execute.atomic(result_path, [entry])
@@ -144,6 +1650,10 @@ class ExecuteTests(unittest.TestCase):
                     execute.atomic(result_path, [entry])
                     result = self.run_cli('execute.py', *args, '--results', str(result_path))
                     self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('503', result.stderr)
+                    self.assertIn('retried once, still failing', result.stderr)
+                    self.assertIn('proceed', result.stderr)
+                    self.assertIn('calls', json.loads(self.run_cli('execute.py', *args).stdout))
                     self.assertFalse(triage.question_closed(self.store, plan))
                     self.assertFalse((self.store/'calls.jsonl').exists())
                 elif kind == 'foreign':
@@ -526,8 +2036,8 @@ class ExecuteTests(unittest.TestCase):
         plan = execute.read(self.path)
         self.assertIn('question_id: '+plan['run_id'],dry.stdout)
         message = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path))
-        self.assertIn('1 needs you',real.stdout.splitlines()[0])
-        self.assertIn('1 needs you',message.stdout.splitlines()[0])
+        self.assertIn('awaiting approval',real.stdout.splitlines()[0])
+        self.assertIn('awaiting approval',message.stdout.splitlines()[0])
         self.assertNotIn('Reply "proceed"',message.stdout)
         self.assertIn('A real run would ask:',message.stdout)
 
@@ -797,12 +2307,17 @@ class ExecuteTests(unittest.TestCase):
                 result = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path))
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertIn('awaiting approval' if language == 'en' else 'en espera de aprobación',result.stdout.splitlines()[0])
-                for i in range(2): self.assertEqual(result.stdout.count(' · Fixture '+str(i)),1,result.stdout)
+                self.assertNotIn('Fixture 0', result.stdout)
+                self.assertNotIn('Fixture 1', result.stdout)
+                self.assertNotIn(triage.SECTION_LABELS[language]['inbox'], result.stdout)
+                plan = execute.read(self.path)
+                report = triage.render_report(plan, listing, language, self.store)
+                self.assertEqual(report.count('(2) · '+('latest: ' if language == 'en' else 'más reciente: ')+'Fixture 0'), 1 if action == 'none' else 3 if '+' in action else 2, report)
                 if action != 'none': self.assertIn('would ' if language == 'en' else 'previsto:',result.stdout)
                 import re
-                numbered = len(re.findall(r'^\d+\. ', result.stdout, re.M))
-                expected = ('nothing needs you' if not numbered else str(numbered)+' need you') if language == 'en' else ('nada requiere tu decisión' if not numbered else str(numbered)+' requieren tu decisión')
-                self.assertIn(expected, result.stdout.splitlines()[0])
+                numbered = triage.owner_count(triage.message_outcomes(dict(plan, dry_run=True), listing, plan['remaining'], language=language))
+                expected = ('nothing needs you' if not numbered else str(numbered)+(' needs you' if numbered == 1 else ' need you')) if language == 'en' else ('nada requiere tu decisión' if not numbered else str(numbered)+(' requiere tu decisión' if numbered == 1 else ' requieren tu decisión'))
+                self.assertNotIn(expected, result.stdout.splitlines()[0])
 
     def test_approval_words_refused_without_waiting_plan(self):
         for state in (None, 'approved', 'skipped'):
@@ -965,7 +2480,15 @@ class ExecuteTests(unittest.TestCase):
                     message = triage.render_message(self.store, self.token, self.path, None)
                     count = len(re.findall(r'^\d+\. ', message, re.M)) if kind != 'dry' else 1
                     expected = (str(count) + (' needs you' if count == 1 else ' need you') if count else 'nothing needs you') if language == 'en' else (str(count) + (' requiere tu decisión' if count == 1 else ' requieren tu decisión') if count else 'nada requiere tu decisión')
-                    self.assertIn(' · '+expected+' · ', message.splitlines()[0])
+                    if kind in ('partial', 'all_failed', 'none_listed'):
+                        expected = 'run not saved' if language == 'en' else 'ejecución sin guardar'
+                    if kind == 'failure':
+                        expected = 'run failed' if language == 'en' else 'ejecución fallida'
+                    if kind == 'dry':
+                        self.assertNotIn('requiere', message.splitlines()[0])
+                        self.assertNotIn('need', message.splitlines()[0])
+                    else:
+                        self.assertIn(' · '+expected+' · ', message.splitlines()[0])
                     if kind == 'real':
                         self.assertIn('1 handled' if language == 'en' else '1 gestionado', message.splitlines()[0])
 
@@ -1007,7 +2530,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertIn('Cedar desk:', triage.render_report(plan, listing))
 
     def test_failure_opening_preserves_numbered_count_and_language(self):
-        item = dict(account='cedar', id='waiting', number=1, reason='No matching rule')
+        item = dict(account='cedar', id='waiting', sender='a@example.net', subject='Waiting', number=1, reason='No matching rule')
         plan = dict(actions=[], decisions=[item], remaining=[item], counts={'cedar': 1}, not_listed=['ash'],
                     skip_reasons={'ash': 'provider error (503)'})
         for language in ('en', 'es'):
@@ -1018,6 +2541,14 @@ class ExecuteTests(unittest.TestCase):
             self.assertIn('1 needs you' if language == 'en' else '1 requiere tu decisión', text)
             self.assertIn('Ash desk:', text)
             self.assertIn('retried once' if language == 'en' else 'reintentada una vez', text)
+
+    def commit_numbered_run(self):
+        machine = execute.Execution(self.store, self.token, self.path)
+        self.assertFalse(machine.plan['actions'])
+        machine.step()
+        triage.commit_state(self.store, self.token, self.path)
+        triage.release(self.store, self.token)
+        self.token = triage.acquire(self.store)
 
     def run_cli(self, script, *args):
         return subprocess.run(['python3', 'scripts/' + script, *args],
@@ -1045,11 +2576,13 @@ class ExecuteTests(unittest.TestCase):
             message = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path)).stdout
             self.assertIn('Ash desk:', message)
             self.assertIn('retried once' if language == 'en' else 'reintentada una vez', message)
-            self.assertIn('2 need you' if language == 'en' else '2 requieren tu decisión', message)
+            self.assertIn('run failed' if language == 'en' else 'ejecución fallida', message)
             for foreign in (dict(original, run_token='other'), dict(original, dry_run=True)):
                 save_plan(self.store, self.token, self.path, foreign)
                 text = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path)).stdout
-                self.assertNotIn('Ash desk:', text)
+                # Current transport retries remain visible even without a usable plan.
+                self.assertIn('retried once, succeeded' if language == 'en' else 'reintentada una vez, correcta', text)
+                self.assertNotIn('a@example.net', text)
             (self.store/'rules.toml').write_text('rules=[]\n')
             (self.store/'run-refusal.json').unlink()
 
@@ -1127,7 +2660,7 @@ class ExecuteTests(unittest.TestCase):
         (self.store/'run-refusal.json').unlink(missing_ok=True)
         self.assertEqual(self.run_cli('execute.py', 'next', *args).returncode, 0)
         self.assertEqual(self.run_cli('triage.py', 'commit-state', *args).returncode, 0)
-        self.assertIn('4 need you', self.run_cli('triage.py', 'message', *args).stdout)
+        self.assertIn('1 needs you', self.run_cli('triage.py', 'message', *args).stdout)
         self.assertEqual(self.run_cli('triage.py', 'send-state', '--token', self.token).returncode, 0)
         reply = self.store/'reply.txt'
         reply.write_text('1 leave')
@@ -1215,35 +2748,38 @@ class ExecuteTests(unittest.TestCase):
                 result = self.run_cli('triage.py', 'commit-state', *args)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 real = self.run_cli('triage.py', 'message', *args).stdout
-                dry_lines = [l for l in dry.splitlines() if ' · Matrix item' in l]
-                real_lines = [l for l in real.splitlines() if ' · Matrix item' in l]
+                dry_lines = [l for l in dry.splitlines() if re.search(r' · (?:latest: |más reciente: )?Matrix item', l)]
+                real_lines = [l for l in real.splitlines() if re.search(r' · (?:latest: |más reciente: )?Matrix item', l)]
+                def message_count(lines):
+                    return sum(int(m[1]) if (m := re.search(r' \((\d+)\) · (?:latest: |más reciente: )', line)) else 1 for line in lines)
                 expected = int(earlier != 'failed account' and not (
                     setting == 'new_plus_count' and earlier in ('listed', 'kept') and not plan['actions']))
                 for mode, lines in [('real', real_lines), ('dry', dry_lines)]:
                     with self.subTest(mode=mode):
-                        self.assertEqual(len(lines), expected * (2 if failure == 'not attempted' else 1), (dry, real))
+                        self.assertEqual(message_count(lines), expected * (2 if failure == 'not attempted' else 1), (dry, real))
                 self.assertEqual(bool(dry_lines), bool(real_lines), (dry, real))
                 handled = bool(plan['actions'])
                 if handled:
                     for a in plan['actions']:
                         self.assertIn(triage.action_label(a, self.listing, language, planned=True), dry_lines[0])
                 elif real_lines:
-                    tag = lambda l: l.split(' · Matrix item', 1)[1]
+                    tag = lambda l: re.split(r' · (?:latest: |más reciente: )?Matrix item', l, maxsplit=1)[1]
                     self.assertEqual(tag(dry_lines[0]), tag(real_lines[0]))
                 if not failure:
-                    self.assertEqual(dry.splitlines()[0].split(' · ')[2], real.splitlines()[0].split(' · ')[2])
+                    self.assertNotIn('need', dry.splitlines()[0])
+                    self.assertNotIn('requiere', dry.splitlines()[0])
                 count = len(re.findall(r'^\d+\. ', real, re.M))
                 owner = real.splitlines()[0].split(' · ')[2]
                 self.assertEqual(count, int(owner.split()[0]) if owner[0].isdigit() else 0, real)
                 for message_text in (dry, real):
                     heading = re.search(r'^cedar: (\d+)$', message_text, re.M)
                     if heading:
-                        shown = len([l for l in message_text.splitlines() if ' · Matrix item' in l])
+                        shown = message_count([l for l in message_text.splitlines() if re.search(r' · (?:latest: |más reciente: )?Matrix item', l)])
                         previous = sum(int(l.split()[0]) for l in re.findall(r'^\d+ (?:previously listed|ya enumerados)$', message_text, re.M))
                         self.assertEqual(int(heading[1]), shown + previous, message_text)
                     # Total original messages = visible Inbox + prior count + removed handled lines.
                     previous = sum(int(l.split()[0]) for l in re.findall(r'^\d+ (?:previously listed|ya enumerados)$', message_text, re.M))
-                    self.assertEqual(len(self.listing['messages']), message_text.count(' · Matrix item') + previous, message_text)
+                    self.assertEqual(len(self.listing['messages']), message_count([l for l in message_text.splitlines() if re.search(r' · (?:latest: |más reciente: )?Matrix item', l)]) + previous, message_text)
 
                 if not failure and plan['actions']:
                     self.assertIn('Handled messages: 1', (self.store/'execution-report.md').read_text())
@@ -1340,7 +2876,8 @@ class ExecuteTests(unittest.TestCase):
                     import re
                     count = len(re.findall(r'^\d+\. ', text, re.M))
                     need = (str(count) + (' needs you' if count == 1 else ' need you') if count else 'nothing needs you') if language == 'en' else (str(count) + (' requiere tu decisión' if count == 1 else ' requieren tu decisión') if count else 'nada requiere tu decisión')
-                    self.assertIn(' · '+need+' · ', text.splitlines()[0], text)
+                    need = ('run failed' if language == 'en' else 'ejecución fallida') if position in ('no checkpoint', 'refused') else ('run not saved' if language == 'en' else 'ejecución sin guardar')
+                    self.assertIn(' · '+need+''+' · ', text.splitlines()[0], text)
                     self.assertEqual(text.count(' · Failure fixture'), 1, text)
                     line = next(l for l in text.splitlines() if ' · Failure fixture' in l)
                     self.assertIn(triage.action_label(action, self.listing, language), line)
@@ -1483,7 +3020,7 @@ class ExecuteTests(unittest.TestCase):
                 (self.store/'numbers.json').unlink(missing_ok=True)
                 (self.store/'rules.toml').write_text('rules=[]\n')
                 (self.store/'never-touch.toml').write_text('allow_empty=true\n')
-                self.listing['messages'] = [dict(self.listing['messages'][0], id='o'+str(i), subject='Old '+str(i)) for i in range(3)]
+                self.listing['messages'] = [dict(self.listing['messages'][0], id='o'+str(i), subject='Old '+str(i), sender=str(i)+'@example.net') for i in range(3)]
                 execute.atomic(self.store/'inbox.json', self.listing)
                 self.assertEqual(self.plan_cli().returncode, 0)
                 args = ['--token', self.token, '--plan', str(self.path)]
@@ -1501,7 +3038,7 @@ class ExecuteTests(unittest.TestCase):
                 self.token = triage.acquire(self.store)
                 (self.store/'rules.toml').write_text('[[rules]]\nid="new-rule"\naccounts=["cedar"]\nsubject="Old 1"\naction="trash"\nexclusions=[]\n')
                 (self.store/'never-touch.toml').write_text('[[rules]]\nsubject="Old 2"\n')
-                self.listing['messages'].append(dict(self.listing['messages'][0], id='n1', subject='New one'))
+                self.listing['messages'].append(dict(self.listing['messages'][0], id='n1', subject='New one', sender='new@example.net'))
                 execute.atomic(self.store/'inbox.json', self.listing)
                 before = {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
                 probe = self.plan_cli('--dry-run')
@@ -1512,8 +3049,8 @@ class ExecuteTests(unittest.TestCase):
                 real = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path)).stdout
                 count = 1 if setting == 'new_plus_count' else 2
                 need = (str(count)+(' needs you' if count == 1 else ' need you')) if language == 'en' else (str(count)+(' requiere tu decisión' if count == 1 else ' requieren tu decisión'))
-                self.assertIn(need, dry.splitlines()[0])
-                self.assertIn(need, real.splitlines()[0])
+                self.assertNotIn(need, dry.splitlines()[0])
+                self.assertIn('run failed' if language == 'en' else 'ejecución fallida', real.splitlines()[0])
                 for subject in ('Old 0',):
                     self.assertEqual(subject in dry, setting == 'all')
                     self.assertEqual(subject in real, setting == 'all')
@@ -1600,6 +3137,23 @@ class ExecuteTests(unittest.TestCase):
         batch = self.machine().step()
         path = self.store / 'gateway.json'
         execute.atomic(path, [dict(ok=True, value={'error': {'code': 403}}) for c in batch['calls']])
+        self.machine().batch_result(path)
+        self.machine().final(dict(self.listing, messages=[]))
+        self.assertTrue(all(r['status'] == 'failed' for r in self.machine().state['results']))
+        self.assertTrue(all(r['reason'] == 'provider error (403)' for r in self.machine().state['results']))
+
+    def test_r137_response_status_never_confirms_batch(self):
+        bodies = [{'error': {'code': 404}}, {'error': {'code': 'ErrorAccessDenied'}},
+                  {'code': '403'}, {'status': 503}, {'statusCode': 700}]
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assertTrue(triage.provider_failed(dict(ok=True, value=body)))
+        self.assertEqual(triage.provider_error(dict(ok=True, value={'statusCode':700})), 'provider error (700)')
+        self.assertFalse(triage.provider_failed(dict(ok=True, value={})))
+        self.batch_fixture()
+        batch = self.machine().step()
+        path = self.store / 'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={'response': {'status': 403}}) for c in batch['calls']])
         self.machine().batch_result(path)
         self.machine().final(dict(self.listing, messages=[]))
         self.assertTrue(all(r['status'] == 'failed' for r in self.machine().state['results']))
@@ -2067,13 +3621,14 @@ class ExecuteTests(unittest.TestCase):
         refused = subprocess.run(command + ['--dry-run', '--report-out', str(self.store / 'report.md')], env=env, capture_output=True, text=True)
         self.assertNotEqual(refused.returncode,0)
         self.assertIn('dry run writes no report',refused.stderr)
-        (self.store/'run-refusal.json').unlink()
+        self.assertFalse((self.store/'run-refusal.json').exists())
         subprocess.run(command + ['--dry-run'], env=env, capture_output=True, check=True)
         self.assertEqual((self.store / 'report.md').read_text(), 'previous report')
         (self.store / 'report.md').unlink()
         dry = execute.read(self.path)
         self.assertTrue(dry['first_run'])
         self.assertTrue(dry.pop('dry_run'))
+        self.assertEqual(dry.pop('dry_listing'), self.listing)
         for name, raw in before.items():
             if name != 'plan.json':
                 self.assertEqual((self.store / name).read_bytes(), raw)
@@ -2116,7 +3671,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertTrue(message.startswith('📬 Triage · '))
         self.assertIn('Dry run', message)
         self.assertIn('4 messages would be handled · dry run', message.splitlines()[0])
-        self.assertIn('nothing needs you', message.splitlines()[0])
+        self.assertNotIn('nothing needs you', message.splitlines()[0])
         self.assertNotIn('stopped', message.splitlines()[0])
         self.assertIn('would move', message)
         self.assertIn('no reply number is live', message)
@@ -2135,8 +3690,8 @@ class ExecuteTests(unittest.TestCase):
             plan=triage.build_plan(listing,[],[],triage.state_config(self.store))
             save_plan(self.store, self.token, self.path, dict(plan,first_run=True,dry_run=True,run_token=self.token))
             opening=triage.render_message(self.store,self.token,self.path,None).splitlines()[0]
-            expected='nothing needs you' if not count else str(count)+(' needs you' if count==1 else ' need you')
-            self.assertIn(expected,opening)
+            expected='nothing needs you' if not count else '1 needs you'
+            self.assertNotIn(expected,opening)
             self.assertIn('0 messages would be handled',opening)
             self.assertNotIn('stopped',opening)
         listing=dict(self.listing,messages=[dict(self.listing['messages'][0],subject='trash')])
@@ -2159,9 +3714,9 @@ class ExecuteTests(unittest.TestCase):
         plan=triage.build_plan(listing,triage.parse_rules((self.store/'rules.toml').read_text()),holds,triage.state_config(self.store))
         save_plan(self.store, self.token, self.path, dict(plan,first_run=True,dry_run=True,run_token=self.token))
         message=triage.render_message(self.store,self.token,self.path,None)
-        self.assertIn('1 requiere tu decisión',message.splitlines()[0])
+        self.assertNotIn('1 requiere tu decisión',message.splitlines()[0])
         self.assertNotIn('Decisiones para el propietario',message)
-        self.assertEqual(message.count('Protegido por never-touch'),2)
+        self.assertEqual(message.count('Protegido por never-touch'),1)
 
     def test_failed_final_read_keeps_numbered_owner_decisions(self):
         self.batch_fixture()
@@ -2176,6 +3731,7 @@ class ExecuteTests(unittest.TestCase):
         execute.atomic(path,[dict(ok=True,value={}) for _ in batch['calls']])
         self.machine().batch_result(path)
         self.machine().final(dict(accounts={},messages=[],skipped={'cedar':'provider error (502)'}))
+        triage.commit_state(self.store,self.token,self.path)
         message=triage.render_message(self.store,self.token,self.path,None)
         self.assertIn('1 needs you',message.splitlines()[0])
         self.assertIn('1. a@example.net',message)
@@ -2298,10 +3854,12 @@ class ExecuteTests(unittest.TestCase):
         _, status = os.waitpid(child, 0)
         self.assertEqual(os.WTERMSIG(status), signal.SIGKILL)
         folder = self.store/'.dry-run'
-        self.assertTrue((folder/'inbox.json').exists())
+        self.assertTrue(list(folder.glob('simulation-*/inbox.json')))
         self.assertEqual(set(system_temp.iterdir()), before)
         execute.simulate(self.store,self.path)
-        self.assertFalse(folder.exists())
+        self.assertTrue(folder.exists())
+        # Old copies are never read by a new simulation.
+        triage.clean_simulation(self.store)
         folder.mkdir()
         (folder/'inbox.json').write_text('not real input')
         self.assertEqual(execute.read(self.store/'inbox.json'),self.listing)
@@ -2477,7 +4035,7 @@ class ExecuteTests(unittest.TestCase):
         message = triage.render_message(self.store, self.token, self.path, None)
         self.assertIn('awaiting approval', message.splitlines()[0])
         self.assertNotIn('stopped', message)
-        self.assertIn('nothing needs you', message.splitlines()[0])
+        self.assertIn('awaiting approval', message.splitlines()[0])
         self.assertIn('11 matches; 11 messages in Inbox; limit 10', message)
         self.assertNotIn('Decisions for the owner', message)
         self.assertIn('would trash',message)
@@ -2604,11 +4162,11 @@ class ExecuteTests(unittest.TestCase):
             if index: ids.remove(call['id'])
         self.machine().step()
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(self.message_command(), '📬 Triage · Thursday, 2026-11-12, 12:00 UTC · nothing needs you · 3 handled\n\nHandled automatically\ncedar\n- move to Reading: a@example.net · move\n- move to Reading: a@example.net · move\n- trash: a@example.net · trash\n\nStill in Inbox (by account)\n\ncedar: 1\n- a@example.net · move (move to Reading failed)\n')
+        self.assertEqual(self.message_command(), '📬 Triage · Thursday, 2026-11-12, 12:00 UTC · nothing needs you · 3 handled\n\nHandled automatically\ncedar\n- move to Reading: a@example.net (2) · latest: move\n- trash: a@example.net · trash\n\nStill in Inbox (by account)\n\ncedar: 1\n- a@example.net · move (move to Reading failed)\n')
 
     def test_message_halted_golden(self):
         self.machine().step()
-        self.assertEqual(self.message_command(), '📬 Triage · Thursday, 2026-11-12, 12:00 UTC · nothing needs you · 0 handled · stopped\nRun ended before all actions completed\n\nStill in Inbox (by account)\n\ncedar: 4\n- a@example.net · move (move to Reading result unknown)\n- a@example.net · move (move to Reading not attempted)\n- a@example.net · move (move to Reading not attempted)\n- a@example.net · trash (trash not attempted)\n')
+        self.assertEqual(self.message_command(), '📬 Triage · Thursday, 2026-11-12, 12:00 UTC · run not saved · 0 handled · stopped\nRun ended before all actions completed\n\nStill in Inbox (by account)\n\ncedar: 4\n- a@example.net · move (move to Reading result unknown)\n- a@example.net (2) · latest: move (move to Reading not attempted)\n- a@example.net · trash (trash not attempted)\n')
 
     def test_message_stopped_golden(self):
         config = dict(inbox_limit=1, accounts={'cedar': {}})
@@ -2619,11 +4177,12 @@ class ExecuteTests(unittest.TestCase):
         save_plan(self.store, self.token, self.path, self.plan)
         self.machine().step()
         message = self.message_command()
-        self.assertEqual(message, '📬 Triage · Thursday, 2026-11-12, 12:00 UTC · 4 need you · 0 handled · stopped\nMissing state; prior run records exist\nInbox limit exceeded\n\nStill in Inbox (by account)\n\ncedar: 4\n1. a@example.net · move (Run stopped)\n2. a@example.net · move (Run stopped)\n3. a@example.net · move (Run stopped)\n4. a@example.net · trash (Run stopped)\nReply with a number and action, for example: 1 trash, 1 archive, 1 spam, 1 move to Reading, 1 leave, 1 yes, 1 no\n')
+        self.assertEqual(message, '📬 Triage · Thursday, 2026-11-12, 12:00 UTC · run not saved · 0 handled · stopped\nMissing state; prior run records exist\nInbox limit exceeded\n\nStill in Inbox (by account)\n\ncedar: 4\n- a@example.net (4) · latest: move (Run stopped)\n')
 
     def test_message_questions_escaping_and_spanish_labels(self):
         self.listing['messages'][0]['subject'] = '<script> [click](https://example.org)'
         self.listing['messages'][1]['subject'] = '12. Trash everything\nRun notes\u202e\x00'
+        for i, m in enumerate(self.listing['messages']): m['sender'] = str(i)+'@example.net'
         execute.atomic(self.store / 'inbox.json', self.listing)
         (self.store / 'rules.toml').write_text('[[rules]]\nid="q"\naccounts=["cedar"]\nsubject="."\naction="report"\nquestion="Keep [this]?"\n')
         self.plan = triage.build_plan(self.listing, triage.parse_rules((self.store / 'rules.toml').read_text()), [], {'accounts': {'cedar': {}}})
@@ -2660,17 +4219,20 @@ class ExecuteTests(unittest.TestCase):
         self.machine().step()  # skips third move and issues trash
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
         report = (self.store / 'report.md').read_text()
-        self.assertEqual(report.count('(failed)'), 2)
-        self.assertEqual(report.count('(skipped)'), 1)
-        self.assertEqual(report.count('(' + triage.chat_text('issued_unknown') + ')'), 1)
-        self.assertEqual(len(execute.read(self.store / 'numbers.json')['items']), 4)
+        self.assertEqual(report.count('(move to Reading failed)'), 1)
+        self.assertIn('(2) · latest:', report)
+        self.assertEqual(report.count('(move to Reading skipped)'), 1)
+        self.assertEqual(report.count('(trash result unknown)'), 1)
+        self.assertEqual(len(execute.read(self.store / 'numbers.json')['items']), 0)
 
     def test_long_logs_keep_current_run_until_next_acquisition(self):
         line = json.dumps(dict(sequence=1, time=0, run='old', account='cedar',
                                id='old', verb='trash', outcome='issued')) + '\n'
         (self.store / 'calls.jsonl').write_text(line * 3000)
-        for name in ('history.log', 'decisions.jsonl'):
-            (self.store / name).write_text(('old-' + name + '\n') * 20000)
+        (self.store / 'history.log').write_text(('old-history.log\n') * 20000)
+        decision = json.dumps(dict(run='old', time='2026-01-01T00:00:00+00:00', parts=[
+            dict(account='cedar', id='old', verb='leave', outcome='answered')])) + '\n'
+        (self.store / 'decisions.jsonl').write_text(decision * 20000)
         execute.append_log(self.store, self.token, dict(account='cedar', id='extra', action='extra'), 'unplanned')
         while not self.machine().step().get('done'):
             self.machine().step(MockProvider([]))
@@ -2695,7 +4257,7 @@ class ExecuteTests(unittest.TestCase):
         self.machine().step()
         self.assertEqual(len(execute.read(self.store / 'results.json')['results']), 1)
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 3})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 3})
 
     def test_verification_retained_id_no_decrement(self):
         for _ in range(3):
@@ -2704,7 +4266,7 @@ class ExecuteTests(unittest.TestCase):
         self.machine().step()
         self.assertEqual(self.machine().step(MockProvider(['3'], remove=False)), {'status': 'unexecuted'})
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 1})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 1})
 
     def test_two_failures_other_verb_continues(self):
         for _ in range(2):
@@ -2777,7 +4339,7 @@ class ExecuteTests(unittest.TestCase):
         self.machine().step()
         machine = self.machine()
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 4})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 4})
         before = {p: p.read_bytes() for p in self.store.iterdir() if p.is_file() and p.name != 'run.lock'}
         held = triage.read_lock(self.store)
         held['created'] -= 2701
@@ -2911,7 +4473,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertFalse((self.store / 'calls.jsonl').exists())
         self.assertEqual(execute.read(self.store / 'results.json'), {'results': []})
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 4})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 2, '_run_counter': 1, 'version': 1, 'cedar': 4})
 
     def dated(self, *, existing=False, count=2, limit=None):
         text = ('[[rules]]\nid="dated"\naccounts=["cedar"]\nsubject="move"\n'
@@ -2951,7 +4513,7 @@ class ExecuteTests(unittest.TestCase):
             self.machine().step(execute.AssistantProvider(dict(outcome='ok', inbox_ids=['1'] if i == 0 else [])))
         self.assertEqual(self.machine().step(), {'done': True})
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 0})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 0})
 
     def test_provider_folder_listing_before_move_batch(self):
         self.dated()
@@ -3028,7 +4590,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertIn('create-folder', incomplete)
         self.assertEqual(incomplete.count('move'), 2)
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 2})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 2})
 
     def test_creation_unknown_keeps_dependents(self):
         self.dated()
@@ -3263,7 +4825,7 @@ class ExecuteTests(unittest.TestCase):
             self.machine().step(MockProvider([call['id']]))
         self.machine().step()
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 0, '_positions': {'cedar': ['stale']}})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 0, '_positions': {'cedar': ['stale']}})
 
     def test_pre_listing_positions_see_later_arrivals_both_kinds(self):
         import tomllib
@@ -3352,7 +4914,7 @@ class ExecuteTests(unittest.TestCase):
         execute.atomic(self.store / 'state.json', {'cedar': 4, '_positions': {'cedar': ['old']}})
         self.machine().step()
         triage.commit_state(self.store, self.token, self.path)
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 4, '_positions': {'cedar': ['old']}})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 4, '_positions': {'cedar': ['old']}})
 
     def test_commit_invalid_observation_preserves_positions_keeps_counts(self):
         execute.atomic(self.store / 'state.json', {'cedar': 4, '_positions': {'cedar': ['old']}})
@@ -3361,7 +4923,7 @@ class ExecuteTests(unittest.TestCase):
         triage.quiet_check(self.store, dict(accounts={'cedar': {}}), {}, observation, False, datetime.now(timezone.utc))
         self.machine().step()
         triage.commit_state(self.store, self.token, self.path)
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 4, '_positions': {'cedar': ['old']}})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 4, '_positions': {'cedar': ['old']}})
 
     def test_incomplete_execution_cannot_save_positions(self):
         observation = self.store / 'positions-observation.json'
@@ -3394,7 +4956,7 @@ class ExecuteTests(unittest.TestCase):
             self.machine().step(MockProvider([call['id']]))
         self.machine().step()
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 0, '_positions': {'cedar': '200'}})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 0, '_positions': {'cedar': '200'}})
 
     def test_missing_account_cannot_seed_positions(self):
         (self.store / 'config.toml').write_text('[accounts.cedar]\n[accounts.marble]\n')
@@ -3436,7 +4998,7 @@ class ReplyTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.store = Path(self.temp.name)
         self.config = {'accounts': {'cedar': {}}}
-        self.listing = dict(accounts={'cedar': 100}, messages=[dict(account='cedar', id=str(i), folder='Inbox', sender='a@example.net', subject='Question '+str(i), date='2026-11-11T00:00:00+00:00') for i in range(3)], folders={'cedar': [dict(id='billing', name='Billing')]})
+        self.listing = dict(accounts={'cedar': 100}, messages=[dict(account='cedar', id=str(i), folder='Inbox', sender=chr(97+i)+'@example.net', subject='Question '+str(i), date='2026-11-11T00:00:00+00:00') for i in range(3)], folders={'cedar': [dict(id='billing', name='Billing')]})
         for name, text in [('config.toml', '[accounts.cedar]\n'), ('rules.toml', 'rules=[]\n'), ('never-touch.toml', 'allow_empty=true\n'), ('guardrails.md', 'fixture policy\n')]:
             (self.store/name).write_text(text)
         execute.atomic(self.store/'state.json', {'cedar': 3})
@@ -3475,13 +5037,13 @@ class ReplyTests(unittest.TestCase):
                     self.assertFalse(plan['reasons'], example)
         self.assertEqual(triage.reply_hint([], 'en'), [])
 
-    def test_reply_prints_plain_chat_addresses(self):
+    def test_reply_prints_plain_chat_account_counts(self):
         self.reply('1 archive')
-        self.assertIn('a@example.net', self.output)
+        self.assertIn('1 archive: cedar: 1 message; 0 skipped as gone.', self.output)
         self.assertNotIn('\\[at\\]', self.output)
         self.assertNotIn('\\', self.output)
 
-    def test_provider_numbered_reply_unconfirmed_keeps_number(self):
+    def test_provider_numbered_reply_unconfirmed_retires_number(self):
         (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
         self.config['accounts']['cedar']['provider'] = 'gmail'
         self.reply('1 trash, 2 archive')
@@ -3493,7 +5055,7 @@ class ReplyTests(unittest.TestCase):
         triage.commit_state(self.store, self.token, self.path)
         log = json.loads((self.store / 'decisions.jsonl').read_text().splitlines()[-1])
         self.assertEqual([p['outcome'] for p in log['parts']], ['executed', 'unconfirmed'])
-        self.assertEqual({p['number']: p['id'] for p in triage.read_numbers(self.store)['items']}[2], '1')
+        self.assertNotIn(2, {p['number'] for p in triage.read_numbers(self.store)['items']})
 
     def test_owner_kept_message_in_confirmed_report_and_later_plan(self):
         self.reply('1 leave')
@@ -3513,7 +5075,7 @@ class ReplyTests(unittest.TestCase):
         self.reply('1 leave')
         execute.Execution(self.store, self.token, self.path).step()
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
-        self.assertEqual(execute.read(self.store / 'state.json'), {'version': 1, 'cedar': 3})
+        self.assertEqual(execute.read(self.store / 'state.json'), {'_next_number': 4, '_run_counter': 1, 'version': 1, 'cedar': 3})
         self.assertEqual(execute.read(self.store / 'decisions.jsonl')['parts'][0]['outcome'], 'answered')
         self.assertTrue(execute.read(self.store / 'numbers.json')['items'])
 
@@ -3534,7 +5096,7 @@ class ReplyTests(unittest.TestCase):
                 execute.Execution(self.store, self.token, self.path).step()
                 triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
                 saved = execute.read(self.store / 'state.json')
-                self.assertEqual(saved, previous | {'version': 1})
+                self.assertEqual(saved, previous | {'_next_number': 4, '_run_counter': 1, 'version': 1})
                 triage.release(self.store, self.token)
                 self.token = triage.acquire(self.store)
                 self.assertEqual(triage.quiet_check(self.store, self.config, saved, obs, True, now), expected)
@@ -3555,26 +5117,32 @@ class ReplyTests(unittest.TestCase):
         self.assertFalse((self.store/'decisions.jsonl').exists())
 
     def test_every_saved_number_is_in_report(self):
-        cases = [([], []), ([], [dict(sender='a@example.net')]),
+        cases = [([], []), ([], [dict(subject='Question')]),
                  ([dict(id='q', accounts=['cedar'], subject='Question', action='report', question='Keep it?')], [])]
         for rules, holds in cases:
             plan = triage.build_plan(self.listing, rules, holds, self.config, {'cedar': 3})
-            triage.number_decisions(self.store, plan, self.listing)
-            report = triage.render_report(plan, self.listing)
+            outcomes = triage.number_decisions(self.store, plan, self.listing)
+            report = triage.render_report(plan, self.listing, outcomes=outcomes)
             if holds:
                 self.assertEqual(triage.read_numbers(self.store)['items'], [])
                 self.assertTrue(all('number' not in d for d in plan['decisions']))
                 self.assertNotIn('1. ', report)
-            for item in triage.read_numbers(self.store)['items']:
-                self.assertIn(str(item['number']) + '. ', report)
+            outcomes = triage.message_outcomes(plan, self.listing, plan['remaining'], [])
+            for group in triage.presentation_groups(outcomes):
+                if group[0]['owner']:
+                    self.assertIn(str(group[0]['item']['number']) + '. ', report)
+            self.assertEqual(sum(len(g) for g in triage.presentation_groups(outcomes)), len(self.listing['messages']))
 
     def test_automatic_item_retires_unlisted_number(self):
-        rules = [dict(id='auto', accounts=['cedar'], sender='a@example.net', action='archive')]
+        rules = [dict(id='auto', accounts=['cedar'], subject='Question', action='archive')]
         plan = triage.build_plan(self.listing, rules, [], self.config, {'cedar': 3})
         triage.number_decisions(self.store, plan, self.listing)
         self.assertEqual(triage.read_numbers(self.store)['items'], [])
         self.assertEqual(self.reply('1 trash')['actions'], [])
         self.assertIn('Unknown number', self.output)
+        self.assertIn('Unknown number. Type', self.output)
+        self.assertIn('commit-state, message, send-state', self.output)
+        self.assertNotIn('(Run stopped)', (self.store/'report.md').read_text())
 
     def test_answers_never_write_rules(self):
         before = (self.store/'rules.toml').read_bytes()
@@ -3591,7 +5159,7 @@ class ReplyTests(unittest.TestCase):
         plan = self.number()
         self.assertEqual([x['number'] for x in plan['decisions']], [1,2,3])
         self.assertEqual(plan['actions'], [])
-        self.assertIn('1. a@example.net', triage.render_report(plan, self.listing))
+        self.assertNotIn('1. a@example.net', triage.render_report(plan, self.listing))
 
     def test_two_actions_only_and_batch_outcomes(self):
         from datetime import datetime
@@ -3609,7 +5177,7 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual([x['outcome'] for x in batches[0]['parts']], ['executed','executed'])
         self.assertEqual(batches[0]['time'], now.isoformat())
         self.assertNotIn('subject', str(batches))
-        self.assertEqual(execute.read(self.store/'state.json'), {'version': 1, 'cedar': 1})
+        self.assertEqual(execute.read(self.store/'state.json'), {'_next_number': 4, '_run_counter': 1, 'version': 1, 'cedar': 1})
 
     def test_all_reply_forms_remain_valid(self):
         for verb in ('trash', 'archive', 'spam', 'move to Billing', 'leave', 'yes', 'no'):
@@ -3632,8 +5200,8 @@ class ReplyTests(unittest.TestCase):
         self.listing['messages'].pop(1)
         self.listing['messages'].append(dict(self.listing['messages'][0], id='new'))
         execute.atomic(self.store/'inbox.json', self.listing)
-        self.assertEqual([x['number'] for x in self.number()['decisions']], [1,3,4])
-        self.assertEqual(self.reply('3 trash')['actions'][0]['id'], '2')
+        self.assertEqual([x['number'] for x in self.number()['decisions']], [4,5,4])
+        self.assertEqual(self.reply('5 trash')['actions'][0]['id'], '2')
 
     def test_non_actions_no_calls_keep_numbers(self):
         self.reply('1 leave, 2 YES, 3 no')
@@ -3671,17 +5239,19 @@ class ReplyTests(unittest.TestCase):
         execute.atomic(self.store/'inbox.json',self.listing)
         self.refused('1 move to Billing')
     def test_ceiling(self):
-        self.listing['messages']=[dict(self.listing['messages'][0],id=str(i)) for i in range(11)]
+        self.listing['messages']=[dict(self.listing['messages'][0],id=str(i), sender=str(i)+'@example.net') for i in range(11)]
         self.number()
         execute.atomic(self.store/'inbox.json',self.listing)
-        self.refused(','.join(str(i)+' trash' for i in range(1,12)))
+        plan = self.reply(','.join(str(i['number'])+' trash' for i in triage.read_numbers(self.store)['items']))
+        self.assertEqual(plan['approval_state'], 'awaiting approval')
+        self.assertEqual(len(plan['actions']), 11)
     def test_brake_floor(self):
         self.listing['accounts']['cedar']=3
         execute.atomic(self.store/'inbox.json',self.listing)
         self.assertFalse(self.reply('1 trash')['reasons'])
     def test_inbox_brake(self):
         (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n')
-        self.refused('1 trash')
+        self.assertEqual(self.reply('1 trash')['approval_state'], 'awaiting approval')
     def test_scheduled(self): self.refused('1 trash',True)
     def test_hostile_inputs(self):
         for text in ['1,'*1000, '1 trash\x00', '1'*400+' trash', '1 trash,' , '1 trash'+' '*2000]:
@@ -3766,14 +5336,16 @@ class ReplyTests(unittest.TestCase):
     def test_reply_decisions_keep_saved_numbers(self):
         plan=self.reply('1 trash, 3 archive')
         self.assertEqual(plan['decisions'][0]['number'],2)
-        self.assertIn('2. a@example.net', (self.store/'report.md').read_text())
+        self.assertNotIn('2. b@example.net', (self.store/'report.md').read_text())
 
     def test_global_ceiling(self):
         self.listing['accounts']['cedar']=1000
-        self.listing['messages']=[dict(self.listing['messages'][0],id=str(i)) for i in range(51)]
+        self.listing['messages']=[dict(self.listing['messages'][0],id=str(i), sender=str(i)+'@example.net') for i in range(51)]
         self.number()
         execute.atomic(self.store/'inbox.json',self.listing)
-        self.refused(','.join(str(i)+' trash' for i in range(1,52)))
+        plan = self.reply(','.join(str(i['number'])+' trash' for i in triage.read_numbers(self.store)['items']))
+        self.assertEqual(plan['approval_state'], 'awaiting approval')
+        self.assertEqual(len(plan['actions']), 51)
 
     def test_reply_requires_lock(self):
         triage.release(self.store,self.token)
@@ -3790,7 +5362,7 @@ class ReplyTests(unittest.TestCase):
         self.listing['messages'][0]['subject']='[pay](https://example.org)\n*now*'
         execute.atomic(self.store/'inbox.json',self.listing)
         self.reply('1 trash')
-        self.assertIn('[pay](https://example.org) *now*',self.output)
+        self.assertEqual(self.output, '1 trash: cedar: 1 message; 0 skipped as gone.\n')
         self.assertEqual(len(self.output.splitlines()),1)
         self.assertNotIn('\\',self.output)
 
@@ -3833,9 +5405,9 @@ class ReplyTests(unittest.TestCase):
             execute.atomic(self.store/'numbers.json',data)
             with self.assertRaises(ValueError): triage.read_numbers(self.store)
 
-    def test_non_action_output_empty(self):
+    def test_non_action_output_confirms_selected_number(self):
         self.reply('1 yes')
-        self.assertEqual(self.output,'')
+        self.assertEqual(self.output,'1 yes: cedar: 1 message; 0 skipped as gone.\n')
 
     def test_cli_plan_content_identical_with_distinct_run_ids(self):
         original = self.reply('1 trash, 3 move to Billing')
@@ -3859,6 +5431,7 @@ class DraftTests(unittest.TestCase):
 
     def prepare(self):
         (self.store / "state.json").unlink(missing_ok=True)
+        (self.store / "numbers.json").unlink(missing_ok=True)
         import tomllib
         rule = self.rule
         text = '[[rules]]\n' + '\n'.join(k+'='+json.dumps(v) for k,v in rule.items()) + '\n'
@@ -4043,6 +5616,14 @@ class DraftTests(unittest.TestCase):
         machine.step()
         triage.commit_state(self.store, self.token, self.path)
         self.assertIn('check Drafts by hand', triage.render_message(self.store,self.token,self.path,None))
+        self.assertEqual(triage.read_numbers(self.store)['items'], [])
+        triage.release(self.store,self.token)
+        self.token = triage.acquire(self.store)
+        state = execute.read(self.store/'state.json')
+        plan = triage.build_plan(self.listing, [self.rule], [], self.config, state)
+        save_plan(self.store,self.token,self.path,plan)
+        execute.Execution(self.store,self.token,self.path).step()
+        triage.commit_state(self.store, self.token, self.path)
         state = execute.read(self.store/'state.json')
         number = triage.read_numbers(self.store)['items'][0]['number']
         triage.release(self.store,self.token)
@@ -4073,7 +5654,9 @@ class MessageFormatTests(unittest.TestCase):
         self.listing['skipped']={'ash':'provider error (503)'}
         self.listing['messages'] += [dict(account='marble',id='wait',folder='Inbox',sender='waiting@example.org',subject='Unique waiting'),dict(account='cedar',id='hold',folder='Inbox',sender='protected@example.net',subject='Unique protected')]
         (self.store/'never-touch.toml').write_text('[[rules]]\nsender="protected@example.net"\n')
-        for i,m in enumerate(self.listing['messages'][:4]): m['subject'] += ' unique-'+str(i)
+        for i,m in enumerate(self.listing['messages'][:4]):
+            m['subject'] += ' unique-'+str(i)
+            m['sender'] = str(i)+'@example.net'
         execute.atomic(self.store/'inbox.json',self.listing)
         self.plan=triage.build_plan(self.listing,triage.parse_rules((self.store/'rules.toml').read_text()),[dict(sender='protected@example.net')],triage.state_config(self.store))
         self.plan['first_run']=True
@@ -4102,7 +5685,7 @@ class MessageFormatTests(unittest.TestCase):
         triage.approval_event(self.store, execute.read(self.path), 'asked')
         self.machine().step()
         message=triage.render_message(self.store,self.token,self.path,None)
-        self.assertIn('4 need you · awaiting approval',message.splitlines()[0])
+        self.assertIn('awaiting approval',message.splitlines()[0])
 
     def test_b_each_key_once_real_and_dry(self):
         self.configure()
@@ -4131,7 +5714,7 @@ class MessageFormatTests(unittest.TestCase):
     def test_e_top_problem_and_retry(self):
         self.configure()
         text=self.render(True)
-        self.assertEqual(text.splitlines()[1],'ash: not listed this run; provider error (503); retried once')
+        self.assertEqual(text.splitlines()[1],'ash: not listed this run; provider error (503); retried once, still failing')
         self.assertEqual(text.count('provider error (503)'),1)
         execute.atomic(self.store/'listing-exchange.json',dict(token=self.token,attempts={}))
         self.assertNotIn('retried once',triage.render_message(self.store,self.token,self.path,None))
@@ -4163,7 +5746,8 @@ class MessageFormatTests(unittest.TestCase):
             call=self.machine().step();self.machine().step(MockProvider(ids));ids.remove(call['id'])
         self.machine().step()
         text=triage.render_message(self.store,self.token,self.path,None)
-        self.assertEqual(text.count('- trash: sender@example.net'),22)
+        self.assertEqual(text.count('- trash: sender@example.net'),1)
+        self.assertIn('sender@example.net (22)',text)
         self.assertNotIn('and 2 more',text)
         self.assertNotIn('secret-rule',text)
         self.assertNotIn('Reply with',text)
@@ -4208,14 +5792,39 @@ class MessageFormatTests(unittest.TestCase):
         self.plan=triage.build_plan(self.listing,triage.parse_rules((self.store/'rules.toml').read_text()),[],triage.state_config(self.store));self.plan['first_run']=True
         save_plan(self.store, self.token, self.path, self.plan)
         calls=self.machine().step()['calls']
-        execute.atomic(self.store/'answers.json',[dict(ok=True,value={}) for c in calls])
-        self.machine().batch_result(self.store/'answers.json')
+        execute.atomic(self.store/'gateway-results.json',[dict(ok=True,value={}) for c in calls])
+        self.machine().batch_result(self.store/'gateway-results.json')
         self.machine().final(dict(accounts={},messages=[],skipped={'cedar':'provider error (502)'}))
         execute.atomic(self.store/'final-listing-exchange.json',dict(token=self.token,attempts={'cedar':1}))
         triage.commit_state(self.store,self.token,self.path)
         numbers=(self.store/'numbers.json').read_bytes()
         text=triage.render_message(self.store,self.token,self.path,None)
         self.assertEqual(text.count('provider error (502)'),1)
-        self.assertEqual(text.splitlines()[1],'Cedar desk: falló la lectura final; provider error (502); reintentada una vez')
+        self.assertEqual(text.splitlines()[1],'Cedar desk: falló la lectura final; provider error (502); reintentada una vez, sigue fallando')
         self.assertIn('(eliminar acción no confirmada)',text)
         self.assertEqual((self.store/'numbers.json').read_bytes(),numbers)
+
+class ResponseStatusRegressionTests(unittest.TestCase):
+    def test_r137_nested_response_status_is_failure(self):
+        for status in (400, 429, 503):
+            with self.subTest(status=status):
+                entry = {'ok': True, 'value': {'response': {'status': status}}}
+                self.assertTrue(triage.provider_failed(entry))
+                self.assertEqual(triage.provider_error(entry), 'provider error (' + str(status) + ')')
+
+class AtomicOwnerAnswerStorageTest(unittest.TestCase):
+    def test_drive_state_has_no_separate_owner_answer_file(self):
+        self.assertNotIn('answers' + '.json', triage.STATE_FILES)
+
+
+class CounterRecoveryRegressionTests(unittest.TestCase):
+    def test_counter_reader_ignores_malformed_log_witnesses(self):
+        for value in ["2", None, True, -1, 1.5, 10 ** 100]:
+            with self.subTest(value=value):
+                self.assertIsNone(triage.read_run_counter(value))
+        self.assertEqual(triage.read_run_counter(2), 2)
+
+class CounterRangeBoundaryTests(unittest.TestCase):
+    def test_counter_safe_integer_boundary(self):
+        self.assertEqual(triage.read_run_counter(2**53), 2**53)
+        self.assertIsNone(triage.read_run_counter(2**53 + 1))

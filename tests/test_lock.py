@@ -174,7 +174,7 @@ class LockTests(unittest.TestCase):
                     machine.step(MockProvider(['b'], outcome='error' if status == 'failed' else 'ok', remove=False))
                 result = self.run_commit(store, token, '--results', str(store / 'results.json'))
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads((store / 'state.json').read_text()), {'version': 1, 'cedar': 1, 'marble': 7})
+                self.assertEqual(json.loads((store / 'state.json').read_text()), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 1, 'marble': 7})
 
     def test_default_results_saves_observed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -182,7 +182,7 @@ class LockTests(unittest.TestCase):
             token, _ = self.two_trash(store)
             execute.Execution(store, token, store / 'plan.json').step()
             self.assertEqual(self.run_commit(store, token).returncode, 0)
-            self.assertEqual(json.loads((store / 'state.json').read_text()), {'version': 1, 'cedar': 2, 'marble': 7})
+            self.assertEqual(json.loads((store / 'state.json').read_text()), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 2, 'marble': 7})
 
     def test_stopped_commit_keeps_observed_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -195,7 +195,7 @@ class LockTests(unittest.TestCase):
             execute.Execution(store, token, store / 'plan.json').step()
             result = self.run_commit(store, token)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads((store / 'state.json').read_text()), {'version': 1, 'cedar': 2, 'marble': 7})
+            self.assertEqual(json.loads((store / 'state.json').read_text()), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 2, 'marble': 7})
 
     def test_executed_nonremoval_never_decrements(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -499,7 +499,7 @@ class LockTests(unittest.TestCase):
             self.assertTrue(json.loads((store / 'plan.json').read_text())['reasons'])
             execute.Execution(store, token, store / 'plan.json').step()
             self.assertEqual(self.run_commit(store, token).returncode, 0)
-            self.assertEqual(set(json.loads((store / 'state.json').read_text())), {'version', 'cedar', 'marble'})
+            self.assertEqual(set(json.loads((store / 'state.json').read_text())), {'_next_number', '_run_counter', 'version', 'cedar', 'marble'})
             self.assertEqual(self.run_plan(store, token).returncode, 0)
 
     def test_invalid_regex_cli_refusal(self):
@@ -531,7 +531,7 @@ class LockTests(unittest.TestCase):
                 self.assertEqual(bool(plan['reasons']), stopped)
                 execute.Execution(store, token, store / 'plan.json').step()
                 self.assertEqual(self.run_commit(store, token).returncode, 0)
-                self.assertEqual(json.loads((store / 'state.json').read_text()), {'version': 1, 'cedar': 0, 'marble': 0})
+                self.assertEqual(json.loads((store / 'state.json').read_text()), {'_next_number': 1, '_run_counter': 1 if stopped else 2, 'version': 1, 'cedar': 0, 'marble': 0})
                 triage.release(store, token)
 
     def test_unlisted_account_keeps_saved_count(self):
@@ -1156,6 +1156,7 @@ class DriveLockTests(unittest.TestCase):
         self.assertEqual((self.store / 'run.lock').read_bytes(), held)
 
     def test_drive_acquisition_trims_logs(self):
+        execute.atomic(self.store / 'numbers.json', dict(next=1,items=[],answers=[]))
         for name in triage.LOG_NAMES:
             (self.store / name).write_text('old-line\n' * 40000 + 'newest\n')
         self.acquire()
@@ -1680,6 +1681,111 @@ class DriveStateTests(unittest.TestCase):
             result = self.exchange('send', observation)
         return names, result
 
+    def test_r149_malformed_log_counters_drive(self):
+        for value in ['x', None, True, -1, 1.5, 10 ** 100]:
+            with self.subTest(value=value):
+                self.setUp()
+                self.failed_numbers_upload_recovery(empty_host=True, malformed=value)
+
+    def test_r145_failed_upload_keeps_numbers_and_answers_together(self):
+        self.failed_numbers_upload_recovery(empty_host=True)
+
+    def test_r147_failed_numbers_upload_same_host(self):
+        self.failed_numbers_upload_recovery(empty_host=False)
+
+    def failed_numbers_upload_recovery(self, empty_host, malformed=False):
+        from unittest.mock import patch
+        import contextlib
+        import io
+        self.now = datetime.now(timezone.utc)
+        self.drive.created = self.now.isoformat()
+        clock = patch.object(triage.time, 'time', side_effect=lambda: datetime.now(timezone.utc).timestamp())
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.configured()
+        self.fetch()
+        config = (self.store/'config.toml').read_text()
+        guardrails = (self.store/'guardrails.md').read_text()
+        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'never-touch.toml').write_text('allow_empty=true\n')
+        messages = [dict(account='cedar',id='budget',folder='Inbox',sender='boss@example.org',subject='Budget')]
+        def command(module, *args):
+            output = io.StringIO()
+            output.reconfigure = lambda **kw: None
+            with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                if module is execute:
+                    with patch.object(sys,'argv',['execute.py',*args]): module.main()
+                else: module.main(list(args), now=self.now)
+            return output.getvalue()
+        def finish(reply=None):
+            execute.atomic(self.store/'inbox.json',dict(accounts={'cedar':100},messages=messages))
+            path = str(self.store/'plan.json')
+            if reply:
+                (self.store/'reply.txt').write_text(reply)
+                command(triage,'reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',path)
+            else:
+                command(triage,'plan','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--plan-out',path)
+            command(execute,'next','--token',self.token,'--plan',path)
+            triage.commit_state(self.store,self.token,Path(path),now=self.now,lock_verified=True)
+            return command(triage,'message','--token',self.token,'--plan',path)
+        def restart():
+            self.observe(self.drive.perform(self.start('release',self.token)['call']),'release',self.token)
+            if empty_host:
+                other = self.store/'empty-host'
+                other.mkdir()
+                (other/'config.toml').write_text(config)
+                (other/'guardrails.md').write_text(guardrails)
+                self.store = other
+            self.token = self.acquire()
+            self.fetch()
+        finish()
+        self.send()
+        old = self.drive.files['numbers.json']
+        restart()
+        messages.append(dict(messages[0],id='lost',sender='peer@example.net',subject='Lost run'))
+        self.assertIn('Kept by owner reply',finish('1 leave'))
+        original = self.drive.file_call
+        def failed_answer_upload(call):
+            if call['operation'] == 'upload' and call['name'] == 'numbers.json':
+                return {'status':'failed'}
+            return original(call)
+        with patch.object(self.drive,'file_call',side_effect=failed_answer_upload):
+            self.send()
+        self.assertEqual(self.drive.files['numbers.json'],old)
+        lost_numbers = triage.read_numbers(self.store)
+        if malformed is not False:
+            batches = [json.loads(line) for line in self.drive.files['decisions.jsonl'].splitlines()]
+            for batch in batches: batch['_run_counter'] = malformed
+            self.drive.files['decisions.jsonl'] = ('\n'.join(json.dumps(b) for b in batches)+'\n').encode()
+        restart()
+        messages.append(dict(messages[0],id='lunch',subject='Lunch'))
+        text = finish()
+        self.assertIn('Saved numbers were out of date; nothing is grouped', text)
+        if malformed is False:
+            self.assertIn('Kept by owner reply', text)
+            self.assertEqual(triage.read_answers(self.store), {('cedar','budget'):'leave'})
+        self.assertEqual(execute.read(self.store/'state.json')['_run_counter'], triage.read_numbers(self.store)['_run_counter'])
+        items = triage.read_numbers(self.store)['items']
+        self.assertTrue(all(len(i.get('members',[i])) == 1 for i in items))
+        self.assertGreaterEqual(triage.read_numbers(self.store)['next'], lost_numbers['next'])
+        for lost in lost_numbers['items']:
+            if lost['number'] not in {i['number'] for i in json.loads(old)['items']}:
+                (self.store/'reply.txt').write_text(str(lost['number'])+' trash')
+                command(triage,'reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.store/'lost-reply.json'))
+                refused = execute.read(self.store/'lost-reply.json')
+                self.assertFalse(refused['actions'])
+                self.assertIn('Unknown number', str(refused['reasons']))
+        lunch = next(i for i in items if i['id']=='lunch')
+        (self.store/'reply.txt').write_text(str(lunch['number'])+' trash')
+        command(triage,'reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.store/'plan.json'))
+        self.assertEqual([a['id'] for a in execute.read(self.store/'plan.json')['actions']],['lunch'])
+        self.send()
+        restart()
+        finish()
+        if malformed is False:
+            self.assertTrue(all(len(i.get('members',[i])) == 1 for i in triage.read_numbers(self.store)['items']))
+            self.assertEqual(triage.read_answers(self.store), {('cedar','budget'):'leave'})
+
     def test_approval_survives_empty_host_restart(self):
         self.approval_drive_cycle()
 
@@ -1694,6 +1800,9 @@ class DriveStateTests(unittest.TestCase):
 
     def test_approval_cutoff_before_reading_keeps_question_open(self):
         self.approval_drive_cycle(read_cutoff=True)
+
+    def test_r137_reply_stale_question_cleared_from_drive(self):
+        self.approval_drive_cycle(stale=True, reply_origin=True)
 
     def test_stale_question_cleared_from_drive(self):
         self.approval_drive_cycle(stale=True)
@@ -1800,7 +1909,7 @@ class DriveStateTests(unittest.TestCase):
     def test_approval_send_without_lock_observation_refused(self):
         self.approval_drive_cycle(refuse_send=True)
 
-    def approval_drive_cycle(self, replay=None, failure=False, closure=None, refuse_send=False, documented=False, repeated=False, read_cutoff=False, stale=False):
+    def approval_drive_cycle(self, replay=None, failure=False, closure=None, refuse_send=False, documented=False, repeated=False, read_cutoff=False, stale=False, reply_origin=False):
         from unittest.mock import patch
         import contextlib
         import io
@@ -1837,6 +1946,17 @@ class DriveStateTests(unittest.TestCase):
             return command(execute if 'scripts/execute.py' in line else triage, shlex.split(line)[3:])
         path = self.store/'plan.json'
         command(triage, ['plan','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--plan-out',str(path)])
+        if reply_origin:
+            (self.store/'config.toml').write_text(config)
+            (self.store/'rules.toml').write_text('rules=[]\n')
+            listing['messages'] = [dict(listing['messages'][0],id=str(i)) for i in range(12)]
+            listing['accounts']['cedar']=12
+            execute.atomic(self.store/'inbox.json',listing)
+            command(triage,['plan','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--plan-out',str(path)])
+            triage.number_decisions(self.store, {k:v for k,v in execute.read(path).items() if k != 'run_token'}, listing)
+            reply=self.store/'reply.txt'
+            reply.write_text('1 trash')
+            command(triage,['reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(reply),'--plan-out',str(path)])
         plan = execute.read(path)
         self.assertEqual(plan['approval_state'], 'awaiting approval')
         command(execute, ['next','--token',self.token,'--plan',str(path)])
@@ -2210,7 +2330,7 @@ class DriveStateTests(unittest.TestCase):
         again = triage.build_plan(listing, [], [], triage.state_config(other), saved)
         triage.number_decisions(other, again, listing)
         self.assertEqual(again['decisions'], plan['decisions'])
-        self.assertEqual(self.send()[0], [])
+        self.assertEqual(self.send()[0], ['numbers.json'])
 
     def test_gdrive_state_on_onedrive_lock(self):
         self.configured()
@@ -2548,7 +2668,7 @@ class DriveStateTests(unittest.TestCase):
         self.commit()
         names, _ = self.send()
         self.assertEqual(set(names), {'numbers.json', 'state.json'})
-        self.assertEqual(json.loads(self.drive.files['state.json']), {'version': 1, 'cedar': 0})
+        self.assertEqual(json.loads(self.drive.files['state.json']), {'_next_number': 1, '_run_counter': 1, 'version': 1, 'cedar': 0})
 
     def test_lost_lock_fetch_no_download_issued(self):
         self.configured()
@@ -2877,6 +2997,10 @@ class ParserRefusalTests(unittest.TestCase):
             for name in ('state.json', 'numbers.json', 'unsubscribe-failures.json', 'calls.jsonl', 'decisions.jsonl'):
                 with self.subTest(name=name):
                     (folder / name).write_text('?')
+                    if name == 'decisions.jsonl':
+                        for raw in (b'?', b'{"_run_counter":' + b'9'*5000 + b'}'):
+                            triage.validate_state_file(name, raw, {'accounts': {'cedar': {}}}, folder)
+                        continue
                     with self.assertRaises(ValueError) as caught:
                         triage.validate_state_file(name, b'?', {'accounts': {'cedar': {}}}, folder)
                     self.assertIn(name, str(caught.exception))
@@ -2896,3 +3020,28 @@ class ParserRefusalTests(unittest.TestCase):
                         triage.validate_state_file(name, text.encode(), config, folder)
                     self.assertIn(str(folder / name), str(caught.exception))
                     self.assertIn(reason, str(caught.exception))
+
+class NumberWatermarkTests(unittest.TestCase):
+    def test_next_number_uses_state_witness(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = Path(folder)
+            execute.atomic(store/'state.json', {'version': 1, '_run_counter': 2, '_next_number': 20})
+            execute.atomic(store/'numbers.json', {'next': 3, 'items': []})
+            plan = {'run_token': 'fixture', 'decisions': [], 'remaining': [], 'counts': {}, 'actions': [], 'reasons': []}
+            triage.number_decisions(store, plan, {'messages': [], 'accounts': []}, outcome_plan=plan)
+            self.assertGreaterEqual(triage.read_numbers(store)['next'], 20)
+
+    def test_next_number_witness_validity(self):
+        for value in [None, True, 0, -1, 1.5, '20', 2**53+1, 20, 2**53]:
+            for source in ['state.json', 'decisions.jsonl']:
+                with self.subTest(value=value, source=source), tempfile.TemporaryDirectory() as folder:
+                    store = Path(folder)
+                    record = {'_next_number': value}
+                    if source == 'state.json':
+                        execute.atomic(store/source, record)
+                    else:
+                        (store/source).write_text(json.dumps(record)+'\n')
+                    execute.atomic(store/'numbers.json', {'next': 3, 'items': []})
+                    plan = {'run_token': 'fixture', 'decisions': [], 'remaining': [], 'counts': {}, 'actions': [], 'reasons': []}
+                    triage.number_decisions(store, plan, {'messages': [], 'accounts': []}, outcome_plan=plan)
+                    self.assertEqual(triage.read_numbers(store)['next'], value if type(value) is int and 3 <= value <= 2**53 else 3)

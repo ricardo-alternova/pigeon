@@ -81,7 +81,7 @@ class Execution:
         triage.require_plan_token(self.plan, token)
         if self.plan.get('dry_run'):
             raise ValueError('dry-run plan: execution is refused; no call issued')
-        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds'}, str(self.plan_path))
+        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds'}, str(self.plan_path))
         for key in ('actions', 'decisions', 'reasons'):
             if not isinstance(self.plan.get(key), list):
                 raise ValueError(str(self.plan_path) + '.' + key + ': expected an array')
@@ -208,10 +208,19 @@ class Execution:
             raise ValueError(str(self.plan_path) + '.first_run: expected boolean')
         stops = ['Missing state; prior run records exist'] if not (self.store / 'state.json').exists() and not first_run else []
         if 'reply' in self.plan:
-            saved = read(self.store / 'reply.json')
-            if saved.get('token') != self.token:
-                raise ValueError('reply.json: expected current token')
-            expected = triage.reply_plan(self.store, listing, holds, config, previous, saved['parts'], stops)
+            if 'reply_source' in self.plan:
+                triage.known_keys(self.plan['reply_source'], {'numbers', 'parts'}, 'reply_source')
+                if set(self.plan['reply_source']) != {'numbers', 'parts'}:
+                    raise ValueError('reply_source: expected numbers and parts')
+            if self.plan.get('approval_state') in {'awaiting approval', 'approved', 'skipped'} and 'reply_source' in self.plan:
+                saved = self.plan['reply_source']
+            else:
+                saved = read(self.store / 'reply.json')
+                if saved.get('token') != self.token:
+                    raise ValueError('reply.json: expected current token')
+            source = self.plan.get('reply_source', {})
+            expected = triage.reply_plan(self.store, listing, holds, config, previous, saved['parts'], stops,
+                                         numbers=source.get('numbers'))
             if self.plan['reply'] != expected['reply']:
                 raise ValueError('reply: expected saved user selections')
         elif self.plan['reasons'] and self.plan['reasons'][0].startswith('Reply refused:'):
@@ -262,7 +271,7 @@ class Execution:
         if 'final_listing' in self.state:
             final = self.state['final_listing']
             failed = final.get('skipped', {})
-            return dict(final, accounts=final['accounts'] | {a:n for a,n in listing['accounts'].items() if a in failed},
+            return dict(final, folders=listing.get('folders', {}) | {a: f for a, f in final.get('folders', {}).items() if f}, accounts=final['accounts'] | {a:n for a,n in listing['accounts'].items() if a in failed},
                         messages=final['messages'] + [m for m in listing['messages'] if m['account'] in failed])
         change = self.state.get('outside_change')
         if not change:
@@ -797,7 +806,6 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
     triage.require_plan_token(plan, triage.read_lock(store)['token'])
     if approve is not None and (plan.get('approval_state') != 'awaiting approval' or plan.get('run_id') != approve):
         raise ValueError('approval: run id does not match a dry plan awaiting approval')
-    triage.clean_simulation(store)
     if plan.get('dry_run') is not True:
         raise ValueError('simulation: expected a dry-run plan')
     token = plan.get('run_token')
@@ -813,13 +821,17 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
             raise ValueError('simulation: expected a dry-run quiet decision')
         positions = observation['positions']
         triage.validate_positions(positions, triage.state_config(store))
-    scratch = store / triage.SIMULATION_DIR
-    scratch.mkdir(mode=0o700)
+    import tempfile
+    folder = store / triage.SIMULATION_DIR
+    existed = folder.exists()
+    folder.mkdir(mode=0o700, exist_ok=True)
+    temporary = tempfile.TemporaryDirectory(prefix='simulation-', dir=folder)
+    scratch = Path(temporary.name)
     try:
         for name in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md',
                      'state.json', 'inbox.json', 'run.lock', 'state-exchange.json',
                      'quiet-check.json', 'tool-paths.json', 'numbers.json', 'decisions.jsonl',
-                     'calls.jsonl', 'unsubscribe-failures.json'):
+                     'calls.jsonl', 'unsubscribe-failures.json', 'unsubscribe-secret'):
             if (store / name).is_file():
                 shutil.copyfile(store / name, scratch / name)
         simulated_token = 'simulation-' + secrets.token_hex(24)
@@ -834,14 +846,22 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
                     atomic(scratch / name, value | dict(token=simulated_token))
         if positions is not None:
             atomic(scratch / 'quiet-check.json', dict(token=simulated_token, decision={}, positions=positions))
-        real_plan = {k: v for k, v in plan.items() if k != 'dry_run'}
+        if 'dry_listing' in plan:
+            atomic(scratch / 'inbox.json', plan['dry_listing'])
+        real_plan = {k: v for k, v in plan.items() if k not in ('dry_run', 'dry_listing', 'ungrouped_run')}
         real_plan['run_token'] = simulated_token
         path = scratch / 'simulation-plan.json'
         atomic(path, real_plan)
         if real_plan.get('approval_state') == 'awaiting approval':
             triage.approval_event(scratch, real_plan, 'asked')
         if approve is not None:
-            triage.approve_plan(scratch, simulated_token, path, approve, reading=read(scratch/'inbox.json'))
+            accounts = {a['account'] for a in real_plan['actions']}
+            reading = read(scratch/'inbox.json')
+            reading['accounts'] = {a: n for a, n in reading['accounts'].items() if a in accounts}
+            reading['messages'] = [m for m in reading['messages'] if m['account'] in accounts]
+            reading['folders'] = {a: f for a, f in reading.get('folders', {}).items() if a in accounts}
+            reading.pop('skipped', None)
+            triage.approve_plan(scratch, simulated_token, path, approve, reading=reading)
         machine = Execution(scratch, simulated_token, path)
         listing = read(scratch / 'inbox.json')
         final = copy.deepcopy(listing)
@@ -900,7 +920,9 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
                                                positions=state.get('_positions', {}))))
         return dict(dry_run=True, token=simulated_token, stages=stages)
     finally:
-        triage.clean_simulation(store)
+        temporary.cleanup()
+        if not existed:
+            folder.rmdir()
 
 
 def main():
@@ -960,7 +982,6 @@ def main():
                     print(json.dumps(response))
                     return
                 reading = read(store/'approval-inbox.json')
-                (store/'approval-reading.json').unlink(missing_ok=True)
             else:
                 pending = store/'approval-reading.json'
                 if results: raise ValueError('approval: expected complete Inbox reading')
@@ -974,6 +995,7 @@ def main():
                 reading = read(inbox)
                 pending.unlink()
             response = triage.approve_plan(store, token, path, run_id, reading=reading)
+            (store/'approval-reading.json').unlink(missing_ok=True)
             if response:
                 Execution(store, token, path).step()
                 print(json.dumps(response))
@@ -1001,6 +1023,8 @@ def main():
             except ValueError as error:
                 raise ValueError('--observation: expected a JSON object with outcome and inbox_ids') from error
             provider = AssistantProvider(observation)
+        if args.command == 'next' and any(b['outcomes'] is None for b in execution.state.get('batches', [])):
+            raise ValueError('batch: expected result --results before another next')
         print(json.dumps(execution.step(provider, local=args.command == 'unsubscribe'), ensure_ascii=True))
 
 
