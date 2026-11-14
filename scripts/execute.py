@@ -81,7 +81,7 @@ class Execution:
         triage.require_plan_token(self.plan, token)
         if self.plan.get('dry_run'):
             raise ValueError('dry-run plan: execution is refused; no call issued')
-        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token'}, str(self.plan_path))
+        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds'}, str(self.plan_path))
         for key in ('actions', 'decisions', 'reasons'):
             if not isinstance(self.plan.get(key), list):
                 raise ValueError(str(self.plan_path) + '.' + key + ': expected an array')
@@ -218,6 +218,28 @@ class Execution:
             expected = triage.build_plan(listing, [], holds, config, previous, self.plan['reasons'])
         else:
             expected = triage.build_plan(listing, rules, holds, config, previous, stops)
+        if self.plan.get('approval_state') == 'approved':
+            if expected['reasons'] != self.plan.get('approved_thresholds'):
+                raise ValueError('approval: thresholds changed; plan again')
+            history = self.store / 'history.log'
+            events = [line.split(' approval ', 1)[1] for line in triage.read_text(history).splitlines()
+                      if ' approval ' in line] if history.exists() else []
+            run = str(self.plan.get('run_id'))
+            marker = 'approved: ' + run + ' ' + hashlib.sha256(self.token.encode()).hexdigest()
+            if len(events) < 2 or events[-2:] != ['asked: ' + run, marker]:
+                raise ValueError('approval: no recorded approval for this run id and current lock; plan again')
+            if triage.state_setting(config)['kind'] != 'local':
+                exchange = read(self.store / 'state-exchange.json')
+                empty = hashlib.sha256(b'').hexdigest()
+                if (exchange['hashes']['history.log'] != hashlib.sha256(triage.state_bytes(history)).hexdigest()
+                        or any(exchange['hashes'][name] not in (None, empty) for name in ('plan.json', 'inbox.json'))):
+                    raise ValueError('approval: drive approval upload not confirmed; stop and plan again')
+            if self.plan['reasons']:
+                raise ValueError('approval: approved plan must have no pending reasons')
+        elif expected.get('approval_state') == 'awaiting approval' and self.plan['reasons'] != expected['reasons']:
+            raise ValueError('approval: thresholds changed; plan again')
+        if expected.get('approval_state') == 'awaiting approval' and self.plan.get('approval_state') not in ('awaiting approval', 'skipped', 'approved'):
+            raise ValueError('approval: expected approval for threshold plan')
         if self.plan['actions'] != expected['actions'] or self.plan['counts'] != expected['counts']:
             raise ValueError(str(self.plan_path) + '.actions: expected actions and counts from current private inputs and Inbox listing')
 
@@ -482,6 +504,8 @@ class Execution:
                 return {'done': True, 'status': 'stopped', 'stop': self.stop_reason()}
             if self.plan['reasons']:
                 self.save()
+                if self.plan.get('approval_state') == 'awaiting approval':
+                    return {'done': True, 'status': 'awaiting approval', 'question_id': self.plan['run_id'], 'stop': triage.approval_question(self.plan, triage.state_config(self.store).get('language', 'en'))}
                 return {'done': True}
             try:
                 self.validate()
@@ -762,13 +786,17 @@ def simulation_status(response):
     return {key: response[key] for key in ('status', 'done') if key in response}
 
 
-def simulate(store, plan_path, fail=None, positions_path=None):
+def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
     """Run the existing machine against a disposable private-store copy."""
     import copy
     import shutil
     observation = read(positions_path) if positions_path is not None else None
     plan = read(plan_path)
+    if not plan.get('dry_run') and plan.get('approval_state') in ('awaiting approval', 'approved'):
+        raise ValueError('simulation: real approval plan; use a separate dry-run plan')
     triage.require_plan_token(plan, triage.read_lock(store)['token'])
+    if approve is not None and (plan.get('approval_state') != 'awaiting approval' or plan.get('run_id') != approve):
+        raise ValueError('approval: run id does not match a dry plan awaiting approval')
     triage.clean_simulation(store)
     if plan.get('dry_run') is not True:
         raise ValueError('simulation: expected a dry-run plan')
@@ -810,6 +838,10 @@ def simulate(store, plan_path, fail=None, positions_path=None):
         real_plan['run_token'] = simulated_token
         path = scratch / 'simulation-plan.json'
         atomic(path, real_plan)
+        if real_plan.get('approval_state') == 'awaiting approval':
+            triage.approval_event(scratch, real_plan, 'asked')
+        if approve is not None:
+            triage.approve_plan(scratch, simulated_token, path, approve, reading=read(scratch/'inbox.json'))
         machine = Execution(scratch, simulated_token, path)
         listing = read(scratch / 'inbox.json')
         final = copy.deepcopy(listing)
@@ -860,7 +892,7 @@ def simulate(store, plan_path, fail=None, positions_path=None):
                     if pending['action']=='create-draft' and ok:
                         observation['draft_id']='simulation-draft-' + str(position)
                     stages.append(dict(result=simulation_status(machine.step(AssistantProvider(observation)))))
-        if not plan['reasons']:
+        if not machine.plan['reasons']:
             stages.append(dict(final=simulation_status(machine.final(final))))
         triage.commit_state(scratch, simulated_token, path, lock_verified=True)
         state = read(scratch / 'state.json')
@@ -879,6 +911,10 @@ def main():
         command.add_argument('--token', required=True)
         if name != 'observed':
             command.add_argument('--plan', required=True)
+        if name == 'next':
+            command.add_argument('--approve')
+            command.add_argument('--results')
+            command.add_argument('--inbox')
         if name == 'final':
             command.add_argument('--inbox')
             command.add_argument('--results', help='Gateway array: docs/quickstart.md#gateway-results')
@@ -891,12 +927,15 @@ def main():
                 command.add_argument('--' + key, required=True)
     simulation = sub.add_parser('dry-run', allow_abbrev=False)
     simulation.add_argument('--plan', required=True)
+    simulation.add_argument('--approve')
     simulation.add_argument('--fail', type=int, help='Fail the Nth planned action, counting from 1')
     simulation.add_argument('--positions', help='Dry-run quiet decision JSON')
     args = parser.parse_args()
     store = triage.private_store()
+    if args.command == 'next' and args.approve is None and (args.results or args.inbox):
+        raise ValueError('next: --results and --inbox require --approve')
     if args.command == 'dry-run':
-        print(json.dumps(simulate(store, args.plan, args.fail, args.positions), ensure_ascii=True))
+        print(json.dumps(simulate(store, args.plan, args.fail, args.positions, args.approve), ensure_ascii=True))
         return
     if args.command == 'observed':
         with triage.lock_gate(store):
@@ -907,6 +946,43 @@ def main():
             render_summary(store, args.token, plan_path=args.plan)
         print(json.dumps({'recorded': True}))
     else:
+        if args.command == 'next' and args.approve is not None:
+            token, path, run_id, results, inbox = args.token, args.plan, args.approve, args.results, args.inbox
+            plan = triage.approve_plan(store, token, path, run_id, validate_only=True)
+            accounts = sorted({a['account'] for a in plan['actions']})
+            binding = hashlib.sha256((token + run_id + json.dumps(plan, sort_keys=True)).encode()).hexdigest()
+            config = triage.state_config(store)
+            scripted = all(all(config['accounts'][a].get(k) for k in ('provider', 'executor_app', 'executor_account')) for a in accounts)
+            if scripted:
+                if inbox: raise ValueError('approval: expected gateway results')
+                response = triage.listing_exchange(store, token, results, ids_only=True, accounts=accounts, approval=binding)
+                if not response.get('done'):
+                    print(json.dumps(response))
+                    return
+                reading = read(store/'approval-inbox.json')
+                (store/'approval-reading.json').unlink(missing_ok=True)
+            else:
+                pending = store/'approval-reading.json'
+                if results: raise ValueError('approval: expected complete Inbox reading')
+                if inbox is None:
+                    atomic(pending, dict(token=token, approval=binding, created=time.time()))
+                    print(json.dumps(dict(approval_reads=[dict(account=a, **triage.gateway_account(config, a)) for a in accounts])))
+                    return
+                state = read(pending)
+                if state.get('token') != token or state.get('approval') != binding or Path(inbox).stat().st_mtime < state['created']:
+                    raise ValueError('approval: no pending fresh reading')
+                reading = read(inbox)
+                pending.unlink()
+            response = triage.approve_plan(store, token, path, run_id, reading=reading)
+            if response:
+                Execution(store, token, path).step()
+                print(json.dumps(response))
+                return
+            if triage.state_setting(config)['kind'] != 'local':
+                print(json.dumps(triage.drive_state(store, 'send', token)))
+                return
+            print(json.dumps(Execution(store, token, path).step()))
+            return
         execution = Execution(store, args.token, args.plan)
         if args.command == 'final':
             if args.inbox:

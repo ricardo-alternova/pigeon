@@ -4,8 +4,9 @@ language = "en"
 relist_inbox = "all"
 # Time zone for schedule slots and the run message.
 timezone = "UTC"
-# Maximum Inbox messages across all accounts before the planner stops.
+# Maximum Inbox messages across all accounts before the planner asks for approval.
 inbox_limit = 100
+approval_hours = 12
 
 # Optional schedule: local times in timezone; both day lists are required.
 # [schedule]

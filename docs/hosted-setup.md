@@ -23,7 +23,6 @@ If the host keeps its files, use local state/lock. If it starts empty or two hos
 - [ ] Gateway: discover mail and drive tool schemas and verify configured account identities; only the calls allowed by [guardrails](../config/guardrails.example.md) may be carried by the assistant.
 
 
-
 ## Mail gateway connection
 
 Connect and authenticate mail accounts before scheduling. Use Executor search/describe to discover connected app paths and input shapes. Verify fixed linked-account identity; never choose an arbitrary account. Use exactly accounts.HANDLE.executor_account when configured for every read, listing and action in that account. Stop if the gateway does not offer that ID. Keep connection details private.
@@ -38,11 +37,12 @@ Require config.toml before locking. Use these keys:
 
 | Key | Value; default |
 | --- | --- |
-| version | Integer format version, 1; refuse above 1 in config.toml/state.json; validate prints it. |
-| language | en or es; en. Reasons and Inbox count stay English. |
+| version | Format version 1; refuse above 1 in config.toml/state.json. |
+| language | en or es; en. |
 | relist_inbox | all, or new_plus_count for new items and earlier-item counts; all. |
 | timezone | IANA zone for slots/messages; UTC. |
 | inbox_limit | Positive integer across accounts; 100. |
+| approval_hours | Hours from the question; 1–72; 12. |
 | lock.kind | local or onedrive; local. |
 | lock.account, lock.folder | Required for onedrive: account handle and parent folder ID; each 1–512 ASCII letters, digits, underscore, hyphen, dot, colon or exclamation mark. No other keys for local. |
 | state.kind | local, onedrive or gdrive; local. Drive requires lock.kind=onedrive. |
@@ -81,13 +81,13 @@ After uncertain acquisition wait 45 minutes from script start, then start fresh 
 
 ## Drive state
 
-Keep drive state readable/writable only by the owner's own account, never shared or in a shared folder. Apply this to the lock folder too.
+Keep state and lock folders readable/writable only by the owner's own account, never shared or in a shared folder.
 
-Immediately after locking, fetch before reading state or calling mail. Download exactly the printed names to state-incoming: numbers.json, unsubscribe-secret, unsubscribe-failures.json, decisions.jsonl, calls.jsonl, history.log, run-message.md, rules.toml, never-touch.toml, tool-paths.json, state.json. Keep plans, checkpoints, observations, config.toml and guardrails.md local. Follow [storage guardrails](../config/guardrails.example.md).
+After locking, fetch before reading state or mail. Download printed names to state-incoming: numbers.json, unsubscribe-secret, unsubscribe-failures.json, decisions.jsonl, calls.jsonl, history.log, run-message.md, rules.toml, never-touch.toml, tool-paths.json, plan.json, inbox.json, state.json. Open questions carry plan and listing; closing clears both with zero-byte uploads. Keep checkpoints, observations, config.toml and guardrails.md local. Follow [storage guardrails](../config/guardrails.example.md).
 
 Return fetched, absent or failed per issued filename. Confirm absence through the gateway; classify uncertainty as failed; preserve local rules when absent remotely. Refuse an empty drive store when local records exist; correct state.folder or restore local records to that folder.
 
-For send-state carry a fresh matching lock read, even after commit, and resume with --lock-observation PATH. Upload each issued changed-file snapshot from state-outgoing, numbers first and counts last; include absent rules from local copies. Return upload-observation.json as {"status":"done","size":123} with the actual integer drive size, or {"status":"failed"}. Bound fetch/upload observations to 4096 bytes; never derive names from observations.
+For send-state carry a fresh lock read even after commit; resume with --lock-observation PATH. Upload each issued changed-file snapshot from state-outgoing, numbers first and counts last; include absent rules from local copies. Return upload-observation.json as {"status":"done","size":123} with the actual integer drive size, or {"status":"failed"}. Observations: at most 4096 bytes; use only issued names.
 
 On upload failure, deliver the warning, retain local files and release conditionally. Never retry or send again. Clear pending messages with a zero-byte remote run-message.md.
 
@@ -115,7 +115,6 @@ Use path {userId:"me"} for every Gmail call; add id for message/label reads. Pag
 
 For post-action verification call gmail.users.messages.get with `{path:{userId:"me",id},query:{format:"minimal"}}`. Set in_inbox to whether labelIds contains INBOX. Report the boolean,not the labels.
 
-
 | Action | Tool | input |
 | --- | --- | --- |
 | trash | gmail.users.messages.trash |{path:{userId:"me",id:ID}}|
@@ -139,7 +138,6 @@ For post-action verification read the issued message by ID with the gateway’s 
 
 Copy Outlook IDs containing = + and / unchanged.
 
-
 | Action | Tool | input |
 | --- | --- | --- |
 | trash | meMessage.meMessagesMessageMove |{path:{"message-id":ID},body:{DestinationId:"deleteditems"}}|
@@ -149,7 +147,6 @@ Copy Outlook IDs containing = + and / unchanged.
 | create-folder | meMailFolder.meCreateMailFolders or meMailFolder.meMailFoldersCreateChildFolders |{body:{displayName:NAME}}; for child add path:{"mailFolder-id":PARENT}. |
 | create-draft | meMessage.meMessagesMessageCreateReply or meMessage.meMessagesMessageCreateForward | path:{"message-id":ID}; preserve issued draft_text and draft_to. |
 | message-read | meMessage.meGetMessages |{path:{"message-id":ID},query:{$select:["id","parentFolderId"]}}|
-
 
 ## Inbox listing
 

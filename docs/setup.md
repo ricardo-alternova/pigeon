@@ -41,10 +41,10 @@ Both files use TOML arrays of tables named [[rules]]. In rules.toml, order matte
 | has_attachment | Optional boolean; absent message flag means false. |
 | exclusions | Case-insensitive substring array for subject and body (when used). Require on trash, even []; optional elsewhere, forbidden in never-touch. |
 | after_unsubscribe | Optional trash/archive on unsubscribe only. Plan separately after safe unsubscribe even on failure; turn unsafe requests and companions into decisions. |
-| limit | Optional integer, 1 to 50 (hard cap), default 10. Counts actions across all accounts of the rule, including unsubscribes and companion removals, excluding folder creation. Exceeding it stops the whole plan with zero actions; the stop reason names the rule id. Report rules create no actions and consume no limit; question rules also consume no twenty-percent brake count. |
+| limit | Optional integer, 1 to 50 (hard cap), default 10. Counts actions across all accounts of the rule, including unsubscribes and companion removals, excluding folder creation. Exceeding it asks for owner approval, naming the rule id. Report rules create no actions and consume no limit; question rules also consume no twenty-percent brake count. |
 | target | Move-only exact folder path. Require a unique existing fixed path; resolve dated {year}/{month} from message date to four/two digits. Leave missing/invalid dates or years outside 1990–2100 as decisions. Require 1–255 characters and at most eight segments; refuse empty, dot, dot-dot, control, format, surrogate, line/paragraph separator, backslash and unknown placeholders. Refuse slash look-alikes U+2044, U+2215, U+2571, U+2572, U+27CB, U+27CD, U+29F5, U+29F8, U+FE68, U+FF0F, U+FF3C. Compare paths with casefold(), without normalization. Leave missing folder information as a decision; refuse leaf-only metadata for nested destinations. Plan one create-folder per missing dated account/path before dependent moves, comparing with casefold() and retaining the first matching rule's spelling. Forbid in never-touch.toml. |
 
-Keep target, after_unsubscribe and question off draft rules. Keep messages in Inbox after creating drafts. Stop above ten drafts per run; apply the per-rule limit and twenty-percent brake. Count no draft toward removals. After sending by hand, file the original with a numbered reply.
+Keep target, after_unsubscribe and question off draft rules. Keep messages in Inbox after creating drafts. Apply the approval procedure for draft, per-rule and twenty-percent limits. Count no draft toward removals. After sending by hand, file the original with a numbered reply.
 
 Require a sender, domain, subject or body predicate on each rules.toml entry; require sender, domain or subject on never-touch. Refuse invalid regexes and regexes matching empty text.
 
@@ -131,7 +131,7 @@ Use kinds archive, attachments, create-draft, create-folder, folders, history, i
 
 ## Run message format
 
-Follow [Commit and message](quickstart.md#commit-and-message). Keep plan.json, inbox.json, config.toml, numbers.json, calls.jsonl and the checkpoint. Use committed results, including partial results on a halt; never substitute gateway results. Keep these labels:
+Follow [Commit and message](quickstart.md#commit-and-message). Keep plan.json, inbox.json, config.toml, numbers.json, calls.jsonl and the checkpoint. An approved run cut off before finishing must plan again and ask again under its next lock. Use committed results, including partial results on a halt; never substitute gateway results. Keep these labels:
 
 | Key | English | Spanish |
 | --- | --- | --- |
@@ -147,9 +147,9 @@ Show each message once. Group handled messages by account and list action, sende
 
 ## Decision and stop reasons
 
-Read decisions and reasons in plan.json. Keep decisions in Still in Inbox once, with the saved number and optional question; never number protected messages. Treat report rules, missing/ambiguous move targets, invalid dates, missing folder information, invalid senders, unsafe unsubscribes and unmatched mail as decisions. Follow [Brake refusal](quickstart.md#brake-refusal) for stopped plans and [Run exits](../AGENTS.md#run-exits) for command refusals.
+Read decisions and reasons in plan.json. Keep decisions in Still in Inbox once, with the saved number and optional question; never number protected messages. Treat report rules, missing/ambiguous move targets, invalid dates, missing folder information, invalid senders, unsafe unsubscribes and unmatched mail as decisions. Follow [Approval question](quickstart.md#approval-question) for threshold approvals and [Run exits](../AGENTS.md#run-exits) for command refusals.
 
-Stop for missing state with prior records, unconfigured accounts, no configured account listed, combined Inbox count above inbox_limit, or an unexpectedly empty account whose saved expected count was at least three. Stop above 50 destructive actions, ten unsubscribes or a rule's limit. Follow the quick start for the per-account twenty-percent brake.
+Stop for missing state with prior records, unconfigured accounts, no configured account listed, or an unexpectedly empty account whose saved expected count was at least three.
 
 ## Scripted listing
 
@@ -232,9 +232,12 @@ Read one JSON object on success or a nonzero one-line Refused: on stderr; follow
 | `run` | Execute the local unsubscribe argument list. |
 | `status` | Read the status table; remaining means issued_unknown or unexecuted. |
 | `done` | Finish; inspect stop. |
-| `stop` | Halt reason; distinguish from a stopped plan. |
+| `question_id` | Retain this run id with the relayed approval question; pass it as reply --question. |
+| `stop` | On status=awaiting approval, the approval question: use Finish. On status=stopped, use Finish; other halts follow Run exits. |
 | `remaining` | Report without replaying. |
-| `calls` | Carry ordered batch; return result --results PATH. |
+| `calls` | Carry the whole ordered batch. For action results use result --results PATH; for a reading with round, use the next row. |
+| `round` | Approval reading batch: save ordered gateway answers and return next --approve RUN_ID --results PATH; see [Approval question](quickstart.md#approval-question). |
+| `approval_reads` | Read these accounts, save the complete listing and return next --approve RUN_ID --inbox PATH; see [Approval question](quickstart.md#approval-question). |
 | `final_reads` | Submit execute.py final for these accounts. |
 | `refresh_lock` | Complete lock --refresh before continuing. |
 | `recorded` | Disclosure logged. |
@@ -246,6 +249,8 @@ Read one JSON object on success or a nonzero one-line Refused: on stderr; follow
 
 | Status | Read or act |
 | --- | --- |
+| stale | Inbox changed; nothing was done. Finish; the next run plans and asks again. See [Approval question](quickstart.md#approval-question). |
+| awaiting approval | No action issued. Finish with commit and message, send-state and release; follow [Approval question](quickstart.md#approval-question). |
 | executed | Confirm ok removal absent from Inbox, 2xx unsubscribe, created folder ID or valid draft_id. Reset that verb's failure count. |
 | failed | Count gateway error or unsuccessful/unsafe HTTPS request toward two-failure skip. Check manually if trusted. |
 | unexecuted | Check the message in a fresh run. Count unsuccessful gateway evidence toward skip, never unissued calls after folder failure or lock loss. |
@@ -310,3 +315,5 @@ Keep calls.jsonl, history.log and decisions.jsonl to the script-owned 262144-byt
 ## Quiet observation validation
 
 For history use a 1–128 ASCII-digit position and up to 1000 Inbox arrival IDs. For ids use at most ten unique newest-first IDs, each 1–512 ASCII letters, digits or _ - = + /. Run full for unknown fields, missing/extra accounts, wrong types, files over 65536 bytes, unreadable/absent files or decreasing positions. Prove quiet only with empty arrivals or unchanged ordered IDs for every account.
+
+Approved execution first reads planned accounts’ Inbox IDs; missing planned mail closes the question as stale, while read failure leaves it open. Follow [Approval question](quickstart.md#approval-question) for the exchanges.

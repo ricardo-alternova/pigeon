@@ -18,6 +18,42 @@ def setup_text():
 
 
 class KitTextTests(unittest.TestCase):
+    def test_approval_lifecycle_and_exit_are_explicit(self):
+        quick = (ROOT/'docs/quickstart.md').read_text()
+        self.assertNotIn('## Brake refusal',quick)
+        section = quick.split('## Approval question\n')[1].split('\n## ')[0]
+        for text in ('question_id', '--question RUN_ID', 'end the turn',
+                     'Both hosts read Inbox first', 'Skip:', 'without commit/message',
+                     'Waiting clears positions', 'owner never types it'):
+            self.assertIn(text,section)
+        self.assertLess(section.index('Commit and message'),section.index('relay every word'))
+        self.assertLess(section.index('relay every word'),section.index('Release; end the turn'))
+        self.assertLess(section.index('Release; end the turn'),section.index('end the turn'))
+        agents = (ROOT/'AGENTS.md').read_text()
+        self.assertIn('status=awaiting approval use Finish',agents)
+        self.assertIn('run next once',agents)
+        hosted = (ROOT/'docs/hosted-setup.md').read_text()
+        self.assertIn('Keep the first run attended:',hosted)
+        self.assertIn('Hours from the question',hosted)
+        self.assertIn('planner asks for approval', (ROOT/'config/config.example.toml').read_text())
+
+    def test_threshold_approval_instructions_and_config(self):
+        quick = (ROOT/'docs/quickstart.md').read_text()
+        for text in ('relay every word, including the last line', 'end the turn',
+                     'Never answer for the owner or treat silence as an answer',
+                     "save the owner's answer unchanged", 'run only the printed command',
+                     '--approve RUN_ID', 'approval_hours'):
+            self.assertIn(text,quick)
+        hosted = (ROOT/'docs/hosted-setup.md').read_text()
+        self.assertIn('Hours from the question',hosted)
+        policy = (ROOT/'config/guardrails.example.md').read_text()
+        self.assertIn('quickstart.md#approval-question',policy)
+        self.assertNotIn('stops with zero actions above',policy)
+        self.assertNotIn('Exceeding it stops the whole plan with zero actions', (ROOT/'docs/setup.md').read_text())
+        import tomllib
+        config = tomllib.loads((ROOT/'config/config.example.toml').read_text())
+        self.assertEqual(config['approval_hours'],12)
+
     def test_document_heading_links_and_see_references_resolve(self):
         from urllib.parse import unquote
         documents = list(dict.fromkeys([ROOT / n for n in DOCS] + list((ROOT/'config').glob('*.toml')) + list((ROOT/'config').glob('*.md')) + list((ROOT/'rules').glob('*.toml'))))
@@ -63,7 +99,7 @@ class KitTextTests(unittest.TestCase):
 
     def test_routine_quickstart_size_and_entry_points(self):
         path = ROOT / 'docs/quickstart.md'
-        self.assertLessEqual(len(path.read_bytes()), 13000)
+        self.assertLessEqual(len(path.read_bytes()), 14600)
         self.assertLessEqual(len(re.findall(r'\]\(setup\.md(?:#|\))', path.read_text())), 3)
         for name in ('README.md', 'AGENTS.md', '.agents/skills/email-triage/SKILL.md'):
             self.assertIn('docs/quickstart.md', (ROOT / name).read_text())
@@ -82,10 +118,10 @@ class KitTextTests(unittest.TestCase):
 
     def test_common_exceptions_are_self_contained(self):
         text = (ROOT / 'docs/quickstart.md').read_text()
-        for heading in ('Account skipped and retry', 'Brake refusal', 'Outside change stop',
+        for heading in ('Account skipped and retry', 'Approval question', 'Outside change stop',
                         'Lock refresh', 'Unknown tool path', 'Numbered reply', 'Dry run'):
             section = text.split('## ' + heading + '\n')[1].split('\n## ')[0]
-            self.assertIn('TOKEN' if heading not in ('Brake refusal', 'Outside change stop') else 'Commit and message', section)
+            self.assertIn('TOKEN' if heading not in ('Approval question', 'Outside change stop') else 'Commit and message', section)
             self.assertNotIn('setup.md', section)
         self.assertIn('provider error (STATUS)', text)
         self.assertIn('pigeon error (WHAT)', text)
@@ -263,7 +299,7 @@ class RuleConfirmationTests(unittest.TestCase):
         setup = setup_text()
         self.assertNotIn('exact rule can be proposed', setup)
         section = setup.split('## Decision and stop reasons')[1].split('## Scripted listing')[0]
-        for term in ('saved number', 'never number protected', 'unmatched mail', 'stopped plans'):
+        for term in ('saved number', 'never number protected', 'unmatched mail', 'threshold approvals'):
             self.assertIn(term, section)
 
 
@@ -309,7 +345,8 @@ class RunExitTests(unittest.TestCase):
         keys |= {k.value for n in ast.walk(main) if isinstance(n, ast.Dict)
                  for k in n.keys if isinstance(k, ast.Constant)}
         table = setup_text().split('### Step machine responses')[1].split('### Result statuses')[0]
-        keys |= {'executor_app', 'executor_account', 'refresh_lock', 'final_reads', 'tool', 'path', 'input'}
+        # Approval responses include keyword-built fields outside Execution._step.
+        keys |= {'executor_app', 'executor_account', 'refresh_lock', 'final_reads', 'tool', 'path', 'input', 'round', 'approval_reads'}
         listed = set(re.findall(r'^\| `([^`]+)` \|', table, re.M))
         self.assertEqual(listed, keys)
         self.assertIn('#step-machine-responses', (ROOT / 'AGENTS.md').read_text())
@@ -648,7 +685,7 @@ class DraftDocumentationTests(unittest.TestCase):
         self.assertIn('Create and show issued drafts. Never send them.', (ROOT/'config/guardrails.example.md').read_text())
         quick = (ROOT/'docs/quickstart.md').read_text()
         self.assertIn('create-draft', quick)
-        self.assertLessEqual(len(quick.encode()),13000)
+        self.assertLessEqual(len(quick.encode()),14600)
 
 
 class ScriptedListingTextTests(unittest.TestCase):
@@ -656,4 +693,4 @@ class ScriptedListingTextTests(unittest.TestCase):
         text = (Path(__file__).resolve().parents[1] / 'docs/quickstart.md').read_text()
         self.assertIn('triage.py listing --token TOKEN', text)
         self.assertIn('triage.py listing --token TOKEN --results', text)
-        self.assertLessEqual(len(text.encode()), 13000)
+        self.assertLessEqual(len(text.encode()), 14600)

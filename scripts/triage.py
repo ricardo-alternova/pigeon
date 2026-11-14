@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import time
@@ -409,10 +410,10 @@ def drive_lock(store, operation, token=None, observation=None, *, now=None):
             raise
 
 
-# Fixed durable set, also the upload order. Run-local plans and checkpoints stay local.
+# Fixed download set and upload order. Only an open question carries its plan and listing.
 STATE_FILES = ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json',
                'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md',
-               'rules.toml', 'never-touch.toml', 'tool-paths.json', 'state.json')
+               'rules.toml', 'never-touch.toml', 'tool-paths.json', 'plan.json', 'inbox.json', 'state.json')
 STATE_LIMIT = 4 * 1024 * 1024
 
 
@@ -471,7 +472,13 @@ def state_bytes(path):
 
 def validate_state_file(name, raw, config, folder):
     text = raw.decode('utf-8')
-    if name in ('rules.toml', 'never-touch.toml'):
+    if name in ('plan.json', 'inbox.json'):
+        if text:
+            data = parse_json(text, folder / name)
+            known_keys(data, set(data) if isinstance(data, dict) else set(), name)
+            if name == 'inbox.json':
+                validate_inputs(data, config, {})
+    elif name in ('rules.toml', 'never-touch.toml'):
         try:
             entries = parse_rules(text, protection=name == 'never-touch.toml')
         except ValueError as error:
@@ -517,7 +524,7 @@ def validate_state_file(name, raw, config, folder):
                     raise ValueError(name + ': invalid call log')
     elif name == 'history.log':
         for line in text.splitlines():
-            if not re.fullmatch(r'[0-9T:.+Z-]{20,40} (?:skipped: no new mail|abandoned: earlier lock exchange)', line):
+            if not re.fullmatch(r'[0-9T:.+Z-]{20,40} (?:skipped: no new mail|abandoned: earlier lock exchange|approval (?:asked|skipped|expired|replaced|stale): [0-9a-f]{64}|approval approved: [0-9a-f]{64} [0-9a-f]{64})', line):
                 raise ValueError('history.log: invalid skip line')
             if state_timestamp(line.split(' ')[0], folder / name).utcoffset() != timedelta(0):
                 raise ValueError('history.log: expected UTC')
@@ -620,7 +627,7 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
                 contents['history.log'] = ('\n'.join(history) + '\n').encode('utf-8')
             try:
                 for n in STATE_FILES:
-                    if n in contents and not (n == 'run-message.md' and contents[n] == b''):
+                    if n in contents and not (n in ('run-message.md', 'plan.json', 'inbox.json') and contents[n] == b''):
                         execute.atomic_text(store / n, contents[n].decode('utf-8'))
                     elif n not in ('rules.toml', 'never-touch.toml'):
                         (store / n).unlink(missing_ok=True)
@@ -639,6 +646,19 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
             return {'done': True}
         if observation is None:
             contents = {n: state_bytes(store / n) for n in STATE_FILES if (store / n).exists()}
+            plan_path = store / 'plan.json'
+            plan = parse_json(contents['plan.json'].decode('utf-8'), plan_path) if contents.get('plan.json') else {}
+            events = [line.split(' approval ', 1)[1] for line in contents.get('history.log', b'').decode('utf-8').splitlines() if ' approval ' in line]
+            waiting = (plan.get('approval_state') == 'awaiting approval' and not plan.get('dry_run')
+                       and events and events[-1] == 'asked: ' + str(plan.get('run_id'))
+                       and not question_closed(store, plan))
+            if waiting and 'inbox.json' not in contents:
+                raise ValueError('approval: awaiting plan requires inbox.json for drive state')
+            if not waiting:
+                for name in ('plan.json', 'inbox.json'):
+                    contents.pop(name, None)
+                    if data['hashes'][name] is not None:
+                        contents[name] = b''
             for n, raw in contents.items():
                 validate_state_file(n, raw, config, store)
             if 'run-message.md' not in contents and data['hashes']['run-message.md'] is not None:
@@ -1365,7 +1385,8 @@ def check_version(data, source):
 def validate_inputs(listing, config, previous):
     check_version(config, 'config.toml')
     check_version(previous, 'state.json')
-    known_keys(config, {'version', 'accounts', 'language', 'inbox_limit', 'timezone', 'schedule', 'lock', 'state', 'relist_inbox', 'calendar', 'calendars'}, 'config')
+    known_keys(config, {'version', 'accounts', 'language', 'inbox_limit', 'timezone', 'schedule', 'lock', 'state', 'relist_inbox', 'calendar', 'calendars', 'approval_hours'}, 'config')
+    approval_hours(config)
     validate_calendar_config(config)
     lock_setting(config)
     state_setting(config)
@@ -1492,11 +1513,15 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         raise ValueError('Inbox.messages: Listing must contain unique Inbox ids from declared accounts; expected unique (account, id) pairs, folder Inbox, and accounts present in Inbox.accounts')
     counts = {a: sum(m['account'] == a for m in messages) for a in totals}
     reasons = list(stop_reasons)
+    unconditional = bool(reasons)
+    thresholds = []
     if len(messages) > config.get('inbox_limit', 100):
         reasons.append('Inbox limit exceeded')
+        thresholds.append(dict(kind='inbox', count=len(messages), limit=config.get('inbox_limit', 100)))
     for account, count in counts.items():
         if count == 0 and (previous or {}).get(account, 0) >= 3:
             reasons.append('Unexpected empty Inbox: ' + account)
+            unconditional = True
         if totals[account] < count:
             raise ValueError('Inbox.accounts.' + account + ': Account total is smaller than Inbox count; expected an all-folder total at least ' + str(count))
     actions, decisions, hits = [], [], {}
@@ -1596,22 +1621,27 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
     actions = unique
     if sum(a['action'] in {'trash', 'move', 'archive', 'spam'} for a in actions) > 50:
         reasons.append('Destructive action limit exceeded')
+        thresholds.append(dict(kind='destructive', count=sum(a['action'] in REMOVALS for a in actions), limit=50))
     for rule in rules:
         count = sum(a['rule'] == rule['id'] and a['action'] != 'create-folder' for a in actions)
         if count > rule.get('limit', 10):
             reasons.append(f"Per-rule action limit exceeded: {rule['id']} ({count} of {rule.get('limit', 10)})")
+            thresholds.append(dict(kind="rule", rule=rule["id"], count=count, limit=rule.get("limit", 10)))
     if sum(a['action'] == 'create-draft' for a in actions) > DRAFT_LIMIT:
         reasons.append('Draft limit exceeded')
+        thresholds.append(dict(kind='draft', count=sum(a['action'] == 'create-draft' for a in actions), limit=DRAFT_LIMIT))
     if sum(a['action'] == 'unsubscribe' for a in actions) > 10:
         reasons.append('Unsubscribe limit exceeded')
+        thresholds.append(dict(kind='unsubscribe', count=sum(a['action'] == 'unsubscribe' for a in actions), limit=10))
     for (rule, account), count in sorted(hits.items()):
         allowed = max(BRAKE_FLOOR, totals[account] // 5)
         if count > allowed:
             reasons.append(f'Rule exceeds twenty percent of account total: {rule}, {account} ({count} matches, total {totals[account]}, allowed {allowed})')
+            thresholds.append(dict(kind='brake', account=account, rule=rule, count=count, total=totals[account], limit=allowed))
     refused = {(a['account'], a['id']) for a in actions if any(
         r.startswith('Rule exceeds twenty percent of account total: ' + a['rule'] + ', ' + a['account'] + ' (')
         for r in reasons)}
-    if reasons:
+    if unconditional:
         actions = []
         decisions = [{'account': m['account'], 'id': m['id'], 'reason': 'Protected by never-touch' if any(matches(m, h, protection=True) for h in never_touch) else 'Run stopped; rule refused by brake' if (m['account'], m['id']) in refused else 'Run stopped'} for m in messages]
     validate_actions(actions, listing)
@@ -1623,6 +1653,9 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
             'expected_counts': expected, 'not_listed': not_listed, 'skip_reasons': {a:listing.get('skipped', {}).get(a, 'pigeon error (listing answer)') for a in not_listed},
             'relist_inbox': config.get('relist_inbox', 'all'),
             'account_names': {a: f.get('name', a) for a, f in config['accounts'].items()}}
+    if reasons and not unconditional:
+        result['approval_state'] = 'awaiting approval'
+        result['approval_thresholds'] = thresholds
     result['remaining'] = remaining_items(result, listing)
     for item in result['remaining']:
         for record in (previous or {}).get('_drafts', []):
@@ -1718,6 +1751,8 @@ def number_decisions(store, plan, listing, *, read_only=False):
         if item['reason'] == 'Protected by never-touch':
             continue
         key = (item['account'], item['id'])
+        if plan.get('approval_state') == 'awaiting approval' and any((a['account'], a['id']) == key for a in plan['actions']):
+            continue
         if key in kept and item['reason'] == 'No matching rule':
             item['reason'] = 'Kept by owner reply'
         if not read_only or key in lookup:
@@ -1982,6 +2017,7 @@ def message_outcomes(plan, listing, items, observed=None, language='en', *, know
                              visible=visible, hidden=hidden, remaining=section == 'inbox', section=section, tag=tag,
                              owner=section == 'inbox' and visible and (
                                  bool(owner_items(plan, [item])) and not any(a['action'] in REMOVALS for a in planned)
+                                 and (plan.get('approval_state') != 'awaiting approval' or not planned)
                                  if plan.get('dry_run') else 'number' in item)))
     return outcomes
 
@@ -2015,7 +2051,8 @@ def render_remaining(plan, listing, language='en', *, outcomes=None):
             lines.append(str(hidden) + (' previously listed' if language == 'en' else ' ya enumerados'))
     if empty_accounts:
         lines.append(', '.join(empty_accounts) + (': empty' if language == 'en' else ': vacío'))
-    lines += reply_hint(shown, language, listing)
+    if plan.get('approval_state') != 'awaiting approval':
+        lines += reply_hint(shown, language, listing)
     return lines
 
 
@@ -2090,16 +2127,19 @@ def calendar_section(data, config, now):
     return lines
 
 
-def render_report(plan, listing, language='en', store=None):
+def render_report(plan, listing, language='en', store=None, *, new_question=False):
+    if plan.get('approval_state') == 'awaiting approval' and store is not None:
+        return awaiting_message(store, plan, listing, language, new_question=new_question)
     empty, stopped = STRINGS[language]
     planned, new = (SECTION_LABELS[language][k] for k in ('planned', 'rules'))
     lookup = {(m['account'], m['id']): m for m in listing['messages']}
     lines = ['Inbox: ' + str(sum(plan['counts'].values())) + ' total' + (' · ' if plan['counts'] else '') + ' · '.join(account_name(plan, a) + ' ' + str(n) for a, n in plan['counts'].items())]
     lines = account_problems(plan, listing, store, language) + lines
     lines += [account_name(plan, a) + ': no new mail' for a in listing.get('quiet', [])]
-    lines += [stopped + ': ' + account_reason(plan, r) for r in plan['reasons']]
+    if plan.get('approval_state') != 'awaiting approval':
+        lines += [stopped + ': ' + account_reason(plan, r) for r in plan['reasons']]
     lines += render_drafts(plan, listing)
-    if listing['accounts']: lines += ['', SECTION_LABELS[language]['inbox'], ''] + render_remaining(plan, listing, language)
+    if listing['accounts']: lines += ['', SECTION_LABELS[language]['inbox'], ''] + render_remaining(dict(plan, dry_run=True) if plan.get('approval_state') == 'awaiting approval' else plan, listing, language)
     lines += plan.get('calendar_section', [])
     hosts = {(a['account'], a['id']): safe_unsubscribe_host(a['url']) for a in plan['actions'] if 'url' in a}
     lines += ['', planned, '']
@@ -2112,6 +2152,8 @@ def render_report(plan, listing, language='en', store=None):
             lines.append('- ' + action['action'] + ': ' + chat_text(m['sender'])[:160] + ' · ' + chat_text(m['subject'])[:240] + (' · ' + chat_text(action['target_path']) if 'target_path' in action else '') + (' · ' + chat_text(hosts.get((account, action['id']), '')) if 'url' in action else ''))
     if not plan['actions']: lines.append(empty)
     lines += ['', new, '', empty, '']
+    if plan.get('approval_state') == 'awaiting approval':
+        lines.append(approval_question(plan, language))
     return '\n'.join(lines)
 
 
@@ -2144,6 +2186,232 @@ def message_opening(store, plan=None, outcomes=()):
     need = (str(count) + (' needs you' if count == 1 else ' need you') if count else 'nothing needs you') if language == 'en' else (str(count) + (' requiere tu decisión' if count == 1 else ' requieren tu decisión') if count else 'nada requiere tu decisión')
     opening = '📬 Triage · ' + started.strftime('%A, %Y-%m-%d, %H:%M %Z')
     return opening + ' · ' + need + (' · 0 handled · stopped' if language == 'en' else ' · 0 gestionados · ' + STRINGS[language][1].lower()) + '\n' + ''.join(line + '\n' for line in account_problems(plan, {}, store, language))
+
+
+def threshold_text(plan, language):
+    texts = []
+    for threshold in plan.get('approval_thresholds', []):
+        kind, count, limit = (threshold[k] for k in ('kind', 'count', 'limit'))
+        rule = chat_text(threshold.get('rule', ''))
+        if kind == 'inbox':
+            accounts = ', '.join(account_name(plan, a) + ' ' + str(n) for a, n in plan['counts'].items())
+            text = (f'{count} message{"s" if count != 1 else ""} in Inbox {"are" if count != 1 else "is"} over the limit of {limit}' if language == 'en' else f'{count} mensaje{"s" if count != 1 else ""} en Recibidos {"superan" if count != 1 else "supera"} el límite de {limit}') + ' (' + accounts + ')'
+        elif kind == 'brake':
+            account = account_name(plan, threshold['account'])
+            total = plan['counts'][threshold['account']]
+            text = (f'{account}, rule {rule}: {count} match{"es" if count != 1 else ""}; {total} message{"s" if total != 1 else ""} in Inbox; limit {limit}' if language == 'en' else f'{account}, regla {rule}: {count} coincidencia{"s" if count != 1 else ""}; {total} mensaje{"s" if total != 1 else ""} en Recibidos; límite {limit}')
+        else:
+            labels = ({'destructive': ('destructive action', 'destructive actions'),
+                       'rule': ('action for rule ' + rule, 'actions for rule ' + rule),
+                       'draft': ('draft', 'drafts'), 'unsubscribe': ('unsubscribe', 'unsubscribes')}
+                      if language == 'en' else
+                      {'destructive': ('acción destructiva', 'acciones destructivas'),
+                       'rule': ('acción de la regla ' + rule, 'acciones de la regla ' + rule),
+                       'draft': ('borrador', 'borradores'), 'unsubscribe': ('baja', 'bajas')})
+            label = labels[kind][count != 1]
+            text = (f'{count} {label} {"exceeds" if count == 1 else "exceed"} the limit of {limit}' if language == 'en' else f'{count} {label} {"supera" if count == 1 else "superan"} el límite de {limit}')
+        texts.append(text)
+    return '. '.join(texts)
+
+
+def approval_question(plan, language='en'):
+    counts = {}
+    for action in plan['actions']:
+        if action['action'] != 'create-folder':
+            counts[action['action']] = counts.get(action['action'], 0) + 1
+    kinds = ', '.join(str(n) + ' ' + (('move' if language == 'en' else 'mover') if kind == 'move' else action_label(dict(action=kind), {}, language)) for kind, n in sorted(counts.items()))
+    proceed, skip = APPROVAL_WORDS[language]
+    total = sum(counts.values())
+    breakdown = ' (' + kinds + ')' if kinds else ''
+    details = threshold_text(plan, language)
+    dry = plan.get('dry_run')
+    if language == 'en':
+        question = f'⚠️ {details}. Planned: {total} action{"s" if total != 1 else ""}{breakdown}.'
+        ending = (f'The choices would be "{proceed}" or "{skip}"; no reply is acted on.' if dry
+                  else f'Reply "{proceed}" to run it, or "{skip}" to leave everything.')
+        prefix = 'A real run would ask: ' if dry else ''
+    else:
+        question = f'⚠️ {details}. Previsto: {total} {"acciones" if total != 1 else "acción"}{breakdown}.'
+        ending = (f'Las opciones serían "{proceed}" u "{skip}"; las respuestas no se aplican.' if dry
+                  else f'Responde "{proceed}" para ejecutarlo, u "{skip}" para dejar todo igual.')
+        prefix = 'Una ejecución real preguntaría: ' if dry else ''
+    return prefix + question + ' ' + ending
+
+
+
+def awaiting_message(store, plan, listing, language, *, new_question=False):
+    preview = dict(plan, dry_run=True)
+    outcomes = message_outcomes(preview, listing, remaining_items(plan, listing), language=language)
+    first = message_opening(store, plan, outcomes).splitlines()[0].rsplit(' · ', 2)[0]
+    waiting = 'awaiting approval' if language == 'en' else 'en espera de aprobación'
+    first += ' · ' + waiting
+    if plan.get('dry_run'): first += ' · ' + ('dry run' if language == 'en' else 'simulación')
+    created = time.time() if new_question else question_created(store, plan)
+    expired = (not new_question and question_closed(store, plan)) or time.time() - created < 0 or time.time() - created > approval_hours(state_config(store)) * 3600
+    if expired:
+        empty = 'nothing needs you' if language == 'en' else 'nada requiere tu decisión'
+        expired_label = 'approval question expired' if language == 'en' else 'pregunta de aprobación caducada'
+        first = first.replace(empty + ' · ' + waiting, expired_label).replace(waiting, expired_label)
+    lines = [first] + account_problems(plan, listing, store, language)
+    lines += [account_name(plan, a) + ': no new mail' for a in listing.get('quiet', [])]
+    lines += ['', SECTION_LABELS[language]['inbox'], '']
+    lines += render_remaining(preview, listing, language, outcomes=outcomes)
+    lines += plan.get('calendar_section', [])
+    lines += [('Approval question expired; the next run asks again.' if language == 'en' else 'La pregunta de aprobación caducó; la próxima ejecución volverá a preguntar.') if expired else approval_question(plan, language)]
+    return '\n'.join(lines) + '\n'
+
+
+APPROVAL_WORDS = {'en': ('proceed', 'skip'), 'es': ('proceder', 'omitir')}
+
+
+def approval_reply(store, args):
+    try:
+        with Path(args.reply).open(encoding='utf-8') as stream:
+            raw = stream.read(REPLY_LIMIT + 1)
+            text = raw.strip().casefold() if len(raw) <= REPLY_LIMIT else ''
+    except UnicodeError:
+        text = ''
+    if text.endswith(('.', '!')):
+        text = text[:-1]
+    config = state_config(store)
+    validate_inputs({'accounts': {}, 'messages': []}, config, {})
+    language = config.get('language', 'en')
+    words = APPROVAL_WORDS['en'] + APPROVAL_WORDS['es']
+    path = Path(args.plan_out or store / 'plan.json').resolve()
+    with lock_gate(store):
+        require_lock(store, args.token)
+        require_fetched(store, args.token)
+        plan = parse_json(read_text(path), path) if path.is_file() else {}
+        waiting = plan.get('approval_state') == 'awaiting approval' and not plan.get('dry_run')
+        if not waiting and text not in words:
+            return False
+        if args.scheduled:
+            raise ValueError('Replies require a user-initiated run')
+        if not waiting:
+            raise ValueError('Reply refused: no plan awaits approval')
+        if text not in words:
+            raise ValueError('Reply refused: answer proceed or skip (proceder or omitir); the plan is still waiting')
+        if args.question != plan.get('run_id'):
+            raise ValueError('Reply refused: question missing or replaced; relay the current question before answering')
+        check_approval_age(store, plan)
+        if text in ('proceed', 'proceder'):
+            command = ['env', 'PIGEON_HOME=' + str(store), 'python3', 'scripts/execute.py', 'next', '--token', args.token,
+                       '--plan', str(path), '--approve', plan['run_id']]
+            print(shlex.join(command))
+            return True
+    skip_approval(store, args.token, path)
+    print('Nothing changes.' if language == 'en' else 'Nada cambia.')
+    return True
+
+
+def question_created(store, plan):
+    if plan.get('dry_run'):
+        return plan['approval_created']
+    history = store / 'history.log'
+    marker = ' approval asked: ' + str(plan.get('run_id'))
+    stamps = [state_timestamp(line.split(' ')[0], history).timestamp()
+              for line in (read_text(history).splitlines() if history.exists() else []) if line.endswith(marker)]
+    if stamps:
+        return min(stamps)
+    raise ValueError('approval: expected recorded question time')
+
+
+def question_closed(store, plan):
+    history = store / 'history.log'
+    return history.exists() and any(
+        line.split(' approval ', 1)[1].split(' ')[:2] == [kind + ':', str(plan.get('run_id'))]
+        for line in read_text(history).splitlines() if ' approval ' in line
+        for kind in ('approved', 'skipped', 'expired', 'replaced', 'stale'))
+
+
+def check_approval_age(store, plan):
+    if question_closed(store, plan):
+        raise ValueError('approval: question closed or expired; plan again')
+    created = question_created(store, plan)
+    if type(created) not in (float, int) or not math.isfinite(created):
+        raise ValueError('approval: expected planning time')
+    age = time.time() - created
+    if age < 0 or age > approval_hours(state_config(store)) * 3600:
+        history = store / 'history.log'
+        marker = ' approval expired: ' + plan['run_id']
+        if not history.exists() or not any(marker in line for line in read_text(history).splitlines()):
+            approval_event(store, plan, 'expired')
+        raise ValueError('approval: question expired; the next run asks again')
+
+
+def approval_hours(config):
+    hours = config.get('approval_hours', 12)
+    if type(hours) is not int or not 1 <= hours <= 72:
+        raise ValueError('config.approval_hours: expected an integer from 1 to 72')
+    return hours
+
+
+def approval_event(store, plan, event):
+    line = datetime.now(timezone.utc).isoformat() + ' approval ' + event + ': ' + plan['run_id']
+    if event == 'approved':
+        line += ' ' + hashlib.sha256(plan['run_token'].encode()).hexdigest()
+    line += '\n'
+    with (store / 'history.log').open('a', encoding='utf-8') as out:
+        out.write(line)
+
+
+def skip_approval(store, token, path):
+    import execute
+    with lock_gate(store):
+        require_lock(store, token)
+        require_fetched(store, token)
+        path = Path(path).resolve()
+        plan = execute.read(path)
+        if plan.get('approval_state') != 'awaiting approval' or plan.get('dry_run'):
+            raise ValueError('approval: expected a plan awaiting approval')
+        execute.atomic(path, dict(plan, approval_state='skipped'))
+        approval_event(store, plan, 'skipped')
+
+
+def approve_plan(store, token, path, run_id, *, validate_only=False, reading=None):
+    # This is the only route that may bind an existing plan to a new lock.
+    import execute
+    with lock_gate(store):
+        require_lock(store, token)
+        require_fetched(store, token)
+        path = Path(path).resolve()
+        plan = execute.read(path)
+        if plan.get('dry_run') or plan.get('approval_state') != 'awaiting approval':
+            raise ValueError('approval: expected a plan awaiting approval')
+        if plan.get('run_id') != run_id:
+            raise ValueError('approval: run id does not match awaiting plan')
+        history_path = store / 'history.log'
+        events = [line.split(' approval ', 1)[1] for line in read_text(history_path).splitlines() if ' approval ' in line] if history_path.exists() else []
+        asked = [event[7:] for event in events if event.startswith('asked: ')]
+        if not asked or asked[-1] != run_id or any(event.split(' ')[:2] == [kind + ':', run_id] for event in events for kind in ('approved', 'skipped', 'expired', 'replaced', 'stale')):
+            raise ValueError('approval: plan replaced or approval already used or expired; plan again')
+        check_approval_age(store, plan)
+        if validate_only:
+            return plan
+        if reading is None:
+            raise ValueError('approval: fresh Inbox reading required')
+        validate_inputs(reading, state_config(store), {})
+        accounts = {a['account'] for a in plan['actions']}
+        if (set(reading['accounts']) != accounts or reading.get('skipped')
+                or accounts - {m['account'] for m in reading['messages']}):
+            raise ValueError('approval: fresh Inbox reading failed; question stays open')
+        present = {(m['account'], m['id']) for m in reading['messages']}
+        if any((a['account'], a['id']) not in present for a in plan['actions'] if a['action'] != 'create-folder'):
+            approval_event(store, plan, 'stale')
+            execute.atomic(path, dict(plan, run_token=token, approval_state='skipped'))
+            (store / ('execution-' + hashlib.sha256(token.encode()).hexdigest() + '.json')).unlink(missing_ok=True)
+            return dict(done=True, status='stale', message='Inbox changed since the question; the next run plans and asks again.')
+        candidate = dict(plan, run_token=token, approval_state='approved',
+                         approved_thresholds=plan['reasons'], reasons=[])
+        checkpoint = store / ('execution-' + hashlib.sha256(token.encode()).hexdigest() + '.json')
+        if checkpoint.exists():
+            prior = execute.Execution(store, token, path)
+            if prior.state['results'] or prior.state['pending'] is not None:
+                raise ValueError('approval: execution already began; plan again')
+        execute.atomic(path, candidate)
+        if checkpoint.exists():
+            checkpoint.unlink()
+        approval_event(store, candidate, 'approved')
 
 
 def require_plan_token(plan, token):
@@ -2185,6 +2453,8 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
     failure_line = ('Run failed at ' + chat_text(failure.get('stage', 'plan')) + ': ' + chat_text(failure.get('refusal', 'pigeon error (plan unavailable)'))) if failure.get('token') == token else None
     candidate = execute.read(plan_path) if Path(plan_path).exists() else {}
     current_plan = candidate.get('run_token') == token
+    if candidate.get('approval_state') == 'awaiting approval' and failure_line and 'question expired' in failure_line:
+        return awaiting_message(store, candidate, execute.read(store / 'inbox.json'), state_config(store).get('language', 'en'))
     if Path(plan_path).exists() and not current_plan and not failure_line:
         return message_opening(store) + 'Run failed at plan: plan.run_token: expected current run token; plan again\n'
     checkpoint = store / ('execution-' + hashlib.sha256(token.encode()).hexdigest() + '.json')
@@ -2193,6 +2463,8 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
         stage = failure.get('stage', 'plan') if failure.get('token') == token else 'plan'
         return message_opening(store) + 'Run failed at ' + chat_text(stage) + ': ' + chat_text(refusal) + '\n'
     plan = candidate
+    if plan.get('approval_state') == 'awaiting approval' and not plan.get('dry_run'):
+        return awaiting_message(store, plan, execute.read(store / 'inbox.json'), state_config(store).get('language', 'en'))
     if not checkpoint.exists() and not plan.get('dry_run'):
         listing = execute.read(store / 'inbox.json')
         language = state_config(store).get('language', 'en')
@@ -2211,6 +2483,8 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
         if any(plan.get(k) != expected[k] for k in expected):
             raise ValueError('dry-run plan: expected unchanged private inputs and listing')
         language = config.get('language', 'en')
+        if plan.get('approval_state') == 'awaiting approval':
+            return awaiting_message(store, plan, listing, language)
         labels = SECTION_LABELS[language]
         lines = ['Dry run', 'Replies to this dry run are not acted on; no reply number is live.'] if language == 'en' else ['Simulación', 'Las respuestas a esta simulación no se aplican; ningún número está activo.']
         outcomes = message_outcomes(plan, listing, remaining_items(plan, listing), language=language)
@@ -2260,6 +2534,12 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
         if outcome['section'] == 'handled':
             handled.setdefault(outcome['item']['account'], []).append(outcome)
     stop_notes = [account_reason(plan, r) for r in plan['reasons']]
+    if plan.get('approval_state') == 'skipped' and any(
+            line.endswith(' approval stale: ' + str(plan.get('run_id')))
+            for line in read_text(store/'history.log').splitlines()):
+        started = datetime.fromtimestamp(read_lock(store).get('started', read_lock(store)['created']), ZoneInfo(config.get('timezone', 'UTC')))
+        return ('📬 Triage · ' + started.strftime('%A, %Y-%m-%d, %H:%M %Z')
+                + (' · nothing needs you · 0 handled · stopped\nInbox changed since the question; nothing was done; the next run plans and asks again.' if language == 'en' else ' · nada requiere tu decisión · 0 gestionados · detenido\nLa bandeja de entrada cambió desde la pregunta; no se hizo nada; la próxima ejecución planifica y pregunta de nuevo.'))
     if execution.stop_reason():
         stop_notes.append(account_reason(plan, execution.stop_reason()))
     notes = []
@@ -2292,6 +2572,8 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
     lines.insert(0, '📬 Triage · ' + started.strftime('%A, %Y-%m-%d, %H:%M %Z') + ' · ' + need + ' · ' + summary)
     problems = account_problems(plan, listing, store, language)
     lines[1:1] = problems + list(dict.fromkeys(stop_notes))
+    if plan.get('approval_state') == 'approved':
+        lines.insert(1, ('Owner approved exceeding these thresholds. ' if language == 'en' else 'El propietario aprobó superar estos límites. ') + threshold_text(plan, language) + '.')
     if handled:
         lines += ['', labels['handled']]
         for account, actions in handled.items():
@@ -2440,7 +2722,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         require_plan_token(plan, token)
         if plan.get('dry_run'):
             raise ValueError('dry-run plan: commit-state is refused')
-        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token'}, str(plan_path))
+        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds'}, str(plan_path))
         for key in ('actions', 'reasons', 'not_listed'):
             if not isinstance(plan.get(key), list):
                 raise ValueError(str(plan_path) + '.' + key + ': expected an array')
@@ -2529,6 +2811,9 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
             validate_positions(positions, config)
             confirmed = {a for a in counts if all(r['status'] not in ('issued_unknown', 'unexecuted', 'unconfirmed') for r in execution.state['results'] if r['account'] == a)}
             previous.setdefault('_positions', {}).update({a:p for a,p in positions.items() if a in confirmed})
+        if plan.get('approval_state') in ('awaiting approval', 'skipped'):
+            for account in counts:
+                previous.get('_positions', {}).pop(account, None)
         if plan.get('reply') and not plan['reasons']:
             log = store / 'decisions.jsonl'
             batches = [parse_json(line, log) for line in read_text(log).splitlines()] if log.exists() else []
@@ -2561,9 +2846,9 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         records = [d for key, d in records.items() if d['account'] not in listing['accounts'] or key in present - removed]
         if records or '_drafts' in previous:
             previous['_drafts'] = records
-        number_decisions(store, confirmed, listing)
+        number_decisions(store, confirmed, listing, read_only=plan.get('approval_state') == 'awaiting approval')
         language = config.get('language', 'en')
-        report = render_report(confirmed, listing, language, store)
+        report = render_report(plan if plan.get('approval_state') == 'awaiting approval' else confirmed, listing, language, store)
         marker = '**' + SECTION_LABELS[language]['inbox'] + '**'
         report = report.replace(marker, '\n'.join(render_drafts(plan, read(store / 'inbox.json'), observed)) + '\n' + marker, 1)
         (store / 'report.md').write_text(report, encoding='utf-8')
@@ -2757,15 +3042,18 @@ def gateway_results(path, count):
     return values
 
 
-def listing_exchange(store, token, results=None, *, ids_only=False, accounts=None, manual_part=None, skip=()):
+def listing_exchange(store, token, results=None, *, ids_only=False, accounts=None, manual_part=None, skip=(), approval=None):
     """Persist issued reads before returning them; mail values remain data."""
     import execute
     with lock_gate(store):
         require_lock(store, token)
         require_fetched(store, token)
         config, rules, holds = load_safety([store / n for n in ('config.toml','rules.toml','never-touch.toml','guardrails.md')])
-        filename = store / ('final-listing-exchange.json' if ids_only else 'listing-exchange.json')
+        filename = store / ('approval-reading.json' if approval else 'final-listing-exchange.json' if ids_only else 'listing-exchange.json')
         state = parse_json(read_text(filename), filename) if filename.exists() else {}
+        if approval and state.get('approval') != approval:
+            if results is not None: raise ValueError('approval: no pending fresh reading')
+            state = {}
         if state.get('token') == token:
             skip = set(skip) | {a for a,r in state.get('failed', {}).items() if r == 'pigeon error (manual skip)'}
         names = list(accounts if accounts is not None else config['accounts'])
@@ -2792,6 +3080,7 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
             if results is not None: raise ValueError('listing: no pending batch')
             state = dict(token=token, config=fingerprint, round=0, queue=[], pending=[], failed={a:'pigeon error (manual skip)' for a in skip}, attempts={},
                          data={a:dict(ids=[], attachments=[], messages=[], folders=[], total=0, seen={}) for a in names})
+            if approval: state['approval'] = approval
             for a in names:
                 for kind in (['ids'] if ids_only else ['profile','ids','attachments','labels'] if config['accounts'][a].get('provider')=='gmail' else ['profile','ids','folders']):
                     state['queue'].append(dict(account=a,kind=kind))
@@ -2803,6 +3092,8 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
         if state['config'] != fingerprint or set(state['data']) != set(names):
             raise ValueError('listing: configuration changed')
         if results is not None:
+            if approval and (not state['pending'] or Path(results).stat().st_mtime < state.get('issued', float('inf')) or state.get('issued', 0) < read_lock(store).get('started', read_lock(store)['created'])):
+                raise ValueError('approval: expected a fresh answer to the pending reading')
             values = gateway_results(results, len(state['pending']))
             # A message response carries the requested ID; validate before consuming any result.
             for job, value in zip(state['pending'], values):
@@ -2827,7 +3118,7 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
                 state['queue'] = [j for j in state['queue'] if j['account'] != a]
                 kinds = ['ids'] if ids_only else ['profile','ids','attachments','labels'] if config['accounts'][a]['provider']=='gmail' else ['profile','ids','folders']
                 state['queue'] += [dict(account=a,kind=k) for k in kinds]
-        if ids_only and not state['pending'] and not state['queue'] and not state.get('arrivals_checked'):
+        if ids_only and not approval and not state['pending'] and not state['queue'] and not state.get('arrivals_checked'):
             original = parse_json(read_text(store/'inbox.json'), 'inbox')
             for a,d in state['data'].items():
                 if a in state['failed']: continue
@@ -2844,7 +3135,9 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
             jobs = state['queue'][:LISTING_BATCH]
             state['queue'] = state['queue'][LISTING_BATCH:]
             state['pending'] = jobs
-            if jobs: state['round'] += 1
+            if jobs:
+                state['round'] += 1
+                if approval: state['issued'] = time.time()
         execute.atomic(filename, state)
         if jobs:
             return dict(round=state['round'], batches_remaining=(len(state['queue'])+LISTING_BATCH-1)//LISTING_BATCH,
@@ -2857,7 +3150,9 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
             if a in state['failed']: continue
             listing['accounts'][a] = (parse_json(read_text(store/'inbox.json'), 'inbox')['accounts'][a] if ids_only else d['total'])
             listing['folders'][a] = d['folders']
-            if ids_only:
+            if ids_only and approval:
+                listing['messages'] += [dict(account=a, id=i, folder='Inbox', sender='', subject='') for i in d['ids']]
+            elif ids_only:
                 original = parse_json(read_text(store/'inbox.json'), 'inbox')
                 old = {m['id']:m for m in original['messages'] if m['account']==a}
                 for m in d['messages']:
@@ -2871,7 +3166,7 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
                     if config['accounts'][a]['provider']=='gmail': m['has_attachment'] = m['id'] in d['attachments']
                 listing['messages'] += d['messages']
         validate_inputs(listing, config, {})
-        execute.atomic(store / ('final-inbox.json' if ids_only else 'inbox.json'), listing)
+        execute.atomic(store / ('approval-inbox.json' if approval else 'final-inbox.json' if ids_only else 'inbox.json'), listing)
         return dict(done=True, counts={a:len(d['ids']) for a,d in state['data'].items() if a not in state['failed']}, failed=state['failed'])
 
 
@@ -3151,6 +3446,7 @@ def _main(argv=None, *, now=None):
             plan.add_argument('--calendar')
         if command_name == 'reply':
             plan.add_argument('--reply', required=True)
+            plan.add_argument('--question')
         plan.add_argument('--token', required=True)
         plan.add_argument('--inbox', required=True)
         plan.add_argument('--scheduled', action='store_true')
@@ -3184,6 +3480,8 @@ def _main(argv=None, *, now=None):
         print(str(store) + ': next run python3 scripts/triage.py validate')
         return
     store = private_store()
+    if args.command == 'reply' and approval_reply(store, args):
+        return
     if args.command in ('tool-save', 'tool-show', 'tool-drop'):
         import execute
         with lock_gate(store):
@@ -3320,6 +3618,13 @@ def _main(argv=None, *, now=None):
             with lock_gate(store):
                 require_lock(store, args.token)
                 require_fetched(store, args.token)
+                if getattr(args, 'dry_run', False) and args.plan_out:
+                    destination = Path(args.plan_out).expanduser().resolve()
+                    if destination.is_file():
+                        old = parse_json(read_text(destination), destination)
+                        if not old.get('dry_run') and old.get('approval_state') in ('awaiting approval', 'approved'):
+                            protected.add(destination)
+                            raise ValueError('dry run: real approval plan at --plan-out; use a separate rehearsal file')
                 config, rules, holds = load_safety(sources)
                 try:
                     listing = json.loads(load_inputs([args.inbox])[0])
@@ -3373,7 +3678,10 @@ def _main(argv=None, *, now=None):
                 if args.command == 'plan' and config.get('calendars'):
                     data = parse_json(load_inputs([args.calendar])[0], args.calendar) if args.calendar else {}
                     result['calendar_section'] = calendar_section(data, config, now or datetime.now(timezone.utc))
+                result['run_id'] = secrets.token_hex(32)
                 result['run_token'] = args.token
+                if result.get('approval_state') == 'awaiting approval':
+                    result['approval_created'] = (now or datetime.now(timezone.utc)).timestamp()
                 if getattr(args, 'dry_run', False):
                     result['dry_run'] = True
                     number_decisions(store, result, listing, read_only=True)
@@ -3381,7 +3689,7 @@ def _main(argv=None, *, now=None):
                     number_decisions(store, result, listing)
                 result['first_run'] = first_run
                 if args.scheduled: result['scheduled'] = True
-                report = render_report(result, listing, config.get('language', 'en'), store)
+                report = render_report(result, listing, config.get('language', 'en'), store, new_question=True)
                 if args.scheduled and 'schedule' in config:
                     now = now or datetime.now(timezone.utc)
                     slot = schedule_slot(config, now)
@@ -3416,7 +3724,25 @@ def _main(argv=None, *, now=None):
                             temporary.append(Path(out.name))
                             out.write(content)
                     for source, (destination, _) in zip(temporary, outputs):
+                        if not getattr(args, 'dry_run', False) and destination == Path(args.plan_out or '').resolve() and destination.exists():
+                            old = parse_json(read_text(destination), destination)
+                            if old.get('approval_state') == 'awaiting approval':
+                                if time.time() - question_created(store, old) > approval_hours(config) * 3600:
+                                    marker = ' approval expired: ' + old['run_id']
+                                    history = store / 'history.log'
+                                    if not history.exists() or not any(marker in line for line in read_text(history).splitlines()):
+                                        approval_event(store, old, 'expired')
                         source.replace(destination)
+                    if not getattr(args, 'dry_run', False) and args.plan_out:
+                        history = store / 'history.log'
+                        events = [line.split(' approval ', 1)[1] for line in read_text(history).splitlines() if ' approval ' in line] if history.exists() else []
+                        asked = [event[7:] for event in events if event.startswith('asked: ')]
+                        if asked and not any(event.split(' ')[:2] == [kind + ':', asked[-1]] for event in events for kind in ('approved', 'skipped', 'expired', 'replaced', 'stale')):
+                            approval_event(store, {'run_id': asked[-1]}, 'replaced')
+                    if not getattr(args, 'dry_run', False) and args.plan_out and result.get('approval_state') == 'awaiting approval':
+                        approval_event(store, result, 'asked')
+                    if getattr(args, 'dry_run', False) and result.get('approval_state') == 'awaiting approval':
+                        print('question_id: ' + result['run_id'])
                     print(('' if args.plan_out else payload) + ('' if args.report_out else report), end='', flush=True)
                 except Exception:
                     for destination, _ in outputs:

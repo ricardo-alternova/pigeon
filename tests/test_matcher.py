@@ -121,13 +121,15 @@ class MatcherTests(unittest.TestCase):
     def test_si9_global_ceiling(self):
         self.batch(51, 6)
         result = self.plan()
-        self.assertEqual(result['actions'], [])
+        self.assertEqual(len(result['actions']), 51)
+        self.assertEqual(result['approval_state'], 'awaiting approval')
         self.assertIn('Destructive action limit exceeded', result['reasons'])
 
     def test_si9_rule_ceiling(self):
         self.batch(11)
         result = self.plan()
-        self.assertEqual(result['actions'], [])
+        self.assertEqual(len(result['actions']), 11)
+        self.assertEqual(result['approval_state'], 'awaiting approval')
         self.assertTrue(any(reason.startswith('Per-rule') and reason.endswith(': ' + self.rules[0]['id'] + ' (11 of 10)') for reason in result['reasons']))
 
     def test_si9_rule_ceiling_counts_companions(self):
@@ -136,17 +138,20 @@ class MatcherTests(unittest.TestCase):
             self.rules[0]['after_unsubscribe'] = 'archive'
             result = self.plan()
             self.assertEqual(any(reason.startswith('Per-rule action limit exceeded:') for reason in result['reasons']), stopped)
-            self.assertEqual(len(result['actions']), 0 if stopped else 2 * count)
+            self.assertEqual(len(result['actions']), 2 * count)
+            self.assertEqual(result.get('approval_state'), 'awaiting approval' if stopped else None)
 
     def test_si9_unsubscribe_ceiling(self):
         self.batch(11, 2, 'unsubscribe')
         result = self.plan()
-        self.assertEqual(result['actions'], [])
+        self.assertEqual(len(result['actions']), 11)
+        self.assertEqual(result['approval_state'], 'awaiting approval')
         self.assertIn('Unsubscribe limit exceeded', result['reasons'])
 
     def test_si10_inbox_limit(self):
         self.config['inbox_limit'] = 3
-        self.assertEqual(self.plan()['actions'], [])
+        self.assertEqual(len(self.plan()['actions']), 2)
+        self.assertEqual(self.plan()['approval_state'], 'awaiting approval')
 
     def test_si10_empty_account(self):
         self.listing['messages'] = [m for m in self.listing['messages'] if m['account'] != 'marble']
@@ -161,7 +166,7 @@ class MatcherTests(unittest.TestCase):
             self.assertEqual(bool(plan['reasons']), stopped)
             if stopped:
                 self.assertEqual(plan['reasons'], ['Rule exceeds twenty percent of account total: r0, cedar (11 matches, total 40, allowed 10)'])
-                self.assertIn(triage.chat_text(plan['reasons'][0]), triage.render_report(plan, self.listing))
+                self.assertIn('11 matches; 11 messages in Inbox; limit 10', triage.render_report(plan, self.listing))
 
     def test_twenty_percent_stable_pairs(self):
         self.batch(22, groups=2)

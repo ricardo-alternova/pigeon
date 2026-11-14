@@ -203,9 +203,10 @@ for dry in (True, False):
     (store/'inbox.json').write_text(json.dumps(original))
     before = {n: (store/n).read_bytes() if (store/n).exists() else None for n in ('state.json','numbers.json','calls.jsonl','history.log','decisions.jsonl')}
     plan_command = blocks[7]
-    if dry: plan_command = plan_command.replace(' --report-out /absolute/private-store/report.md', '') + ' --dry-run'
+    if dry:
+        plan_command = plan_command.replace(' --report-out /absolute/private-store/report.md', '').replace('/plan.json', '/rehearsal.json') + ' --dry-run'
     run(plan_command, token)
-    plan = json.loads((store/'plan.json').read_text())
+    plan = json.loads((store/('rehearsal.json' if dry else 'plan.json')).read_text())
     assert plan['first_run']
     if dry:
         rehearsal = plan['actions']
@@ -215,7 +216,7 @@ for dry in (True, False):
             assert 'commit_preview' in simulation['stages'][-1]
             assert all('calls' not in stage for stage in simulation['stages'])
             assert all(c['path']=='SIMULATION_ONLY' for stage in simulation['stages'] for c in stage.get('simulated_calls',[]))
-        message = run(blocks[11].split(' --results')[0], token)
+        message = run(blocks[11].split(' --results')[0].replace('/plan.json', '/rehearsal.json'), token)
         assert message.startswith('📬 Triage · ') and 'Dry run' in message and 'would' in message
         assert all(((store/n).read_bytes() if (store/n).exists() else None) == raw for n,raw in before.items())
         call = json.loads(run(blocks[13], token))['call']
@@ -267,7 +268,8 @@ store = Path(os.environ['PIGEON_HOME'])
 qblocks = [c.replace(' --batch', '') for c in re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)]
 qblocks[9] = qblocks[9].replace('--results /absolute/private-store/gateway-results.json', "--observation '{\"outcome\":\"ok\",\"inbox_ids\":[\"id-2\",\"id-3\"]}'")
 qblocks[6] = qblocks[6].replace('--results /absolute/private-store/gateway-results.json', '--observation /absolute/private-store/quiet-observation.json')
-reply = re.search(r'`(PIGEON_HOME=[^`]*triage.py reply [^`]*)`', Path('docs/quickstart.md').read_text()).group(1).strip()
+reply_section = Path('docs/quickstart.md').read_text().split('## Numbered reply\n')[1].split('\n## ')[0]
+reply = re.search(r'`(PIGEON_HOME=[^`]*triage.py reply [^`]*)`', reply_section).group(1).strip()
 observed = re.search(r'```bash\n([^\n]*execute.py observed [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
 blocks = [qblocks[i] for i in (0,5,6,7,8,9)] + [observed, qblocks[10], qblocks[13], qblocks[0], reply, qblocks[8], qblocks[9], qblocks[10], qblocks[13]]
 assert len(blocks) == 15
@@ -517,7 +519,8 @@ text = (root / 'docs/quickstart.md').read_text()
 qblocks = [c.replace(' --batch', '') for c in re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)]
 qblocks[9] = qblocks[9].replace('--results /absolute/private-store/gateway-results.json', "--observation '{\"outcome\":\"ok\",\"inbox_ids\":[\"id-2\",\"id-3\"]}'")
 qblocks[6] = qblocks[6].replace('--results /absolute/private-store/gateway-results.json', '--observation /absolute/private-store/quiet-observation.json')
-reply = re.search(r'`(PIGEON_HOME=[^`]*triage.py reply [^`]*)`', Path('docs/quickstart.md').read_text()).group(1).strip()
+reply_section = Path('docs/quickstart.md').read_text().split('## Numbered reply\n')[1].split('\n## ')[0]
+reply = re.search(r'`(PIGEON_HOME=[^`]*triage.py reply [^`]*)`', reply_section).group(1).strip()
 observed = re.search(r'```bash\n([^\n]*execute.py observed [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
 blocks = [qblocks[i] for i in (0,5,6,7,8,9)] + [observed, qblocks[10], qblocks[13], qblocks[0], reply, qblocks[8], qblocks[9], qblocks[10], qblocks[13]]
 inline = [qblocks[1], qblocks[13] + ' --observation /absolute/private-store/lock-observation.json']
@@ -602,7 +605,8 @@ text = Path('docs/quickstart.md').read_text()
 qblocks = [c.replace(' --batch', '') for c in re.findall(r'```bash\n(.*?)\n```', Path('docs/quickstart.md').read_text(), re.S)]
 qblocks[9] = qblocks[9].replace('--results /absolute/private-store/gateway-results.json', "--observation '{\"outcome\":\"ok\",\"inbox_ids\":[\"id-2\",\"id-3\"]}'")
 qblocks[6] = qblocks[6].replace('--results /absolute/private-store/gateway-results.json', '--observation /absolute/private-store/quiet-observation.json')
-reply = re.search(r'`(PIGEON_HOME=[^`]*triage.py reply [^`]*)`', Path('docs/quickstart.md').read_text()).group(1).strip()
+reply_section = Path('docs/quickstart.md').read_text().split('## Numbered reply\n')[1].split('\n## ')[0]
+reply = re.search(r'`(PIGEON_HOME=[^`]*triage.py reply [^`]*)`', reply_section).group(1).strip()
 observed = re.search(r'```bash\n([^\n]*execute.py observed [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
 blocks = [qblocks[i] for i in (0,5,6,7,8,9)] + [observed, qblocks[10], qblocks[13], qblocks[0], reply, qblocks[8], qblocks[9], qblocks[10], qblocks[13]]
 inline = [qblocks[1], qblocks[2], qblocks[3], qblocks[12], qblocks[12] + ' --lock-observation /absolute/private-store/state-lock-observation.json', qblocks[12] + ' --observation /absolute/private-store/upload-observation.json', qblocks[13] + ' --observation /absolute/private-store/lock-observation.json']
@@ -696,7 +700,7 @@ for iteration in (1, 2, 3, 4):
     assert json.loads(run(store, blocks[8], token))['call']['operation'] == 'delete'
     assert observed(store, release_resume, dict(status='deleted'), token, 'lock-observation.json') == 'released'
 print('PASS: fresh-shell drive state; two empty working stores preserve numbers/counts/positions; numbered reply answered; scheduled quiet skip uploads only history; failed upload warns first, no retry, conditional release')
-print('Gateway-to-guardrail: create/read/conditional delete pigeon-run-lock -> guardrails line 9 lock exchange; ten named downloads and changed uploads -> guardrails line 9 state exchange; identity/Inbox/history reads -> guardrails line 7 read-only mail calls. No gateway was contacted.')
+print('Gateway-to-guardrail: create/read/conditional delete pigeon-run-lock -> guardrails line 9 lock exchange; fixed named downloads and changed uploads -> guardrails line 9 state exchange; identity/Inbox/history reads -> guardrails line 7 read-only mail calls. No gateway was contacted.')
 PYSTATE
 
 # Draft-only rule through fresh CLI processes; no gateway is contacted.

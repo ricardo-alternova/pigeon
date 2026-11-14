@@ -1680,6 +1680,364 @@ class DriveStateTests(unittest.TestCase):
             result = self.exchange('send', observation)
         return names, result
 
+    def test_approval_survives_empty_host_restart(self):
+        self.approval_drive_cycle()
+
+    def test_approval_cutoff_replay_empty_host_refused(self):
+        self.approval_drive_cycle(replay='empty')
+
+    def test_approval_cutoff_replay_same_host_refused(self):
+        self.approval_drive_cycle(replay='same')
+
+    def test_approval_cutoff_after_reading_before_upload_keeps_question_open(self):
+        self.approval_drive_cycle(read_cutoff='after')
+
+    def test_approval_cutoff_before_reading_keeps_question_open(self):
+        self.approval_drive_cycle(read_cutoff=True)
+
+    def test_stale_question_cleared_from_drive(self):
+        self.approval_drive_cycle(stale=True)
+
+    def test_approval_failed_upload_issues_nothing(self):
+        self.approval_drive_cycle(failure=True)
+
+    def test_closed_question_not_carried_to_drive(self):
+        for closure in ('skip','expired','replaced'):
+            for repeated in (False, True):
+                with self.subTest(closure=closure, repeated=repeated):
+                    self.setUp()
+                    self.approval_drive_cycle(closure=closure, repeated=repeated)
+
+    def test_documented_local_state_approval_sequence(self):
+        import shlex
+        from mock_provider import MockDrive, MockProvider
+        section = (ROOT/'docs/quickstart.md').read_text().split('## Approval question\n')[1].split('\n## ')[0]
+        local = section.split('### Without drive state\n')[1].split('### With drive state\n')[0]
+        steps = [line for line in local.splitlines() if line.startswith('PIGEON_HOME=')]
+        self.assertEqual(len(steps), 2)
+        reading = next(line for line in section.splitlines() if line.startswith('PIGEON_HOME=') and '--approve RUN_ID --results' in line)
+        for drive_lock in (False, True):
+            with self.subTest(drive_lock=drive_lock), tempfile.TemporaryDirectory() as tmp:
+                store = Path(tmp)
+                LockTests().prepare(store)
+                config = (store/'config.toml').read_text().replace('inbox_limit = 100', 'inbox_limit = 1')
+                config = config.replace('# provider = "gmail"', 'provider = "gmail"')
+                if drive_lock:
+                    config += '\n[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n'
+                (store/'config.toml').write_text(config)
+                (store/'rules.toml').write_text('[[rules]]\nid="r"\naccounts=["cedar"]\nsubject="move"\naction="archive"\n')
+                (store/'never-touch.toml').write_text('allow_empty=true\n')
+                listing = dict(accounts={'cedar':4}, messages=[dict(account='cedar',id=str(i),sender='a@example.net',subject='move',folder='Inbox') for i in range(4)])
+                execute.atomic(store/'inbox.json', listing)
+                env = dict(os.environ, PIGEON_HOME=str(store))
+                def command(script, *args):
+                    run = subprocess.run([shutil.which('python3'), str(ROOT/'scripts'/script), *args], env=env, capture_output=True, text=True)
+                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                    return run.stdout
+                drive = MockDrive()
+                drive.created = datetime.now(timezone.utc).isoformat()
+                def lock(operation, token=None):
+                    args = ['lock' if operation == 'acquire' else operation] + (['--token', token] if token else [])
+                    output = command('triage.py', *args)
+                    while output.lstrip().startswith('{'):
+                        call = json.loads(output)['call']
+                        obs = store/'lock-observation.json'
+                        obs.write_text(json.dumps(drive.perform(call)))
+                        output = command('triage.py', *args, '--observation', str(obs))
+                    return output.strip()
+                token = lock('acquire')
+                path = str(store/'plan.json')
+                command('triage.py','plan','--token',token,'--inbox',str(store/'inbox.json'),'--plan-out',path)
+                plan = execute.read(Path(path))
+                command('execute.py','next','--token',token,'--plan',path)
+                def commit_state():
+                    args = ['commit-state','--token',token,'--plan',path]
+                    output = command('triage.py', *args)
+                    if drive_lock:
+                        obs = store/'commit-observation.json'
+                        obs.write_text(json.dumps(drive.perform(json.loads(output)['call'])))
+                        command('triage.py', *args, '--lock-observation', str(obs))
+                commit_state()
+                lock('release',token)
+                token = lock('acquire')
+                (store/'reply.txt').write_text('proceed')
+                answer = command('triage.py','reply','--token',token,'--inbox',str(store/'inbox.json'),'--reply',str(store/'reply.txt'),'--plan-out',path,'--question',plan['run_id'])
+                issued = json.loads(command('execute.py', *shlex.split(answer)[4:]))
+                self.assertTrue(issued['calls'][0]['path'].endswith('messages.list'))
+                def documented(line):
+                    words = shlex.split(line.replace('/absolute/private-store', str(store)).replace('TOKEN',token).replace('RUN_ID',plan['run_id']))
+                    return json.loads(command(Path(words[2]).name, *words[3:]))
+                execute.atomic(store/'approval-results.json', [dict(ok=True,value=dict(messages=[dict(id=m['id']) for m in listing['messages'][:2]], nextPageToken='next'))])
+                issued = documented(reading)
+                self.assertIn('round', issued)
+                self.assertFalse(triage.question_closed(store, plan))
+                execute.atomic(store/'approval-results.json', [dict(ok=True,value=dict(messages=[dict(id=m['id']) for m in listing['messages'][2:]]))])
+                issued = documented(reading)
+                self.assertEqual(len(issued['calls']),4)
+                mailbox = MockProvider([m['id'] for m in listing['messages']])
+                for call in issued['calls']:
+                    self.assertEqual(mailbox.perform(call), 'ok')
+                execute.atomic(store/'gateway-results.json', [dict(ok=True,value={}) for call in issued['calls']])
+                # Execute the local branch's ordered commands from its own text.
+                documented(steps[0])
+                issued = documented(steps[1])
+                self.assertIn('final_reads', issued)
+                final = store/'final-inbox.json'
+                execute.atomic(final, dict(accounts={'cedar':0},messages=[]))
+                command('execute.py','final','--token',token,'--plan',path,'--inbox',str(final))
+                self.assertEqual(mailbox.ids, [])
+                self.assertEqual([r['status'] for r in execute.read(store/'results.json')['results']], ['executed'] * 4)
+                commit_state()
+                message = command('triage.py','message','--token',token,'--plan',path)
+                self.assertIn('4 handled',message)
+                self.assertIn('Owner approved',message)
+                lock('release',token)
+                self.assertFalse((store/'run.lock').exists())
+
+    def test_documented_drive_approval_sequence(self):
+        self.approval_drive_cycle(documented=True)
+
+    def test_approval_send_without_lock_observation_refused(self):
+        self.approval_drive_cycle(refuse_send=True)
+
+    def approval_drive_cycle(self, replay=None, failure=False, closure=None, refuse_send=False, documented=False, repeated=False, read_cutoff=False, stale=False):
+        from unittest.mock import patch
+        import contextlib
+        import io
+        self.now = datetime.now(timezone.utc)
+        self.drive.created = self.now.isoformat()
+        clock = patch.object(triage.time, 'time', side_effect=lambda: datetime.now(timezone.utc).timestamp())
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.configured()
+        self.fetch()
+        config = (self.store/'config.toml').read_text()
+        (self.store/'config.toml').write_text(config.replace('inbox_limit = 100', 'inbox_limit = 1'))
+        (self.store/'rules.toml').write_text('[[rules]]\nid="r"\naccounts=["cedar"]\nsubject="move"\naction="archive"\n')
+        (self.store/'never-touch.toml').write_text('allow_empty=true\n')
+        listing = dict(accounts={'cedar':4}, messages=[dict(account='cedar',id=str(i),sender='a@example.net',subject='move',folder='Inbox') for i in range(4)])
+        execute.atomic(self.store/'inbox.json', listing)
+        def command(script, args):
+            output = io.StringIO()
+            output.reconfigure = lambda **kwargs: None
+            with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                if script is execute:
+                    with patch.object(sys, 'argv', ['execute.py'] + args):
+                        script.main()
+                else:
+                    script.main(args, now=self.now)
+            return output.getvalue()
+        def documented_command(index):
+            import shlex
+            section = (ROOT/'docs/quickstart.md').read_text().split('## Approval question\n')[1].split('\n## ')[0]
+            branch = section.split('### With drive state\n')[1]
+            lines = [line for line in branch.splitlines() if line.startswith('PIGEON_HOME=')]
+            self.assertEqual(len(lines), 3, 'approval step must show the three drive-resume commands')
+            line = lines[index].replace('/absolute/private-store', str(self.store)).replace('TOKEN', self.token)
+            return command(execute if 'scripts/execute.py' in line else triage, shlex.split(line)[3:])
+        path = self.store/'plan.json'
+        command(triage, ['plan','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--plan-out',str(path)])
+        plan = execute.read(path)
+        self.assertEqual(plan['approval_state'], 'awaiting approval')
+        command(execute, ['next','--token',self.token,'--plan',str(path)])
+        commit = ['commit-state','--token',self.token,'--plan',str(path)]
+        call = json.loads(command(triage,commit))['call']
+        observation = self.store/'commit-read.json'
+        observation.write_text(json.dumps(self.drive.perform(call)))
+        command(triage,commit + ['--lock-observation',str(observation)])
+        self.send()
+        call = self.start('release',self.token)['call']
+        self.observe(self.drive.perform(call),'release',self.token)
+        old = self.store
+        self.store = old/'empty-host'
+        self.store.mkdir()
+        for name in ('config.toml','guardrails.md'):
+            shutil.copyfile(old/name,self.store/name)
+        self.token = self.acquire()
+        self.fetch()
+        path = self.store/'plan.json'
+        self.assertTrue(path.exists(), 'awaiting plan must travel with state')
+        self.assertEqual(execute.read(self.store/'inbox.json'),listing)
+        reply = self.store/'reply.txt'
+        reply.write_text('proceed')
+        if closure:
+            if closure == 'skip':
+                reply.write_text('skip')
+            elif closure == 'expired':
+                history = self.store/'history.log'
+                stamp = datetime.fromtimestamp(triage.time.time()-13*3600,timezone.utc).isoformat()
+                history.write_text(stamp + ' approval asked: ' + plan['run_id'] + '\n')
+            else:
+                triage.approval_event(self.store,plan,'replaced')
+            args = ['reply','--inbox',str(self.store/'inbox.json'),'--token',self.token,
+                    '--reply',str(reply),'--plan-out',str(path),'--question',plan['run_id']]
+            if closure == 'skip':
+                command(triage,args)
+            else:
+                with self.assertRaises(ValueError):
+                    command(triage,args)
+            if repeated:
+                # A repeated asked event cannot reopen a closed run, even with
+                # the original awaiting plan restored in the working store.
+                execute.atomic(path, plan)
+                triage.approval_event(self.store, plan, 'asked')
+            self.send()
+            self.assertEqual(self.drive.files['plan.json'],b'')
+            self.assertEqual(self.drive.files['inbox.json'],b'')
+            return
+        answer = command(triage,['reply','--inbox',str(self.store/'inbox.json'),'--token',self.token,'--reply',str(reply),'--plan-out',str(path),'--question',plan['run_id']])
+        self.assertIn('--approve',answer)
+        issued = command(execute,['next','--token',self.token,'--plan',str(path),'--approve',plan['run_id']])
+        self.assertIn('approval_reads', json.loads(issued))
+        self.assertFalse(triage.question_closed(self.store, plan))
+        self.assertNotIn(b'approval approved:', self.drive.files['history.log'])
+        self.assertTrue(self.drive.files['plan.json'])
+        if read_cutoff is True:
+            call = self.start('release',self.token)['call']
+            self.observe(self.drive.perform(call),'release',self.token)
+            old = self.store
+            self.store = old/'after-reading-cutoff'
+            self.store.mkdir()
+            for name in ('config.toml','guardrails.md'):
+                shutil.copyfile(old/name,self.store/name)
+            self.token = self.acquire()
+            self.fetch()
+            path = self.store/'plan.json'
+            self.assertFalse(triage.question_closed(self.store, plan))
+            again = command(execute,['next','--token',self.token,'--plan',str(path),'--approve',plan['run_id']])
+            self.assertIn('approval_reads', json.loads(again))
+            self.assertFalse((self.store/'calls.jsonl').exists())
+            return
+        fresh = self.store/'approval-inbox.json'
+        execute.atomic(fresh, dict(listing, messages=listing['messages'][1:]) if stale else listing)
+        if documented:
+            import shlex
+            section = (ROOT/'docs/quickstart.md').read_text().split('## Approval question\n')[1].split('\n## ')[0]
+            line = next(line for line in section.splitlines() if line.startswith('PIGEON_HOME=') and '--approve RUN_ID --inbox' in line)
+            line = line.replace('/absolute/private-store', str(self.store)).replace('TOKEN',self.token).replace('RUN_ID',plan['run_id'])
+            issued = command(execute, shlex.split(line)[3:])
+        else:
+            issued = command(execute,['next','--token',self.token,'--plan',str(path),'--approve',plan['run_id'],'--inbox',str(fresh)])
+        if read_cutoff == 'after':
+            # A crashed host cannot finish its pending lock read; expire the mock lease.
+            self.drive.item = None
+            old = self.store
+            self.store = old/'after-reading-cutoff'
+            self.store.mkdir()
+            for name in ('config.toml','guardrails.md'):
+                shutil.copyfile(old/name,self.store/name)
+            self.token = self.acquire()
+            self.fetch()
+            path = self.store/'plan.json'
+            self.assertFalse(triage.question_closed(self.store, plan))
+            again = command(execute,['next','--token',self.token,'--plan',str(path),'--approve',plan['run_id']])
+            self.assertIn('approval_reads', json.loads(again))
+            self.assertFalse((self.store/'calls.jsonl').exists())
+            return
+        if stale:
+            self.assertEqual(json.loads(issued)['status'], 'stale')
+            self.assertFalse((self.store/'calls.jsonl').exists())
+            commit = ['commit-state','--token',self.token,'--plan',str(path)]
+            call = json.loads(command(triage,commit))['call']
+            observation = self.store/'stale-commit.json'
+            observation.write_text(json.dumps(self.drive.perform(call)))
+            command(triage,commit + ['--lock-observation',str(observation)])
+            self.assertIn('Inbox changed since the question', command(triage,['message','--token',self.token,'--plan',str(path)]))
+            triage.approval_event(self.store,plan,'asked')
+            self.send()
+            self.assertEqual(self.drive.files['plan.json'], b'')
+            self.assertEqual(self.drive.files['inbox.json'], b'')
+            self.assertIn(b'approval stale:', self.drive.files['history.log'])
+            return
+        upload = json.loads(issued)
+        if refuse_send:
+            self.assertEqual(upload['call']['operation'], 'read')
+            with self.assertRaisesRegex(ValueError, 'pending or uncertain call'):
+                command(triage, ['send-state', '--token', self.token])
+            self.assertFalse((self.store/'calls.jsonl').exists())
+            return
+        if not replay or 'call' in upload:
+            self.assertIn('call', upload, 'approval must persist before issuing mail')
+            self.assertFalse((self.store/'calls.jsonl').exists())
+            with self.assertRaisesRegex(ValueError, 'upload not confirmed'):
+                command(execute,['next','--token',self.token,'--plan',str(path)])
+            # Approval carries the ordinary send-state lock read and upload protocol.
+            if documented:
+                observation = self.store/'approval-observation.json'
+            observation.write_text(json.dumps(self.drive.perform(upload['call'])))
+            issued = documented_command(0) if documented else command(triage, ['send-state','--token',self.token,'--lock-observation',str(observation)])
+            if failure:
+                with self.assertRaises(ValueError):
+                    command(execute,['next','--token',self.token,'--plan',str(path)])
+            while 'call' in json.loads(issued):
+                call = json.loads(issued)['call']
+                observation.write_text(json.dumps(dict(status='failed') if failure else self.drive.file_call(call)))
+                issued = documented_command(1) if documented else command(triage,['send-state','--token',self.token,'--observation',str(observation)])
+            if failure:
+                with self.assertRaises(ValueError):
+                    command(execute,['next','--token',self.token,'--plan',str(path)])
+                self.assertFalse((self.store/'calls.jsonl').exists())
+                return
+            self.assertEqual(self.drive.files['plan.json'], b'')
+            self.assertEqual(self.drive.files['inbox.json'], b'')
+            self.assertIn(b'approval approved:', self.drive.files['history.log'])
+            issued = documented_command(2) if documented else command(execute,['next','--token',self.token,'--plan',str(path)])
+        self.assertIn('archive',issued)
+        from mock_provider import MockProvider
+        mailbox = MockProvider([m['id'] for m in listing['messages']])
+        for action in plan['actions']:
+            call = json.loads(issued)
+            self.assertEqual(call['id'],action['id'])
+            outcome = mailbox.perform(call)
+            command(execute,['result','--token',self.token,'--plan',str(path),
+                '--observation',json.dumps(dict(outcome=outcome,inbox_ids=mailbox.ids))])
+            if replay:
+                # Simulate a cut-off after the first confirmed mailbox write,
+                # without send-state. Release only the mock lock for the restart.
+                call = self.start('release',self.token)['call']
+                self.observe(self.drive.perform(call),'release',self.token)
+                old = self.store
+                if replay == 'empty':
+                    self.store = old/'restarted'
+                    self.store.mkdir()
+                    for name in ('config.toml','guardrails.md'):
+                        shutil.copyfile(old/name,self.store/name)
+                self.token = self.acquire()
+                self.fetch()
+                self.assertFalse((self.store/'plan.json').exists())
+                reply = self.store/'reply.txt'
+                reply.write_text('proceed')
+                with self.assertRaises(ValueError):
+                    command(triage,['reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),
+                        '--reply',str(reply),'--plan-out',str(self.store/'plan.json'),'--question',plan['run_id']])
+                with self.assertRaises((ValueError, OSError)):
+                    command(execute,['next','--token',self.token,'--plan',str(self.store/'plan.json'),'--approve',plan['run_id']])
+                self.assertEqual(mailbox.ids, ['1','2','3'])
+                return
+            issued = command(execute,['next','--token',self.token,'--plan',str(path)])
+        self.assertTrue(json.loads(issued)['done'])
+        commit = ['commit-state','--token',self.token,'--plan',str(path)]
+        call = json.loads(command(triage,commit))['call']
+        observation = self.store/'commit-read.json'
+        observation.write_text(json.dumps(self.drive.perform(call)))
+        command(triage,commit + ['--lock-observation',str(observation)])
+        message = command(triage,['message','--token',self.token,'--plan',str(path)])
+        self.assertIn('4 handled',message)
+        self.send()
+        self.assertEqual(self.drive.files['plan.json'],b'')
+        self.assertEqual(self.drive.files['inbox.json'],b'')
+        call = self.start('release',self.token)['call']
+        self.observe(self.drive.perform(call),'release',self.token)
+        old = self.store
+        self.store = old/'next-empty-host'
+        self.store.mkdir()
+        for name in ('config.toml','guardrails.md'):
+            shutil.copyfile(old/name,self.store/name)
+        self.token = self.acquire()
+        self.fetch()
+        self.assertFalse((self.store/'plan.json').exists())
+        self.assertFalse((self.store/'inbox.json').exists())
+
     def test_empty_drive_preserves_local_records(self):
         self.configured()
         self.drive.files.clear()
@@ -1694,6 +2052,7 @@ class DriveStateTests(unittest.TestCase):
         self.fetch()
         (self.store / 'rules.toml').write_text('rules=[]\n')
         (self.store / 'never-touch.toml').write_text('allow_empty=true\n')
+        shutil.copyfile(ROOT / 'tests/fixtures/inbox.json', self.store / 'inbox.json')
         listing = execute.read(self.store / 'inbox.json')
         plan = triage.build_plan(listing, [], [], triage.state_config(self.store), {})
         path = self.store / 'plan.json'
@@ -1857,7 +2216,7 @@ class DriveStateTests(unittest.TestCase):
         self.configured()
         result = self.exchange('fetch')
         self.assertTrue(all(c['kind'] == 'gdrive' for c in result['calls']))
-        self.assertEqual(tuple(c['name'] for c in result['calls']), ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json', 'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md', 'rules.toml', 'never-touch.toml', 'tool-paths.json', 'state.json'))
+        self.assertEqual(tuple(c['name'] for c in result['calls']), ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json', 'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md', 'rules.toml', 'never-touch.toml', 'tool-paths.json', 'plan.json', 'inbox.json', 'state.json'))
 
     def test_state_config_refusals(self):
         for value in (None, [], {}, {'kind': 'typo'}, {'kind': 'local', 'account': 'a'},

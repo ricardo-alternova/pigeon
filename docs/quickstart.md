@@ -1,18 +1,18 @@
 # Routine run
 
-Replace /absolute/private-store with PIGEON_HOME and TOKEN with the lock token. Read private config.toml and guardrails.md.
+Replace /absolute/private-store with PIGEON_HOME and TOKEN with the lock token. Read config.toml and guardrails.md.
 
-Stop on any refusal; follow [Run exits](../AGENTS.md#run-exits). Never retry an uncertain call.
+Stop on any refusal; follow [Run exits](../AGENTS.md#run-exits). Never retry uncertain calls.
 
 ## Gateway results
 
-Save the gateway response unchanged as gateway-results.json: a JSON array with one entry per call, in call order. Each entry holds boolean ok and value on success or error on failure:
+Save gateway-results.json unchanged: one JSON array entry per call in call order; boolean ok, value on success or error on failure:
 
 ```json
 [{"ok":true,"value":{"messages":[]}},{"ok":false,"error":{"kind":"CloudFizzle","message":"HTTP 503"}}]
 ```
 
-Use this file for listing, quiet-check, action result and final --results. For message and commit-state, --results names the script-owned results.json instead; never pass gateway results there.
+Gateway --results: listing, quiet-check, execute result/final. Message and commit-state --results use script-owned results.json.
 
 ## Lock and fetch
 
@@ -20,7 +20,7 @@ Use this file for listing, quiet-check, action result and final --results. For m
 PIGEON_HOME=/absolute/private-store python3 scripts/triage.py lock --batch
 ```
 
-A local lock prints the token. A OneDrive lock prints calls; carry them once in order. Use [Drive lock](hosted-setup.md#drive-lock) outcomes. Save batch {"create":OUTCOME,"read":OUTCOME} in lock-observation.json; for a single call save its outcome. Resume until a token:
+Local locks print a token; OneDrive prints calls. Carry once in order using [Drive lock](hosted-setup.md#drive-lock) outcomes. Save batch {"create":OUTCOME,"read":OUTCOME} or the single outcome in lock-observation.json. Resume until a token:
 
 ```bash
 PIGEON_HOME=/absolute/private-store python3 scripts/triage.py lock --batch --observation /absolute/private-store/lock-observation.json
@@ -44,7 +44,7 @@ PIGEON_HOME=/absolute/private-store python3 scripts/triage.py validate
 
 ## Quiet and listing
 
-Omit --scheduled on demand. Without a [schedule] table, every run is full. A provider account has accounts.HANDLE.provider set.
+Omit --scheduled on demand. Without [schedule], all runs are full.
 
 ```bash
 PIGEON_HOME=/absolute/private-store python3 scripts/triage.py quiet-check --token TOKEN --scheduled
@@ -56,9 +56,7 @@ Pass calls unchanged; save gateway-results.json and resume with --results PATH u
 PIGEON_HOME=/absolute/private-store python3 scripts/triage.py quiet-check --token TOKEN --scheduled --results /absolute/private-store/gateway-results.json
 ```
 
-On skip go to Release without commit, message or chat. On full run `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py listing --token TOKEN`. Carry calls unchanged; save gateway-results.json. Resume with `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py listing --token TOKEN --results /absolute/private-store/gateway-results.json` until done writes inbox.json. On account failure follow Account skipped and retry below.
-
-
+On skip go to Release without commit, message or chat. On full: `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py listing --token TOKEN`. Carry calls unchanged; save gateway-results.json. Resume with `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py listing --token TOKEN --results /absolute/private-store/gateway-results.json` until done writes inbox.json. Account failure: Account skipped and retry.
 
 ## Plan and execute
 
@@ -66,32 +64,31 @@ On skip go to Release without commit, message or chat. On full run `PIGEON_HOME=
 PIGEON_HOME=/absolute/private-store python3 scripts/triage.py plan --token TOKEN --scheduled --inbox /absolute/private-store/inbox.json --plan-out /absolute/private-store/plan.json --report-out /absolute/private-store/report.md
 ```
 
-
-Keep inputs fixed. A stopped plan has no actions; continue through Commit and message. On refresh_lock follow Lock refresh below.
+Keep inputs fixed. Stopped plans have no actions. Awaiting approval uses [Approval question](#approval-question). Both continue through Commit and message. On refresh_lock follow Lock refresh.
 
 ```bash
 PIGEON_HOME=/absolute/private-store python3 scripts/execute.py next --token TOKEN --plan /absolute/private-store/plan.json
 ```
 
-For a provider account, pass the calls array unchanged once; for calls without path and input, build each from the [action recipes](hosted-setup.md#gateway-recipes). Save its gateway results unchanged, then report them:
+Pass calls unchanged once. Without path/input use [action recipes](hosted-setup.md#gateway-recipes). Save and report results:
 
 ```bash
 PIGEON_HOME=/absolute/private-store python3 scripts/execute.py result --token TOKEN --plan /absolute/private-store/plan.json --results /absolute/private-store/gateway-results.json
 ```
 
-Repeat next after reporting each batch. Batches hold at most 50 calls per account. For create-draft create once; never send. A draft needs a returned id.
+Report each batch before next (at most 50 calls/account). Create drafts once, with a returned id; never send.
 
-For create-folder, return its results first, read the complete folder listing requested by verify, then confirm the returned ID and full path:
+For create-folder, return results, read verify’s complete folder listing, then confirm the ID and full path:
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/execute.py result --token TOKEN --plan /absolute/private-store/plan.json --observation '{"outcome":"ok","folder_id":"folder-example","folders":[{"id":"folder-example","name":"Reading/2026"}]}'`
 
 Issue dependent moves only after this confirmation. Use saved tool fields; for a missing or unknown path follow Unknown tool path below. If next returns run, execute that argument list once.
 
-Without a provider, carry the single call and its verify reading. Trash goes to Trash, archive leaves Inbox, move uses target, spam goes to Spam/Junk. Return --observation with outcome and in_inbox or complete inbox_ids; for a folder add folder_id. For a draft return outcome and draft_id.
+Without a provider, carry the call and verify reading. Trash goes to Trash, archive leaves Inbox, move uses target, spam goes to Spam/Junk. Return --observation with outcome and in_inbox or complete inbox_ids; for a folder add folder_id. For a draft return outcome and draft_id.
 
 On final_reads run `PIGEON_HOME=/absolute/private-store python3 scripts/execute.py final --token TOKEN --plan /absolute/private-store/plan.json`; carry its ids-only calls and resume with --results /absolute/private-store/gateway-results.json until done. Read each account's whole Inbox once, preserving inbox.json. For manual reads run `PIGEON_HOME=/absolute/private-store python3 scripts/execute.py final --token TOKEN --plan /absolute/private-store/plan.json --inbox /absolute/private-store/final-inbox.json`.
 
-Count a removal only after an ok result and absence in this final reading. Keep a present message unconfirmed. After an interruption, run next; never replay an unreported batch. Finish its final reading and keep its outcomes unknown.
+Count a removal only after an ok result and absence in this final reading. Keep a present message unconfirmed. After interruption, run next without replaying unreported batches; finish final reading with unknown outcomes.
 
 ## Commit and message
 
@@ -113,7 +110,7 @@ Post its output unchanged. Hold the lock. If posting succeeds run `rm -f /absolu
 PIGEON_HOME=/absolute/private-store python3 scripts/triage.py send-state --token TOKEN
 ```
 
-Follow [Drive state](hosted-setup.md#drive-state); warnings first.
+Follow [Drive state](hosted-setup.md#drive-state).
 
 ```bash
 PIGEON_HOME=/absolute/private-store python3 scripts/triage.py release --token TOKEN
@@ -123,17 +120,70 @@ Resume drive release with --observation PATH using [Drive lock](hosted-setup.md#
 
 ## Account skipped and retry
 
-Read counts and failed in listing output. The command retries a failing account once; carry that batch like the first. After its second failure, continue the healthy accounts. If a final reading fails twice, commit-state saves healthy accounts, keeps failed actions not confirmed and clears that account’s position for a full listing next run. The retry batch reads a failed new arrival again. Read provider error (STATUS) as a gateway failure (status only), and pigeon error (WHAT) as the fixed script reason. Never copy provider error messages. Keep skipped accounts out of actions; keep their state, positions and numbers. Compute limits and the brake on handled accounts only.
+Read counts/failed; carry listing’s one retry; continue healthy accounts. After two failed final reads, commit-state saves healthy accounts, marks failed actions not confirmed and clears that account’s position for relisting. Retry failed new arrivals. provider error (STATUS) means gateway failure; pigeon error (WHAT) means script failure. Never copy provider messages. Skipped accounts get no actions and keep state, positions and numbers. Limits/brake count handled accounts only.
 
 Pass --skip ACCOUNT once for each account to skip; later --results calls keep it:
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py listing --token TOKEN --skip ACCOUNT`
 
-Resume with the listing --results command above until done, then plan, execute, commit and message even when every account failed. If planning refuses, render the failure with `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py message --token TOKEN --plan /absolute/private-store/plan.json`; post it while holding the lock, then send-state and release.
+Resume listing --results until done; plan/execute/commit/message even if all accounts failed. If plan refuses, run `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py message --token TOKEN --plan /absolute/private-store/plan.json`; post under lock, then send-state/release.
 
-## Brake refusal
+## Approval question
 
-Read the rule, account, match count, all-folder total and allowed count in the stop reason. Up to 10 matches per rule/account pass the twenty-percent brake; above 10 the allowance is max(10, floor(total / 5)). Keep the stopped plan unchanged and issue no actions. Run next, Commit and message, then Release. Correct the private rules or listing before a fresh run; never bypass a brake.
+On awaiting approval, retain question_id. Commit and message; relay every word, including the last line. Release; end the turn. Never answer for the owner or treat silence as an answer.
+
+On reply, acquire/fetch; save the owner's answer unchanged in reply.txt. RUN_ID is question_id; the owner never types it:
+
+`PIGEON_HOME=/absolute/private-store python3 scripts/triage.py reply --token TOKEN --inbox /absolute/private-store/inbox.json --reply /absolute/private-store/reply.txt --plan-out /absolute/private-store/plan.json --question RUN_ID`
+
+After proceed, run only the printed command. Both hosts read Inbox first. While round appears, carry reads whole; save approval-results.json; resume:
+
+```bash
+PIGEON_HOME=/absolute/private-store python3 scripts/execute.py next --token TOKEN --plan /absolute/private-store/plan.json --approve RUN_ID --results /absolute/private-store/approval-results.json
+```
+
+For approval_reads, read now; save approval-inbox.json (inbox.json shape):
+
+```bash
+PIGEON_HOME=/absolute/private-store python3 scripts/execute.py next --token TOKEN --plan /absolute/private-store/plan.json --approve RUN_ID --inbox /absolute/private-store/approval-inbox.json
+```
+
+Read failure: post refusal; Release; question stays open. Stale: Commit and message; Release. Next run plans and asks again. New mail does not block.
+
+### Without drive state
+
+After reading, carry the action or whole provider batch once. Single call: report its observation (Plan and execute), then next. Batch: save gateway-results.json and run:
+
+```bash
+PIGEON_HOME=/absolute/private-store python3 scripts/execute.py result --token TOKEN --plan /absolute/private-store/plan.json --results /absolute/private-store/gateway-results.json
+PIGEON_HOME=/absolute/private-store python3 scripts/execute.py next --token TOKEN --plan /absolute/private-store/plan.json
+```
+
+Continue Plan and execute.
+
+### With drive state
+
+After reading: a lock read. Carry; save approval-observation.json:
+
+```bash
+PIGEON_HOME=/absolute/private-store python3 scripts/triage.py send-state --token TOKEN --lock-observation /absolute/private-store/approval-observation.json
+```
+
+Upload; save outcomes there; repeat until done without failures:
+
+```bash
+PIGEON_HOME=/absolute/private-store python3 scripts/triage.py send-state --token TOKEN --observation /absolute/private-store/approval-observation.json
+```
+
+Upload failure: Release and replan. Otherwise:
+
+```bash
+PIGEON_HOME=/absolute/private-store python3 scripts/execute.py next --token TOKEN --plan /absolute/private-store/plan.json
+```
+
+Carry the action or whole batch; follow Plan and execute.
+
+Both: Commit and message; Release. Skip: post unchanged-mail line; Release without commit/message. Other refusal: post; Release. If replaced, relay the newest question. Approval lasts approval_hours from the question, once, for named thresholds. Waiting clears positions.
 
 ## Outside change stop
 
@@ -141,29 +191,29 @@ When next or result reports stopped or final_reads after a message leaves Inbox 
 
 ## Lock refresh
 
-On refresh_lock, complete `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py lock --refresh --token TOKEN` before continuing. For a drive lock, carry each returned call once and resume with `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py lock --refresh --token TOKEN --observation /absolute/private-store/lock-observation.json`. Stop on expired token, failed observation or competing acquisition. Never delete a lock to bypass its holder.
+On refresh_lock, complete `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py lock --refresh --token TOKEN` before continuing. For a drive lock, carry each returned call once and resume with `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py lock --refresh --token TOKEN --observation /absolute/private-store/lock-observation.json`. Stop on expiry, failed observation or competing acquisition; never delete a lock to bypass its holder.
 
 ## Unknown tool path
 
-Use an issued tool field without searching. If absent, search and describe the account's tool for that operation. If a listing tool is unknown, let listing retry and skip that account with provider error (CODE); continue the healthy accounts. For an unknown action tool, search once and save the replacement under the held lock:
+Use tool; if absent, search/describe the account’s operation. Unknown listing tool: let listing retry/skip with provider error (CODE); continue healthy accounts. Unknown action tool: search once and save under lock:
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py tool-save --token TOKEN --account ACCOUNT --kind move --tool 'tools["cedar-mail"].gmail.users.messages.modify'`
 
-Replace ACCOUNT, kind and tool with the configured account, issued operation and discovered path. Continue the issued operation only when it was not executed; never repeat an uncertain action. Keep paths under the account's executor_app, at most 200 characters. Use the provider's allowed tool for that kind; never use a segment containing send or delete, or reply/forward outside create-draft. Keep tool-paths.json script-owned.
+Replace ACCOUNT/kind/tool with account/operation/discovered path. Continue only if unexecuted; never repeat an uncertain action. Paths: 200 characters max under executor_app; provider's allowed tool for kind. No segment containing send/delete or reply/forward outside create-draft. Keep tool-paths.json script-owned.
 
 ## Numbered reply
 
-Acquire a new lock and fetch and validate, then get a fresh listing as above, without quiet-check or a position read. Omit --scheduled. Keep saved positions unchanged. Save the user's text verbatim in reply.txt. Accept number plus trash, archive, spam, move to an existing folder path, leave, yes or no; separate parts with commas, semicolons or line breaks. Never create a folder for a reply.
+Acquire, fetch, validate and list afresh; omit quiet-check, position reads and --scheduled. Keep positions unchanged. Save the user's text verbatim in reply.txt. Accept number plus trash, archive, spam, move to an existing folder path, leave, yes or no; separate with commas, semicolons or line breaks. Never create reply folders.
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py reply --token TOKEN --inbox /absolute/private-store/inbox.json --reply /absolute/private-store/reply.txt --plan-out /absolute/private-store/plan.json --report-out /absolute/private-store/report.md`
 
-Continue next, result, final, Commit and message, Release. Retain the printed numbers, account, sender and subject with the outcomes. On refusal execute nothing; post the refusal and ask for a supported reply. Never reuse a retired number or act on an unlisted account. Keep rule edits separate and follow [Writing a rule](../AGENTS.md#writing-a-rule).
+Continue next/result/final, Commit and message, Release. Retain numbers, account, sender, subject and outcomes. Post refusals and ask for a supported reply. Never reuse retired numbers or act on unlisted accounts. Keep rule edits separate and follow [Writing a rule](../AGENTS.md#writing-a-rule).
 
 ## Dry run
 
 Acquire and fetch as above. Add --dry-run to quiet-check; save responses in /absolute/private-store/.dry-run (create it with mode 700). Pass --progress RESPONSE_FILE with --results RESULTS_FILE until decision and positions print. On skip end the rehearsal and release; on full list as above. The quiet check saves nothing.
 
-Add --dry-run to plan; omit --report-out: a dry run writes no report. After planning, resave the dry quiet decision in .dry-run for --positions. Render with message --token TOKEN --plan PLAN as above. To simulate actions, run `PIGEON_HOME=/absolute/private-store python3 scripts/execute.py dry-run --plan /absolute/private-store/plan.json`; add --fail N to fail the Nth planned action, counting from 1; add --positions PATH for the dry quiet decision. Read simulated_calls (SIMULATION_ONLY), simulated_results and commit_preview counts/positions. Pass none of this output to the gateway or a real run. Deliver/release; skip commit-state/send-state. Replies do nothing.
+Add --dry-run to plan with --plan-out /absolute/private-store/rehearsal.json; omit --report-out. After planning, resave the dry quiet decision in .dry-run for --positions. Render with message --token TOKEN --plan PLAN as above. To simulate actions, run `PIGEON_HOME=/absolute/private-store python3 scripts/execute.py dry-run --plan /absolute/private-store/rehearsal.json`; add --fail N to fail the Nth planned action, counting from 1; add --positions PATH for the dry quiet decision. For an awaiting dry plan, use the printed question_id as RUN_ID with --approve RUN_ID on the disposable copy. Read simulated_calls (SIMULATION_ONLY), simulated_results and commit_preview counts/positions. Pass none of this output to the gateway or a real run. Deliver/release; skip commit-state/send-state. Replies do nothing.
 
 ## Quiet observations
 
@@ -177,4 +227,4 @@ Read history position/Inbox arrivals or ten newest ordered IDs; use error/expire
 
 ## Reference
 
-First installation, config, drive and Gateway recipes: [Hosted setup](hosted-setup.md). For rules, drafts, calendar and Unsubscribe use [Advanced setup](setup.md); for tables use [Converter](setup.md#convert-a-rules-table).
+First installation, config, drive, Gateway recipes: [Hosted setup](hosted-setup.md). Rules/drafts/calendar/Unsubscribe: [Advanced setup](setup.md); for tables use [Converter](setup.md#convert-a-rules-table).

@@ -6,7 +6,7 @@ Follow guardrails.md in the private store.
 
 ## Run exits
 
-Choose one exit when directed below. Once an exit is selected, make no further mailbox changes. A stopped plan (nonempty reasons, exit 0) uses Finish. An outside-change response with status=stopped uses Finish. An execution halt has done=true and `stop`; a refusal exits nonzero with Refused:. On final_reads complete the final reading before Finish.
+Choose one exit when directed below. Once an exit is selected, make no further mailbox changes. A stopped plan (no actions, exit 0) uses Finish. A plan awaiting approval also uses Finish; follow [Approval question](docs/quickstart.md#approval-question). An outside-change response with status=stopped uses Finish. An execution halt has done=true and `stop`; a refusal exits nonzero with Refused:. On final_reads complete the final reading before Finish.
 
 | Exit | Commit | Send saved files | Release | Owner chat |
 | --- | --- | --- | --- | --- |
@@ -25,8 +25,8 @@ Follow [the routine sequence](docs/quickstart.md). For exceptions use these numb
 1. Resolve the [private store](docs/hosted-setup.md#private-store).
 2. Complete lock and fetch using [Drive lock](docs/hosted-setup.md#drive-lock) and [Drive state](docs/hosted-setup.md#drive-state).
 3. Use the [gateway recipes](docs/hosted-setup.md#gateway-recipes) and [listing format](docs/hosted-setup.md#inbox-listing). On quiet-check refusal use Halt held, or No lock on ownership failure.
-4. On planning refusal keep its Refused: line and check ownership. Nonempty plan reasons with exit 0 are a stopped plan: use Finish.
-5. Interpret [step-machine responses](docs/setup.md#step-machine-responses). If a gateway cannot perform the issued operation exactly, return error. For create-folder never create missing parents. For an observation refusal, re-read Inbox and resubmit a corrected observation once without repeating the action. On status=stopped use Finish. On other stop use No lock. On other refusals use Halt held if ownership is valid. For uncertain creation check whether the folder exists before creating it by hand; for other uncertain calls ask the owner to check the Inbox. Disclose an unissued action while held:
+4. On planning refusal keep its Refused: line and check ownership. With exit 0, run next once; stopped and awaiting approval responses use Finish.
+5. Interpret [step-machine responses](docs/setup.md#step-machine-responses). If a gateway cannot perform the issued operation exactly, return error. For create-folder never create missing parents. For an observation refusal, re-read Inbox and resubmit a corrected observation once without repeating the action. On status=stopped or status=awaiting approval use Finish. On other stop use No lock. On other refusals use Halt held if ownership is valid. For uncertain creation check whether the folder exists before creating it by hand; for other uncertain calls ask the owner to check the Inbox. Disclose an unissued action while held:
    ```bash
    PIGEON_HOME=/absolute/private-store python3 scripts/execute.py observed --token TOKEN --account cedar --id item-a --verb extra
    ```

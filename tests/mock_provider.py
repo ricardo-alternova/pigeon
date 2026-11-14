@@ -148,6 +148,7 @@ def save_plan(store, token, path, plan):
                          '--plan-out', str(output), '--dry-run'])
         generated = execute.read(output)
         plan['run_token'] = generated['run_token']
+        plan.setdefault('run_id', generated['run_id'])
         execute.atomic(path, plan)
     finally:
         output.unlink(missing_ok=True)

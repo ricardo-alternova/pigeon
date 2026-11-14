@@ -30,6 +30,897 @@ class ExecuteTests(unittest.TestCase):
         save_plan(self.store, self.token, self.path, self.plan)
 
 
+    def awaiting(self):
+        execute.atomic(self.store/'state.json', {})
+        (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
+        (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n')
+        planned = self.plan_cli()
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        return execute.read(self.path)
+
+    def approve_cli(self, run):
+        result = self.run_cli('execute.py', 'next', '--token', self.token,
+                              '--plan', str(self.path), '--approve', run)
+        if result.returncode == 0 and 'approval_reads' in json.loads(result.stdout):
+            fresh = self.store/'fresh-approval.json'
+            execute.atomic(fresh, self.listing)
+            result = self.run_cli('execute.py', 'next', '--token', self.token,
+                                  '--plan', str(self.path), '--approve', run, '--inbox', str(fresh))
+        return result
+
+    def test_approval_requires_fresh_inbox_before_first_action(self):
+        plan = self.awaiting()
+        result = self.run_cli('execute.py', 'next', '--token', self.token,
+                              '--plan', str(self.path), '--approve', plan['run_id'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('approval_reads', json.loads(result.stdout))
+        self.assertEqual(execute.read(self.path)['approval_state'], 'awaiting approval')
+        self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_approval_fresh_reading_stale_failure_and_arrival(self):
+        for kind in ('stale', 'stale-es', 'failure', 'arrival'):
+            with self.subTest(kind=kind):
+                self.setUp()
+                plan = self.awaiting()
+                args = ('next', '--token', self.token, '--plan', str(self.path), '--approve', plan['run_id'])
+                self.assertEqual(self.run_cli('execute.py', *args).returncode, 0)
+                fresh = json.loads(json.dumps(self.listing))
+                if kind.startswith('stale'): fresh['messages'].pop(1)
+                if kind == 'stale-es':
+                    config = self.store/'config.toml'
+                    config.write_text('language="es"\n' + config.read_text())
+                if kind == 'failure': fresh['skipped'] = {'cedar': 'provider error (503)'}; fresh['accounts'] = {}; fresh['messages'] = []
+                if kind == 'arrival': fresh['messages'].append(dict(fresh['messages'][0], id='new'))
+                path = self.store/'fresh.json'
+                execute.atomic(path, fresh)
+                answer = self.run_cli('execute.py', *args, '--inbox', str(path))
+                history = (self.store/'history.log').read_text()
+                if kind == 'failure':
+                    self.assertNotEqual(answer.returncode, 0)
+                    self.assertFalse(triage.question_closed(self.store, plan))
+                    self.assertEqual(self.approve_cli(plan['run_id']).returncode, 0)
+                elif kind.startswith('stale'):
+                    self.assertEqual(json.loads(answer.stdout)['status'], 'stale', answer.stderr)
+                    self.assertTrue(triage.question_closed(self.store, plan))
+                    self.assertFalse((self.store/'calls.jsonl').exists())
+                    self.assertNotIn('approval approved:', history)
+                    committed = self.run_cli('triage.py', 'commit-state', '--token', self.token, '--plan', str(self.path))
+                    self.assertEqual(committed.returncode, 0, committed.stderr)
+                    message = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path))
+                    self.assertIn('bandeja de entrada cambió' if kind == 'stale-es' else 'Inbox changed since the question', message.stdout)
+                    self.assertNotIn('Still in Inbox', message.stdout)
+                    self.assertNotIn('a@example.net', message.stdout)
+                    self.assertNotIn('cedar: 100', message.stdout)
+                    self.assertFalse(any(r['status'] == 'executed' for r in execute.read(self.store/'results.json')['results']))
+                    triage.approval_event(self.store, plan, 'asked')
+                    self.assertTrue(triage.question_closed(self.store, plan))
+                    self.assertNotEqual(self.approve_cli(plan['run_id']).returncode, 0)
+                    self.assertEqual(self.plan_cli().returncode, 0)
+                    self.assertNotEqual(execute.read(self.path)['run_id'], plan['run_id'])
+                else:
+                    self.assertEqual(answer.returncode, 0, answer.stderr)
+                    self.assertEqual(json.loads(answer.stdout)['id'], '0')
+
+    def test_scripted_approval_reads_error_stale_and_new_mail(self):
+        for kind in ('stale', 'new', 'error', 'embedded', 'foreign'):
+            with self.subTest(kind=kind):
+                self.setUp()
+                plan = self.awaiting()
+                config = self.store/'config.toml'
+                config.write_text(config.read_text() + 'provider="gmail"\nexecutor_app="cedar-mail"\nexecutor_account="cedar-example"\n')
+                # Rebuild with the actual provider config before asking.
+                self.assertEqual(self.plan_cli().returncode, 0)
+                plan = execute.read(self.path)
+                args = ('next', '--token', self.token, '--plan', str(self.path), '--approve', plan['run_id'])
+                first = self.run_cli('execute.py', *args)
+                self.assertEqual(first.returncode, 0, first.stderr)
+                calls = json.loads(first.stdout)['calls']
+                self.assertEqual(len(calls), 1)
+                self.assertTrue(calls[0]['path'].endswith('messages.list'))
+                self.assertFalse((self.store/'calls.jsonl').exists())
+                self.assertFalse(triage.question_closed(self.store, plan))
+                ids = [m['id'] for m in self.listing['messages']]
+                if kind == 'stale': ids.remove('1')
+                if kind == 'new': ids.append('new')
+                value = dict(messages=[dict(id=i) for i in ids])
+                entry = dict(ok=True, value=value)
+                if kind == 'error': entry = dict(ok=False, error=dict(code=503))
+                if kind == 'embedded': entry = dict(ok=True, value=dict(error=dict(code=503)))
+                result_path = self.store/'approval-results.json'
+                execute.atomic(result_path, [entry])
+                if kind == 'foreign':
+                    triage.release(self.store, self.token)
+                    self.token = triage.acquire(self.store)
+                    args = ('next', '--token', self.token, '--plan', str(self.path), '--approve', plan['run_id'])
+                if kind == 'new':
+                    os.utime(result_path, (1, 1))
+                    old = self.run_cli('execute.py', *args, '--results', str(result_path))
+                    self.assertNotEqual(old.returncode, 0)
+                    self.assertFalse(triage.question_closed(self.store, plan))
+                    execute.atomic(result_path, [entry])
+                result = self.run_cli('execute.py', *args, '--results', str(result_path))
+                if kind in ('error', 'embedded'):
+                    self.assertIn('calls', json.loads(result.stdout))  # one retry
+                    execute.atomic(result_path, [entry])
+                    result = self.run_cli('execute.py', *args, '--results', str(result_path))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(triage.question_closed(self.store, plan))
+                    self.assertFalse((self.store/'calls.jsonl').exists())
+                elif kind == 'foreign':
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(triage.question_closed(self.store, plan))
+                elif kind == 'stale':
+                    self.assertEqual(json.loads(result.stdout)['status'], 'stale', result.stderr)
+                    self.assertFalse((self.store/'calls.jsonl').exists())
+                    self.assertTrue(triage.question_closed(self.store, plan))
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(len(json.loads(result.stdout)['calls']), 4)
+                    replay = self.run_cli('execute.py', *args, '--results', str(result_path))
+                    self.assertNotEqual(replay.returncode, 0)
+
+    def test_empty_approval_reading_keeps_question_open(self):
+        for provider in ('gmail', 'outlook', None):
+            for omitted in (False, True):
+                with self.subTest(provider=provider, omitted=omitted):
+                    self.setUp()
+                    plan = self.awaiting()
+                    if provider:
+                        config = self.store/'config.toml'
+                        config.write_text(config.read_text() + f'provider="{provider}"\nexecutor_app="cedar-mail"\nexecutor_account="cedar-example"\n')
+                        self.assertEqual(self.plan_cli().returncode, 0)
+                        plan = execute.read(self.path)
+                    args = ('next', '--token', self.token, '--plan', str(self.path), '--approve', plan['run_id'])
+                    first = self.run_cli('execute.py', *args)
+                    self.assertEqual(first.returncode, 0, first.stderr)
+                    path = self.store/'empty.json'
+                    if provider:
+                        value = {} if omitted else {('messages' if provider == 'gmail' else 'value'): []}
+                        execute.atomic(path, [dict(ok=True, value=value)])
+                        answer = self.run_cli('execute.py', *args, '--results', str(path))
+                    else:
+                        execute.atomic(path, dict(accounts={'cedar': 0}, messages=[], folders={}))
+                        answer = self.run_cli('execute.py', *args, '--inbox', str(path))
+                    self.assertNotEqual(answer.returncode, 0, answer.stdout)
+                    self.assertFalse(triage.question_closed(self.store, plan))
+                    self.assertFalse((self.store/'calls.jsonl').exists())
+                    self.assertEqual(execute.read(self.path)['approval_state'], 'awaiting approval')
+
+    def test_approval_reading_survives_lock_refresh(self):
+        self.awaiting()
+        config = self.store/'config.toml'
+        config.write_text(config.read_text() + 'provider="gmail"\nexecutor_app="cedar-mail"\nexecutor_account="cedar-example"\n')
+        self.assertEqual(self.plan_cli().returncode, 0)
+        plan = execute.read(self.path)
+        args = ('next', '--token', self.token, '--plan', str(self.path), '--approve', plan['run_id'])
+        self.assertEqual(self.run_cli('execute.py', *args).returncode, 0)
+        refresh = self.run_cli('triage.py', 'lock', '--token', self.token, '--refresh')
+        self.assertEqual(refresh.returncode, 0, refresh.stderr)
+        path = self.store/'fresh.json'
+        execute.atomic(path, [dict(ok=True, value=dict(messages=[dict(id=m['id']) for m in self.listing['messages']]))])
+        answer = self.run_cli('execute.py', *args, '--results', str(path))
+        self.assertEqual(answer.returncode, 0, answer.stderr)
+        self.assertEqual(len(json.loads(answer.stdout)['calls']), 4)
+
+    def test_hand_approval_reading_predating_request_or_foreign_lock_refused(self):
+        for foreign in (False, True):
+            with self.subTest(foreign=foreign):
+                self.setUp()
+                plan = self.awaiting()
+                path = self.store/'fresh.json'
+                execute.atomic(path, self.listing)
+                os.utime(path, (1, 1))
+                args = ('next', '--token', self.token, '--plan', str(self.path), '--approve', plan['run_id'])
+                self.assertEqual(self.run_cli('execute.py', *args).returncode, 0)
+                if foreign:
+                    triage.release(self.store, self.token)
+                    self.token = triage.acquire(self.store)
+                    execute.atomic(path, self.listing)
+                    args = ('next', '--token', self.token, '--plan', str(self.path), '--approve', plan['run_id'])
+                answer = self.run_cli('execute.py', *args, '--inbox', str(path))
+                self.assertNotEqual(answer.returncode, 0, answer.stdout)
+                self.assertFalse(triage.question_closed(self.store, plan))
+                self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_second_account_alone_missing_message_closes_question(self):
+        self.awaiting()
+        config = self.store/'config.toml'
+        config.write_text(config.read_text() + '[accounts.marble]\n')
+        self.listing['accounts']['marble'] = 2
+        self.listing['folders']['marble'] = []
+        self.listing['messages'] += [dict(account='marble', id=i, folder='Inbox', sender='b@example.net', subject='other') for i in ('m0', 'm1')]
+        rules = self.store/'rules.toml'
+        rules.write_text(rules.read_text() + '[[rules]]\nid="m"\naccounts=["marble"]\nsubject="other"\naction="archive"\n')
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        plan = execute.read(self.path)
+        args = ('next', '--token', self.token, '--plan', str(self.path), '--approve', plan['run_id'])
+        self.assertEqual(self.run_cli('execute.py', *args).returncode, 0)
+        fresh = dict(self.listing, messages=[m for m in self.listing['messages'] if m['id'] != 'm1'])
+        path = self.store/'fresh.json'
+        execute.atomic(path, fresh)
+        answer = self.run_cli('execute.py', *args, '--inbox', str(path))
+        self.assertEqual(answer.returncode, 0, answer.stderr)
+        self.assertEqual(json.loads(answer.stdout)['status'], 'stale')
+        self.assertTrue(triage.question_closed(self.store, plan))
+        self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_approval_read_options_require_approve(self):
+        for flag in ('--results', '--inbox'):
+            result = self.run_cli('execute.py', 'next', '--token', self.token,
+                                  '--plan', str(self.path), flag, str(self.store/'inbox.json'))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_audit_owner_files_message_before_proceed(self):
+        import shlex
+        self.awaiting()
+        (self.store/'config.toml').write_text('inbox_limit=2\n[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar-mail"\nexecutor_account="cedar-example"\n')
+        (self.store/'rules.toml').write_text('[[rules]]\nid="t"\naccounts=["cedar"]\nsubject="trash"\naction="trash"\nexclusions=[]\n')
+        self.listing['accounts']['cedar'] = 4
+        for m in self.listing['messages']: m['subject'] = 'trash'
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        plan = execute.read(self.path)
+        self.run_cli('execute.py','next','--token',self.token,'--plan',str(self.path))
+        ended = self.run_cli('triage.py','commit-state','--token',self.token,'--plan',str(self.path))
+        self.assertEqual(ended.returncode, 0, ended.stderr)
+        triage.release(self.store,self.token)
+        mailbox = MockProvider(['0','2','3'])  # owner filed message 1
+        self.token = triage.acquire(self.store)
+        reply = self.store/'reply.txt'
+        reply.write_text('proceed')
+        answer = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),
+                              '--reply',str(reply),'--plan-out',str(self.path),'--question',plan['run_id'])
+        self.assertEqual(answer.returncode, 0, answer.stderr)
+        command = shlex.split(answer.stdout)
+        first = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(json.loads(first.stdout)['calls']), 1)
+        self.assertTrue(json.loads(first.stdout)['calls'][0]['path'].endswith('messages.list'))
+        response = self.store/'fresh-results.json'
+        execute.atomic(response, [dict(ok=True,value=dict(messages=[dict(id=i) for i in mailbox.ids]))])
+        finished = subprocess.run(command + ['--results',str(response)], capture_output=True,text=True)
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertEqual(json.loads(finished.stdout)['status'], 'stale')
+        self.assertEqual(mailbox.calls, [])
+        self.assertEqual(mailbox.ids, ['0','2','3'])
+        self.assertFalse((self.store/'calls.jsonl').exists())
+        self.assertEqual(execute.read(self.store/'results.json')['results'], [])
+
+    def test_threshold_plan_cannot_bypass_approval_by_editing_saved_fields(self):
+        plan = self.awaiting()
+        candidates = [dict(plan, reasons=[], approval_state=state)
+                      for state in ('awaiting approval', 'Approved', None)]
+        candidates.append(dict(plan, reasons=[], approval_state='approved',
+                               approved_thresholds=plan['reasons']))
+        for candidate in candidates:
+            with self.subTest(state=candidate.get('approval_state')):
+                execute.atomic(self.path, candidate)
+                result = self.run_cli('execute.py', 'next', '--token', self.token,
+                                      '--plan', str(self.path))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertFalse((self.store/'calls.jsonl').exists())
+                with self.assertRaisesRegex(ValueError, 'approval:'):
+                    triage.commit_state(self.store, self.token, self.path)
+
+    def test_approved_plan_replay_under_later_lock_refused(self):
+        plan = self.awaiting()
+        result = self.approve_cli(plan['run_id'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        old = execute.read(self.path)
+        triage.release(self.store, self.token)
+        self.token = triage.acquire(self.store)
+        # First try the stolen approval without a later question, then the
+        # verifier's exact replay after run B asks its own question.
+        for later_question in (False, True):
+            with self.subTest(later_question=later_question):
+                triage.release(self.store, self.token)
+                self.token = triage.acquire(self.store)
+                if later_question:
+                    self.assertEqual(self.plan_cli().returncode, 0)
+                execute.atomic(self.path, dict(old, run_token=self.token))
+                before = (self.store/'calls.jsonl').read_bytes()
+                result = self.run_cli('execute.py', 'next', '--token', self.token,
+                                      '--plan', str(self.path))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn('approval:', result.stderr)
+                self.assertEqual((self.store/'calls.jsonl').read_bytes(), before)
+                with self.assertRaisesRegex(ValueError, 'approval:'):
+                    triage.commit_state(self.store, self.token, self.path)
+
+    def test_approved_plan_replay_after_later_question_same_lock_refused(self):
+        plan = self.awaiting()
+        self.assertEqual(self.approve_cli(plan['run_id']).returncode, 0)
+        approved = execute.read(self.path)
+        # Leave no pending result so the latest-question guard is decisive.
+        checkpoint = self.store / ('execution-' + execute.hashlib.sha256(self.token.encode()).hexdigest() + '.json')
+        checkpoint.unlink()
+        self.assertEqual(self.plan_cli().returncode, 0)
+        execute.atomic(self.path, approved)
+        before = (self.store/'calls.jsonl').read_bytes()
+        result = self.run_cli('execute.py','next','--token',self.token,'--plan',str(self.path))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('no recorded approval',result.stderr)
+        self.assertEqual((self.store/'calls.jsonl').read_bytes(), before)
+
+    def age_question(self, plan, age):
+        path = self.store/'history.log'
+        marker = ' approval asked: ' + plan['run_id']
+        stamp = datetime.fromtimestamp(triage.time.time()-age, timezone.utc).isoformat()
+        path.write_text(''.join((stamp + marker if line.endswith(marker) else line) + '\n'
+                               for line in path.read_text().splitlines()))
+
+    def test_editing_plan_time_cannot_revive_expired_question(self):
+        plan = self.awaiting()
+        self.age_question(plan, 13*3600)
+        execute.atomic(self.path, dict(plan, approval_created=triage.time.time()))
+        result = self.approve_cli(plan['run_id'])
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('expired', result.stderr)
+        self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_duplicate_question_cannot_reset_age(self):
+        plan = self.awaiting()
+        history = self.store/'history.log'
+        fresh = history.read_text()
+        self.age_question(plan, 13*3600)
+        old = history.read_text()
+        for text in (old + fresh, fresh + old):
+            history.write_text(text)
+            result = self.approve_cli(plan['run_id'])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn('expired', result.stderr)
+            self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_closed_question_cannot_reopen_by_duplicate(self):
+        for kind in ('approved', 'skipped', 'expired', 'replaced'):
+            with self.subTest(kind=kind):
+                self.setUp()
+                plan = self.awaiting()
+                triage.approval_event(self.store, plan, kind)
+                triage.approval_event(self.store, plan, 'asked')
+                reply = self.store/'reply.txt'
+                reply.write_text('proceed')
+                result = self.run_cli('triage.py','reply','--token',self.token,
+                    '--inbox',str(self.store/'inbox.json'),'--reply',str(reply),
+                    '--plan-out',str(self.path),'--question',plan['run_id'])
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertNotIn('--approve', result.stdout)
+                message = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path))
+                self.assertNotIn('Reply "proceed"', message.stdout)
+                self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_used_approval_is_not_reported_as_replaced(self):
+        plan = self.awaiting()
+        self.assertEqual(self.approve_cli(plan['run_id']).returncode, 0)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        history = (self.store/'history.log').read_text()
+        self.assertNotIn('approval replaced: ' + plan['run_id'], history)
+
+    def test_threshold_question_agreement_table(self):
+        labels = {
+            'en': {'destructive':('destructive action','destructive actions'),
+                   'rule':('action for rule r','actions for rule r'),
+                   'draft':('draft','drafts'), 'unsubscribe':('unsubscribe','unsubscribes')},
+            'es': {'destructive':('acción destructiva','acciones destructivas'),
+                   'rule':('acción de la regla r','acciones de la regla r'),
+                   'draft':('borrador','borradores'), 'unsubscribe':('baja','bajas')}}
+        for language in ('en','es'):
+            for kind in ('inbox','brake','destructive','rule','draft','unsubscribe'):
+                for count in (1,3):
+                    with self.subTest(language=language,kind=kind,count=count):
+                        plan = dict(actions=[],counts={'cedar':count},account_names={'cedar':'Cedar'},
+                            approval_thresholds=[dict(kind=kind,count=count,limit=0,rule='r',account='cedar')])
+                        text = triage.approval_question(plan,language)
+                        if kind == 'inbox':
+                            expected = (f'{count} message' + ('s' if count != 1 else '') + ' in Inbox ' + ('is' if count == 1 else 'are')) if language == 'en' else (f'{count} mensaje' + ('s' if count != 1 else '') + ' en Recibidos ' + ('supera' if count == 1 else 'superan'))
+                        elif kind == 'brake':
+                            expected = f'{count} ' + (('match' if count == 1 else 'matches') if language == 'en' else ('coincidencia' if count == 1 else 'coincidencias'))
+                        else:
+                            expected = f'{count} ' + labels[language][kind][count != 1] + ' ' + (('exceeds' if count == 1 else 'exceed') if language == 'en' else ('supera' if count == 1 else 'superan')) + ' '
+                        self.assertIn(expected,text)
+
+    def test_approval_clock_set_back_refused(self):
+        plan = self.awaiting()
+        self.age_question(plan, -3600)
+        result = self.approve_cli(plan['run_id'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('expired', result.stderr)
+
+    def test_approved_thresholds_changed_refused(self):
+        plan = self.awaiting()
+        triage.approve_plan(self.store, self.token, self.path, plan['run_id'], reading=self.listing)
+        saved = execute.read(self.path)
+        saved['approved_thresholds'] = ['changed']
+        execute.atomic(self.path, saved)
+        result = self.run_cli('execute.py', 'next', '--token', self.token,
+                              '--plan', str(self.path))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('thresholds changed', result.stderr)
+
+    def test_approval_reply_question_binding_and_normalization(self):
+        for text in (' proceed\n', 'Proceed.', 'PROCEDER!', 'omitir ', 'SKIP!'):
+            with self.subTest(text=text):
+                self.setUp()
+                plan = self.awaiting()
+                reply = self.store/'reply.txt'
+                reply.write_text(text)
+                result = self.run_cli('triage.py', 'reply', '--token', self.token,
+                    '--inbox', str(self.store/'inbox.json'), '--reply', str(reply),
+                    '--plan-out', str(self.path), '--question', plan['run_id'])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('--approve' if text.strip().rstrip('.!').casefold() in ('proceed','proceder') else 'Nothing changes.', result.stdout)
+
+    def test_approval_refused_replies_preserve_waiting_plan(self):
+        plan = self.awaiting()
+        for text, question in [('proceed','old-question'), ('proceed',None),
+                               ('proceed please', plan['run_id']), ('1 archive', plan['run_id']),
+                               ('proceed skip',plan['run_id']),
+                               ('proceed' + ' '*triage.REPLY_LIMIT + 'skip', plan['run_id'])]:
+            with self.subTest(text=text,question=question):
+                reply = self.store/'reply.txt'
+                reply.write_text(text)
+                before = self.path.read_bytes()
+                history = (self.store/'history.log').read_bytes()
+                args = ['--question',question] if question else []
+                result = self.run_cli('triage.py', 'reply', '--token', self.token,
+                    '--inbox', str(self.store/'inbox.json'), '--reply', str(reply),
+                    '--plan-out', str(self.path), *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual((self.store/'history.log').read_bytes(), history)
+                self.assertIn('question' if text == 'proceed' else 'proceed',result.stderr)
+
+    def test_approval_reply_checks_expiry_and_message(self):
+        plan = self.awaiting()
+        self.age_question(plan, 13*3600)
+        triage.release(self.store, self.token)
+        self.token = triage.acquire(self.store)
+        reply = self.store/'reply.txt'
+        reply.write_text('proceed')
+        result = self.run_cli('triage.py', 'reply', '--token', self.token,
+            '--inbox', str(self.store/'inbox.json'), '--reply', str(reply),
+            '--plan-out', str(self.path), '--question',plan['run_id'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('--approve',result.stdout)
+        self.assertIn('expired', result.stderr)
+        message = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path))
+        self.assertIn('expired',message.stdout)
+        self.assertNotIn('nothing needs you',message.stdout)
+        self.assertNotIn('awaiting approval',message.stdout)
+
+    def test_awaiting_message_omits_numbered_invitation_and_exposes_question_id(self):
+        plan = self.awaiting()
+        message = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path))
+        self.assertNotIn('Reply with a number',message.stdout)
+        result = self.run_cli('execute.py','next','--token',self.token,'--plan',str(self.path))
+        self.assertEqual(json.loads(result.stdout)['question_id'],plan['run_id'])
+
+    def test_rehearsal_preserves_real_approval_plan(self):
+        for state in ('awaiting approval','approved'):
+            with self.subTest(state=state):
+                self.setUp()
+                plan = self.awaiting()
+                if state == 'approved':
+                    triage.approve_plan(self.store,self.token,self.path,plan['run_id'], reading=self.listing)
+                before = self.path.read_bytes()
+                dry = self.plan_cli('--dry-run')
+                self.assertNotEqual(dry.returncode,0)
+                self.assertIn('real approval plan',dry.stderr)
+                self.assertEqual(self.path.read_bytes(),before)
+                simulation = self.run_cli('execute.py','dry-run','--plan',str(self.path))
+                self.assertNotEqual(simulation.returncode,0)
+                self.assertIn('real approval plan',simulation.stderr)
+                self.assertEqual(self.path.read_bytes(),before)
+
+    def test_rehearsal_question_id_count_and_no_reply_invitation(self):
+        self.awaiting()
+        self.listing['messages'][-1]['subject'] = 'Owner Fixture'
+        execute.atomic(self.store/'inbox.json',self.listing)
+        self.assertEqual(self.plan_cli().returncode,0)
+        real = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path))
+        self.path = self.store/'rehearsal.json'
+        dry = self.plan_cli('--dry-run')
+        self.assertEqual(dry.returncode,0,dry.stderr)
+        plan = execute.read(self.path)
+        self.assertIn('question_id: '+plan['run_id'],dry.stdout)
+        message = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path))
+        self.assertIn('1 needs you',real.stdout.splitlines()[0])
+        self.assertIn('1 needs you',message.stdout.splitlines()[0])
+        self.assertNotIn('Reply "proceed"',message.stdout)
+        self.assertIn('A real run would ask:',message.stdout)
+
+    def test_threshold_question_uses_account_inbox_count_and_singulars(self):
+        plan = dict(actions=[dict(action='archive')],counts={'cedar':20},
+                    account_names={'cedar':'Cedar'},approval_thresholds=[
+                        dict(kind='brake',account='cedar',rule='file',count=14,total=30,limit=10)])
+        for language in ('en','es'):
+            question = triage.approval_question(plan,language)
+            self.assertIn('14 matches; 20 messages in Inbox; limit 10' if language=='en'
+                          else '14 coincidencias; 20 mensajes en Recibidos; límite 10',question)
+            self.assertIn('Planned: 1 action (' if language=='en' else 'Previsto: 1 acción (',question)
+            self.assertNotIn('1 actions',question)
+            self.assertNotIn('1 acciones',question)
+            plan['approval_thresholds']=[dict(kind='inbox',count=1,limit=0)]
+            question=triage.approval_question(plan,language)
+            self.assertIn('1 message in Inbox is' if language=='en' else '1 mensaje en Recibidos supera',question)
+            plan['approval_thresholds']=[dict(kind='brake',account='cedar',rule='file',count=14,total=30,limit=10)]
+
+    def test_rehearsal_question_keeps_display_names(self):
+        for language, name in (('en','Cedar. Reply Desk'),('es','Cedar. Responde Desk')):
+            plan = dict(actions=[dict(action='archive')],counts={'cedar':4},dry_run=True,
+                        account_names={'cedar':name},approval_thresholds=[dict(kind='inbox',count=4,limit=2)])
+            question = triage.approval_question(plan,language)
+            self.assertIn(name+' 4',question)
+            self.assertIn('Planned: 1 action' if language=='en' else 'Previsto: 1 acción',question)
+
+    def test_approval_refusals_do_not_change_plan_or_issue_calls(self):
+        plan = self.awaiting()
+        for state, run, age, reason in [
+            ('awaiting approval', 'wrong', 0, 'run id'),
+            ('approved', plan['run_id'], 0, 'awaiting approval'),
+            ('skipped', plan['run_id'], 0, 'awaiting approval'),
+            ('awaiting approval', plan['run_id'], 13*3600, 'expired')]:
+            with self.subTest(reason=reason):
+                self.age_question(plan, age)
+                candidate = dict(plan, approval_state=state,
+                                 approval_created=triage.time.time()-age)
+                execute.atomic(self.path, candidate)
+                before = self.path.read_bytes()
+                result = self.approve_cli(run)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_approval_replaced_id_refused(self):
+        old = self.awaiting()
+        self.assertEqual(self.plan_cli().returncode, 0)
+        current = self.path.read_bytes()
+        result = self.approve_cli(old['run_id'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('run id', result.stderr)
+        self.assertEqual(self.path.read_bytes(), current)
+
+    def test_approval_rebinds_once_and_retains_actions(self):
+        plan = self.awaiting()
+        triage.release(self.store, self.token)
+        self.token = triage.acquire(self.store)
+        result = self.approve_cli(plan['run_id'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = execute.read(self.path)
+        self.assertEqual(saved['approval_state'], 'approved')
+        self.assertEqual(saved['run_token'], self.token)
+        self.assertEqual(saved['actions'], plan['actions'])
+        self.assertEqual(saved['approved_thresholds'], plan['reasons'])
+        before = self.path.read_bytes()
+        reused = self.approve_cli(plan['run_id'])
+        self.assertNotEqual(reused.returncode, 0)
+        self.assertEqual(before, self.path.read_bytes())
+        history = (self.store/'history.log').read_text()
+        self.assertEqual(history.count('approval asked:'), 1)
+        self.assertEqual(history.count('approval approved:'), 1)
+
+    def test_skip_approval_preserves_plan_and_logs_once(self):
+        plan = self.awaiting()
+        triage.skip_approval(self.store, self.token, self.path)
+        saved = execute.read(self.path)
+        self.assertEqual(saved, dict(plan, approval_state='skipped'))
+        with self.assertRaisesRegex(ValueError, 'awaiting approval'):
+            triage.skip_approval(self.store, self.token, self.path)
+        self.assertEqual((self.store/'history.log').read_text().count('approval skipped:'), 1)
+        self.assertNotEqual(self.approve_cli(plan['run_id']).returncode, 0)
+        self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_approval_hours_validation(self):
+        for hours in (0, 73, True, '12', 1.5):
+            with self.subTest(hours=hours), self.assertRaisesRegex(ValueError, 'approval_hours'):
+                triage.validate_inputs(dict(accounts={}, messages=[]),
+                                       dict(accounts={'cedar': {}}, approval_hours=hours), {})
+        for hours in (1, 12, 72):
+            self.assertEqual(triage.approval_hours(dict(approval_hours=hours)), hours)
+
+    def test_approval_reply_words_print_only_authorized_command(self):
+        import shlex
+        for language, word in [('en', 'PrOcEeD'), ('es', 'proceder'), ('es', 'proceed')]:
+            with self.subTest(language=language, word=word):
+                self.setUp()
+                self.awaiting()
+                # Put language at the root, outside the account table.
+                config = self.store/'config.toml'
+                config.write_text('language="'+language+'"\n'+config.read_text())
+                plan = execute.read(self.path)
+                triage.release(self.store, self.token)
+                self.token = triage.acquire(self.store)
+                reply = self.store/'reply.txt'
+                reply.write_text(word)
+                before = self.path.read_bytes()
+                result = self.run_cli('triage.py', 'reply', '--token', self.token,
+                    '--inbox', str(self.store/'inbox.json'), '--reply', str(reply), '--plan-out', str(self.path), '--question', execute.read(self.path)['run_id'])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                command = shlex.split(result.stdout)
+                self.assertEqual(command[-2:], ['--approve', plan['run_id']])
+                self.assertEqual(before, self.path.read_bytes())
+                approved = subprocess.run(command, env={k:v for k,v in os.environ.items() if k != 'PIGEON_HOME'}, capture_output=True, text=True)
+                self.assertEqual(approved.returncode, 0, approved.stderr)
+
+    def test_approval_reply_skip_and_no_pending_refusal(self):
+        for word in ('skip', 'omitir'):
+            with self.subTest(word=word):
+                self.setUp()
+                self.awaiting()
+                config = self.store/'config.toml'
+                config.write_text('language="es"\n'+config.read_text())
+                reply = self.store/'reply.txt'
+                reply.write_text(word)
+                args = ('reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'),
+                        '--reply', str(reply), '--plan-out', str(self.path), '--question', execute.read(self.path)['run_id'])
+                result = self.run_cli('triage.py', *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(execute.read(self.path)['approval_state'], 'skipped')
+                self.assertIn('Nada cambia', result.stdout)
+                before = self.path.read_bytes()
+                refused = self.run_cli('triage.py', *args)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertEqual(before, self.path.read_bytes())
+                self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_awaiting_and_approved_messages_both_languages_real_commands(self):
+        for language in ('en', 'es'):
+            with self.subTest(language=language):
+                self.setUp()
+                self.awaiting()
+                config = self.store/'config.toml'
+                config.write_text('language="'+language+'"\n'+config.read_text()+'name="Cedar"\n')
+                self.assertEqual(self.plan_cli().returncode, 0)
+                plan = execute.read(self.path)
+                message = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path))
+                self.assertEqual(message.returncode, 0, message.stderr)
+                self.assertNotIn('stopped', message.stdout)
+                self.assertNotIn('detenida', message.stdout)
+                self.assertIn('Cedar 4', message.stdout.splitlines()[-1])
+                self.assertIn('4', message.stdout.splitlines()[-1])
+                self.assertIn('limit of 1' if language == 'en' else 'límite de 1', message.stdout)
+                self.assertIn('would move' if language == 'en' else 'previsto: mover', message.stdout)
+                self.assertIn('proceed' if language == 'en' else 'proceder', message.stdout.splitlines()[-1])
+                self.assertNotIn(plan['run_id'], message.stdout)
+                refused = self.run_cli('execute.py', 'next', '--token', self.token, '--plan', str(self.path))
+                self.assertEqual(json.loads(refused.stdout)['stop'], message.stdout.splitlines()[-1])
+                step = self.approve_cli(plan['run_id'])
+                ids = [m['id'] for m in self.listing['messages']]
+                for index, action in enumerate(plan['actions']):
+                    self.assertEqual(step.returncode, 0, step.stderr)
+                    ids.remove(action['id'])
+                    result = self.run_cli('execute.py', 'result', '--token', self.token, '--plan', str(self.path),
+                        '--observation', json.dumps(dict(outcome='ok', inbox_ids=ids)))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    step = self.run_cli('execute.py', 'next', '--token', self.token, '--plan', str(self.path))
+                message = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path))
+                self.assertEqual(message.returncode, 0, message.stderr)
+                self.assertIn('Owner approved exceeding' if language == 'en' else 'El propietario aprobó superar', message.stdout)
+                self.assertIn('Owner approved exceeding these thresholds.' if language == 'en' else 'El propietario aprobó superar estos límites.', message.stdout)
+                self.assertIn('4 handled' if language == 'en' else '4 gestionados', message.stdout)
+                self.assertNotIn('awaiting approval', message.stdout)
+
+    def test_awaiting_dry_approval_simulation_is_disposable(self):
+        for language in ('en', 'es'):
+            with self.subTest(language=language):
+                self.setUp()
+                self.awaiting()
+                config = self.store/'config.toml'
+                config.write_text('language="'+language+'"\n'+config.read_text())
+                self.path = self.store/'rehearsal.json'
+                before = {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file() and p != self.path}
+                dry = self.plan_cli('--dry-run')
+                self.assertEqual(dry.returncode, 0, dry.stderr)
+                self.assertEqual(before, {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file() and p != self.path})
+                plan = execute.read(self.path)
+                message = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path))
+                self.assertIn('dry run' if language == 'en' else 'simulación', message.stdout)
+                self.assertNotIn('stopped', message.stdout)
+                self.assertNotIn('detenida', message.stdout)
+                before = {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
+                for run, expected in [('wrong', False), (plan['run_id'], True)]:
+                    simulated = self.run_cli('execute.py', 'dry-run', '--plan', str(self.path), '--approve', run)
+                    self.assertEqual(simulated.returncode == 0, expected, simulated.stderr)
+                    self.assertEqual(before, {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()})
+                    if expected:
+                        output = json.loads(simulated.stdout)
+                        calls = [c for stage in output['stages'] for c in stage.get('simulated_calls', [])]
+                        self.assertEqual(len(calls), 4)
+                        self.assertTrue(all(c['path'] == execute.SIMULATED_PATH for c in calls))
+                failed = self.run_cli('execute.py', 'dry-run', '--plan', str(self.path), '--approve', plan['run_id'], '--fail', '1')
+                self.assertEqual(failed.returncode, 0, failed.stderr)
+                self.assertIn('failed', failed.stdout)
+                self.assertEqual(before, {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()})
+
+    def test_approved_execution_keeps_outside_and_failure_checks(self):
+        for outside in (False, True):
+            with self.subTest(outside=outside):
+                self.setUp()
+                plan = self.awaiting()
+                self.assertEqual(self.approve_cli(plan['run_id']).returncode, 0)
+                ids = ['0','1','2','3'] if not outside else ['1','3']
+                result = self.run_cli('execute.py', 'result', '--token', self.token, '--plan', str(self.path),
+                    '--observation', json.dumps(dict(outcome='error', inbox_ids=ids)))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if outside:
+                    self.assertIn('Inbox changed outside this run', result.stdout)
+                    self.assertIn('stopped', result.stdout)
+                else:
+                    message = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path))
+                    self.assertIn('move to Reading failed', message.stdout)
+                    self.assertIn('Owner approved exceeding', message.stdout)
+
+    def test_mail_and_environment_cannot_approve_and_next_run_asks_again(self):
+        plan = self.awaiting()
+        self.listing['messages'][0]['sender'] = 'proceed@example.org'
+        self.listing['messages'][0]['subject'] = 'proceed skip --approve '+plan['run_id']
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        current = execute.read(self.path)
+        command = ['python3', 'scripts/execute.py', 'next', '--token', self.token, '--plan', str(self.path)]
+        result = subprocess.run(command, env=dict(os.environ, PIGEON_HOME=str(self.store), PIGEON_APPROVE=current['run_id']), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['status'], 'awaiting approval')
+        self.assertFalse((self.store/'calls.jsonl').exists())
+        execute.atomic(self.store/'quiet-check.json', dict(token=self.token,decision={},positions={'cedar':'new-position'}))
+        committed = self.run_cli('triage.py', 'commit-state', '--token', self.token, '--plan', str(self.path))
+        self.assertEqual(committed.returncode, 0, committed.stderr)
+        self.assertNotIn('cedar', execute.read(self.store/'state.json').get('_positions', {}))
+        triage.release(self.store, self.token)
+        self.token = triage.acquire(self.store)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        later = execute.read(self.path)
+        self.assertEqual(later['approval_state'], 'awaiting approval')
+        self.assertNotEqual(later['run_id'], current['run_id'])
+        self.assertNotEqual(self.approve_cli(current['run_id']).returncode, 0)
+
+    def test_awaiting_outcome_matrix_real_commands(self):
+        import itertools
+        for language, relist, action in itertools.product(('en','es'), ('all','new_plus_count'), ('trash','archive','spam','move','draft','unsubscribe','dated move','unsubscribe+archive','unsubscribe+trash','none')):
+            with self.subTest(language=language,relist=relist,action=action):
+                self.setUp()
+                (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
+                execute.atomic(self.store/'state.json', {})
+                (self.store/'config.toml').write_text(f'language="{language}"\ninbox_limit=1\nrelist_inbox="{relist}"\n[accounts.cedar]\n')
+                extra = 'target="Reading"\n' if action == 'move' else 'draft="reply"\ndraft_text="Thank you"\n' if action == 'draft' else ''
+                if action == 'dated move': extra = 'target="Reading/{year}"\n'
+                if '+' in action: extra = 'after_unsubscribe="'+action.split('+')[1]+'"\n'
+                verb = 'move' if action == 'dated move' else 'unsubscribe' if '+' in action else action
+                (self.store/'rules.toml').write_text('rules=[]\n' if action == 'none' else '[[rules]]\nid="r"\naccounts=["cedar"]\nsubject="Fixture"\nexclusions=[]\naction="'+verb+'"\n'+extra)
+                listing = dict(accounts={'cedar':1000},folders=self.listing['folders'],messages=[dict(account='cedar',id=str(i),folder='Inbox',sender='reader@example.org',subject='Fixture '+str(i),date='2026-03-01T00:00:00+00:00',unsubscribe_url='https://example.org/leave') for i in range(2)])
+                execute.atomic(self.store/'inbox.json',listing)
+                planned = self.plan_cli()
+                self.assertEqual(planned.returncode,0,planned.stderr)
+                result = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path))
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertIn('awaiting approval' if language == 'en' else 'en espera de aprobación',result.stdout.splitlines()[0])
+                for i in range(2): self.assertEqual(result.stdout.count(' · Fixture '+str(i)),1,result.stdout)
+                if action != 'none': self.assertIn('would ' if language == 'en' else 'previsto:',result.stdout)
+                import re
+                numbered = len(re.findall(r'^\d+\. ', result.stdout, re.M))
+                expected = ('nothing needs you' if not numbered else str(numbered)+' need you') if language == 'en' else ('nada requiere tu decisión' if not numbered else str(numbered)+' requieren tu decisión')
+                self.assertIn(expected, result.stdout.splitlines()[0])
+
+    def test_approval_words_refused_without_waiting_plan(self):
+        for state in (None, 'approved', 'skipped'):
+            for word in ('proceed', 'skip'):
+                with self.subTest(state=state, word=word):
+                    self.setUp()
+                    (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
+                    if state:
+                        execute.atomic(self.path, dict(self.plan, approval_state=state))
+                    before = self.path.read_bytes()
+                    reply = self.store/'reply.txt'
+                    reply.write_text(word)
+                    result = self.run_cli('triage.py','reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(reply),'--plan-out',str(self.path))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('no plan awaits approval',result.stderr)
+                    self.assertEqual(before,self.path.read_bytes())
+                    self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_expiry_and_replacement_history_are_single_events(self):
+        plan = self.awaiting()
+        self.age_question(plan, 13*3600)
+        execute.atomic(self.path, plan)
+        for _ in range(2):
+            result = self.approve_cli(plan['run_id'])
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('expired',result.stderr)
+        self.assertEqual(self.plan_cli().returncode,0)
+        history = (self.store/'history.log').read_text()
+        self.assertEqual(history.count('approval expired:'),1)
+        self.assertEqual(history.count('approval replaced:'),0)
+        self.assertEqual(history.count('approval asked:'),2)
+
+    def test_saved_config_and_state_cannot_preapprove(self):
+        for target in ('config','state'):
+            with self.subTest(target=target):
+                self.setUp()
+                self.awaiting()
+                if target == 'config':
+                    config = self.store/'config.toml'
+                    config.write_text('approve=true\n'+config.read_text())
+                else:
+                    execute.atomic(self.store/'state.json', {'_approved': True})
+                result = self.plan_cli()
+                self.assertNotEqual(result.returncode,0)
+                self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_normal_plan_at_another_path_replaces_awaiting_plan(self):
+        plan = self.awaiting()
+        before = self.path.read_bytes()
+        (self.store/'config.toml').write_text('[accounts.cedar]\n')
+        later = self.plan_cli('--plan-out',str(self.store/'later.json'))
+        self.assertEqual(later.returncode,0,later.stderr)
+        result = self.approve_cli(plan['run_id'])
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('replaced',result.stderr)
+        self.assertEqual(before,self.path.read_bytes())
+        self.assertEqual((self.store/'history.log').read_text().count('approval replaced:'),1)
+        self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_each_planning_threshold_preserves_full_plan(self):
+        (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
+        execute.atomic(self.store/'state.json', {})
+        for kind, count in [('inbox', 2), ('destructive', 51), ('rule', 11),
+                            ('draft', 11), ('unsubscribe', 11), ('brake', 11), ('two', 11)]:
+            with self.subTest(kind=kind):
+                self.setUp()
+                (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
+                execute.atomic(self.store/'state.json', {})
+                verb = 'draft' if kind == 'draft' else 'unsubscribe' if kind == 'unsubscribe' else 'trash'
+                extra = 'draft="reply"\ndraft_text="Thank you"\n' if verb == 'draft' else ''
+                limit = 10 if kind in ('rule', 'two') else 50
+                (self.store/'rules.toml').write_text('[[rules]]\nid="r"\naccounts=["cedar"]\nexclusions=[]\nsubject="Weekly"\naction="'+verb+'"\nlimit='+str(limit)+'\n'+extra)
+                (self.store/'config.toml').write_text('inbox_limit='+('1' if kind in ('inbox', 'two') else '1000')+'\n[accounts.cedar]\n')
+                listing = dict(accounts={'cedar': 20 if kind == 'brake' else 10000}, messages=[
+                    dict(account='cedar', id=str(i), folder='Inbox', sender='reader@example.net', subject='Weekly', unsubscribe_url='https://example.net/leave') for i in range(count)])
+                if kind == 'destructive':
+                    rule_text = (self.store/'rules.toml').read_text()
+                    (self.store/'rules.toml').write_text(rule_text.replace('id="r"', 'id="first"').replace('subject="Weekly"', 'subject="Weekly A"') + rule_text.replace('id="r"', 'id="second"').replace('subject="Weekly"', 'subject="Weekly B"'))
+                    for index, message in enumerate(listing['messages']):
+                        message['subject'] = 'Weekly A' if index < 26 else 'Weekly B'
+                execute.atomic(self.store/'inbox.json', listing)
+                result = self.plan_cli()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                saved = execute.read(self.path)
+                self.assertEqual(saved['approval_state'], 'awaiting approval')
+                self.assertEqual(len(saved['actions']), count)
+                self.assertEqual(len(saved['reasons']), 2 if kind == 'two' else 1)
+                refused = self.run_cli('execute.py', 'next', '--token', self.token, '--plan', str(self.path))
+                self.assertEqual(refused.returncode, 0, refused.stderr)
+                self.assertEqual(json.loads(refused.stdout)['status'], 'awaiting approval')
+                self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_awaiting_plan_is_full_and_cannot_execute(self):
+        (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
+        (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n')
+        result = self.plan_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = execute.read(self.path)
+        self.assertEqual(saved['approval_state'], 'awaiting approval')
+        self.assertEqual(saved['actions'], self.plan['actions'])
+        self.assertEqual(saved['run_token'], self.token)
+        self.assertRegex(saved['run_id'], r'^[0-9a-f]{64}$')
+        self.assertNotEqual(saved['run_id'], self.token)
+        before = (self.store/'calls.jsonl').read_bytes() if (self.store/'calls.jsonl').exists() else None
+        refused = self.run_cli('execute.py', 'next', '--token', self.token, '--plan', str(self.path))
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        answer = json.loads(refused.stdout)
+        self.assertTrue(answer['done'])
+        self.assertEqual(answer['status'], 'awaiting approval')
+        self.assertNotIn('calls', answer)
+        self.assertEqual(before, (self.store/'calls.jsonl').read_bytes() if (self.store/'calls.jsonl').exists() else None)
+        self.assertEqual(execute.read(self.path), saved)
+        # Commit and release must still work without issuing any mail action.
+        committed = self.run_cli('triage.py', 'commit-state', '--token', self.token, '--plan', str(self.path))
+        self.assertEqual(committed.returncode, 0, committed.stderr)
+        triage.release(self.store, self.token)
+        self.assertEqual(execute.read(self.path)['run_id'], saved['run_id'])
+
     def test_reply_hint_uses_unique_folder_and_follows_empty_accounts(self):
         item = dict(account='cedar', id='waiting', number=1, sender='friend@example.org', subject='Hello', reason='No matching rule')
         plan = dict(counts={'cedar': 1, 'marble': 0}, actions=[], decisions=[item], remaining=[item], reasons=[])
@@ -91,8 +982,9 @@ class ExecuteTests(unittest.TestCase):
         listing = dict(accounts={'cedar': 20, 'marble': 20}, messages=messages)
         rules = [dict(id='t', accounts=['cedar'], subject='trash', action='trash', limit=50, exclusions=[])]
         plan = triage.build_plan(listing, rules, [], dict(accounts={'cedar': {}, 'marble': {}}))
-        tagged = [i for i in plan['remaining'] if 'rule refused by brake' in i['reason']]
-        self.assertEqual({i['id'] for i in tagged}, {str(i) for i in range(11)})
+        self.assertEqual(plan['approval_state'], 'awaiting approval')
+        self.assertEqual({i['id'] for i in plan['actions']}, {str(i) for i in range(11)})
+        self.assertEqual({i['id'] for i in plan['remaining']}, {'waiting', 'other'})
 
     def test_problem_accounts_never_empty_and_report_localized(self):
         plan = dict(counts={'cedar': 0}, account_names={'cedar': 'Cedar desk'},
@@ -1198,7 +2090,10 @@ class ExecuteTests(unittest.TestCase):
                 (alone / name).write_bytes(raw)
             baseline_command = [arg.replace(str(self.store), str(alone)) for arg in command]
             subprocess.run(baseline_command, env=dict(env, PIGEON_HOME=str(alone)), capture_output=True, check=True)
-            self.assertEqual(real, execute.read(alone / 'plan.json'))
+            other = execute.read(alone / 'plan.json')
+            self.assertNotEqual(real['run_id'], other['run_id'])
+            self.assertEqual({k:v for k,v in real.items() if k != 'run_id'},
+                             {k:v for k,v in other.items() if k != 'run_id'})
 
     def test_dry_run_reasons_and_spanish_labels(self):
         (self.store / 'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
@@ -1578,13 +2473,14 @@ class ExecuteTests(unittest.TestCase):
         (self.store / 'rules.toml').write_text(rules)
         execute.atomic(self.store / 'inbox.json', listing)
         result = triage.build_plan(listing, triage.parse_rules(rules), [], {'accounts':{'cedar':{}}})
-        save_plan(self.store, self.token, self.path, dict(result, first_run=True, dry_run=True, run_token=self.token))
+        save_plan(self.store, self.token, self.path, dict(result, first_run=True, dry_run=True, run_token=self.token, run_id=triage.secrets.token_hex(32), approval_created=triage.time.time()))
         message = triage.render_message(self.store, self.token, self.path, None)
-        self.assertIn('stopped', message.splitlines()[0])
-        self.assertIn('11 need you', message.splitlines()[0])
-        self.assertIn('twenty percent', message)
+        self.assertIn('awaiting approval', message.splitlines()[0])
+        self.assertNotIn('stopped', message)
+        self.assertIn('nothing needs you', message.splitlines()[0])
+        self.assertIn('11 matches; 11 messages in Inbox; limit 10', message)
         self.assertNotIn('Decisions for the owner', message)
-        self.assertIn('rule refused by brake',message)
+        self.assertIn('would trash',message)
         self.assertIn('cedar: 11', message)
         before={p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
         simulated=execute.simulate(self.store,self.path)
@@ -2180,12 +3076,14 @@ class ExecuteTests(unittest.TestCase):
 
     def test_rule_limit_and_global_brake(self):
         self.dated(existing=True, count=11)
-        self.assertEqual(self.plan['actions'], [])
+        self.assertEqual(len(self.plan['actions']), 11)
+        self.assertEqual(self.plan['approval_state'], 'awaiting approval')
         self.dated(existing=True, count=11, limit=12)
         self.assertEqual(len(self.plan['actions']), 11)
         self.listing['accounts']['cedar'] = 20
         plan = triage.build_plan(self.listing, triage.parse_rules((self.store / 'rules.toml').read_text()), [], {'accounts': {'cedar': {}}})
-        self.assertEqual(plan['actions'], [])
+        self.assertEqual(len(plan['actions']), 11)
+        self.assertEqual(plan['approval_state'], 'awaiting approval')
         self.assertTrue(plan['reasons'])
 
     def test_rule_limit_invalid(self):
@@ -2481,6 +3379,7 @@ class ExecuteTests(unittest.TestCase):
         self.plan = triage.build_plan(self.listing, triage.parse_rules((self.store / 'rules.toml').read_text()), [], dict(inbox_limit=1, accounts={'cedar': {}}))
         self.plan['first_run'] = True
         save_plan(self.store, self.token, self.path, self.plan)
+        triage.approval_event(self.store, execute.read(self.path), 'asked')
         self.machine().step()
         triage.commit_state(self.store, self.token, self.path, self.store / 'results.json')
         self.assertNotIn('_positions', execute.read(self.store / 'state.json'))
@@ -2938,11 +3837,11 @@ class ReplyTests(unittest.TestCase):
         self.reply('1 yes')
         self.assertEqual(self.output,'')
 
-    def test_cli_plan_bytes_identical(self):
-        self.reply('1 trash, 3 move to Billing')
-        original=self.path.read_bytes()
-        self.reply('1 trash, 3 move to Billing')
-        self.assertEqual(self.path.read_bytes(),original)
+    def test_cli_plan_content_identical_with_distinct_run_ids(self):
+        original = self.reply('1 trash, 3 move to Billing')
+        later = self.reply('1 trash, 3 move to Billing')
+        self.assertNotEqual(original.pop('run_id'), later.pop('run_id'))
+        self.assertEqual(later, original)
 
 class DraftTests(unittest.TestCase):
     def setUp(self):
@@ -3194,13 +4093,16 @@ class MessageFormatTests(unittest.TestCase):
             triage.commit_state(self.store,self.token,self.path)
         return triage.render_message(self.store,self.token,self.path,None)
 
-    def test_a_stopped_counts(self):
+    def test_a_awaiting_counts(self):
         (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n')
         self.plan=triage.build_plan(self.listing,[],[],triage.state_config(self.store))
         self.plan['first_run']=True
-        save_plan(self.store, self.token, self.path, self.plan); self.machine().step()
+        triage.number_decisions(self.store,self.plan,self.listing)
+        save_plan(self.store, self.token, self.path, self.plan)
+        triage.approval_event(self.store, execute.read(self.path), 'asked')
+        self.machine().step()
         message=triage.render_message(self.store,self.token,self.path,None)
-        self.assertIn('nothing needs you · 0 handled · stopped',message.splitlines()[0])
+        self.assertIn('4 need you · awaiting approval',message.splitlines()[0])
 
     def test_b_each_key_once_real_and_dry(self):
         self.configure()
