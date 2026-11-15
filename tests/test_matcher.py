@@ -843,6 +843,7 @@ class ListingTests(unittest.TestCase):
             expected = 'retried once, still failing' if failed_twice else 'retried once, succeeded'
             self.assertEqual(response.get('retries', {}).get('cedar'), expected)
             if failed_twice: self.assertEqual(response['failed']['cedar'], 'provider error (502)')
+            else: self.assertNotIn('failed', response)
             listing = execute.read(self.store/'inbox.json')
             plan = triage.build_plan(listing, [], [], self.config, {})
             text = '\n'.join(triage.account_problems(plan, listing, self.store, 'en'))
@@ -856,7 +857,7 @@ class ListingTests(unittest.TestCase):
         for key in ('accounts','folders'): self.assertEqual(actual[key],self.listing[key])
         self.assertEqual(sorted(actual['messages'],key=lambda m:(m['account'],m['id'])),sorted(self.listing['messages'],key=lambda m:(m['account'],m['id'])))
         self.assertIn(50,sizes)
-        self.assertFalse(result['failed'])
+        self.assertFalse(result.get('failed'))
 
     def test_outlook_identity_mismatch_drops_account(self):
         batch = self.exchange()
@@ -864,7 +865,7 @@ class ListingTests(unittest.TestCase):
         identity = next(i for i,c in enumerate(batch['calls']) if c['path'].endswith('meUserGetUser'))
         values[identity] = dict(ok=True, value={'mail': 'other@example.net'})
         result, _ = self.finish(self.exchange(values))
-        self.assertNotIn('marble', result['failed'])
+        self.assertNotIn('marble', result.get('failed', {}))
         self.assertIn('marble', json.loads((self.store/'inbox.json').read_text())['accounts'])
 
     def test_ordinary_missing_subject_sender_and_departed_gmail(self):
@@ -904,7 +905,7 @@ class ListingTests(unittest.TestCase):
             if c['path'].endswith('meListMailFolders'):
                 v['value']['value'][0]['displayName'] = 'Receipts {old}'
         result, _ = self.finish(self.exchange(values))
-        self.assertNotIn('marble', result['failed'])
+        self.assertNotIn('marble', result.get('failed', {}))
 
     def test_zero(self):
         self.listing['messages']=[]
@@ -949,7 +950,7 @@ class ListingTests(unittest.TestCase):
                 if fault=='id': values[1]['value']['messages'][0]['id']='bad!'
                 if fault=='repeat': values[1]['value']['nextPageToken']='first'
                 result,_=self.finish(self.exchange(values))
-                self.assertNotIn('cedar',result['failed'])
+                self.assertNotIn('cedar',result.get('failed', {}))
                 self.assertEqual(set(json.loads((self.store/'inbox.json').read_text())['accounts']),{'cedar','marble'})
 
     def test_lock_and_body_and_manual_refusal(self):
@@ -976,7 +977,7 @@ class ListingTests(unittest.TestCase):
             result = self.exchange(values, ids_only=True)
         self.assertTrue(failed)
         self.assertTrue(result.get('done'))
-        self.assertFalse(result['failed'])
+        self.assertFalse(result.get('failed'))
         final = json.loads((self.store/'final-inbox.json').read_text())
         self.assertIn('item-new', [m['id'] for m in final['messages']])
 
@@ -984,7 +985,7 @@ class ListingTests(unittest.TestCase):
         import execute
         execute.atomic(self.store/'quiet-check.json', dict(token=self.token, decision={'quiet_accounts':['cedar']}))
         result, _ = self.finish()
-        self.assertNotIn('cedar', result['failed'])
+        self.assertNotIn('cedar', result.get('failed', {}))
         listing = execute.read(self.store/'inbox.json')
         plan = triage.build_plan(listing, [], [], self.config)
         self.assertNotIn('cedar', plan['not_listed'])
@@ -1007,7 +1008,7 @@ class ListingTests(unittest.TestCase):
                             value.update(ok=True, value={'error':{'code':403,'message':'PRIVATE_PROVIDER_TEXT'}})
                     result = self.exchange(values, ids_only=final)
                 self.assertTrue(result.get('done'))
-                self.assertEqual(result['failed'], {'cedar':'provider error (403)'})
+                self.assertEqual(result.get('failed', {}), {'cedar':'provider error (403)'})
                 listing = execute.read(self.store/('final-inbox.json' if final else 'inbox.json'))
                 self.assertNotIn('cedar', listing['accounts'])
                 self.assertEqual(len(listing['messages']), 120)
@@ -1041,7 +1042,7 @@ class ListingTests(unittest.TestCase):
                             value.update(ok=True, value={'response':{'status':403}})
                     result = self.exchange(values, ids_only=final)
                 self.assertTrue(result.get('done'))
-                self.assertEqual(result['failed'], {'cedar':'provider error (403)'})
+                self.assertEqual(result.get('failed', {}), {'cedar':'provider error (403)'})
                 listing = execute.read(self.store/('final-inbox.json' if final else 'inbox.json'))
                 self.assertNotIn('cedar', listing['accounts'])
                 self.assertEqual(len(listing['messages']), 120)
@@ -1157,8 +1158,8 @@ class ListingTests(unittest.TestCase):
         from unittest.mock import patch
         with patch.object(triage,'LISTING_PAGES',1):
             result,_=self.finish()
-        self.assertIn('cedar',result['failed'])
-        self.assertIn('marble',result['failed'])
+        self.assertIn('cedar',result.get('failed', {}))
+        self.assertIn('marble',result.get('failed', {}))
 
     def test_metadata_missing_fields_isolates_account(self):
         batch=self.exchange()
@@ -1167,7 +1168,7 @@ class ListingTests(unittest.TestCase):
         values=self.gateway.batch(batch['calls'])
         values[0]['value'].pop('id')
         result,_=self.finish(self.exchange(values))
-        self.assertEqual(result['failed'],{})
+        self.assertEqual(result.get('failed', {}),{})
 
     def test_metadata_wrong_date_type_isolates_account(self):
         batch=self.exchange()
@@ -1176,7 +1177,7 @@ class ListingTests(unittest.TestCase):
         values=self.gateway.batch(batch['calls'])
         values[0]['value']['internalDate']=True
         result,_=self.finish(self.exchange(values))
-        self.assertEqual(result['failed'],{})
+        self.assertEqual(result.get('failed', {}),{})
 
 
     def test_final_arrivals_both_providers(self):
@@ -1277,7 +1278,7 @@ class GatewayRobustnessTests(unittest.TestCase):
         self.gateway.batch = empty
         result,_ = self.finish()
         self.assertEqual(result['counts'], {'cedar':0,'marble':0})
-        self.assertEqual(result['failed'], {})
+        self.assertEqual(result.get('failed', {}), {})
 
     def test_path_builder_and_slug_validation(self):
         for app,expected in [('cedar-mail','tools["cedar-mail"].'), ('cedar_mail','tools.cedar_mail.')]:
@@ -1309,7 +1310,7 @@ class GatewayRobustnessTests(unittest.TestCase):
             return values
         self.gateway.batch = failing
         result,_ = self.finish()
-        self.assertEqual(result['failed'], {'cedar':'provider error (503)'})
+        self.assertEqual(result.get('failed', {}), {'cedar':'provider error (503)'})
         self.assertEqual(sum(p.endswith('getProfile') for p in issued),2)
         listing=json.loads((self.store/'inbox.json').read_text())
         plan=triage.build_plan(listing,[],[],self.config,{})
@@ -1327,12 +1328,12 @@ class GatewayRobustnessTests(unittest.TestCase):
             return original(state,job,*args)
         with patch.object(triage,'consume_listing',broken):
             result,_=self.finish()
-        self.assertEqual(result['failed'],{'cedar':'pigeon error (listing answer)'})
+        self.assertEqual(result.get('failed', {}),{'cedar':'pigeon error (listing answer)'})
         (self.store/'listing-exchange.json').unlink()
         first=self.exchange(skip=['cedar'])
         self.assertTrue(all(c['input']['accountId']!='cedar-example' for c in first['calls']))
         result,_=self.finish(first)
-        self.assertEqual(result['failed'],{'cedar':'pigeon error (manual skip)'})
+        self.assertEqual(result.get('failed', {}),{'cedar':'pigeon error (manual skip)'})
         with self.assertRaisesRegex(ValueError,'unknown'): self.exchange(skip=['unknown'])
 
     def test_three_accounts_commit_then_only_failed_account_lists(self):
@@ -1396,7 +1397,7 @@ class GatewayRobustnessTests(unittest.TestCase):
                 return values
             self.gateway.batch=broken
             result,_=self.finish()
-            self.assertEqual(result['failed'],{'cedar':'pigeon error (listing answer)'})
+            self.assertEqual(result.get('failed', {}),{'cedar':'pigeon error (listing answer)'})
             self.gateway.batch=original
 
     def test_every_account_failed_commits_and_message_without_plan(self):
@@ -1406,7 +1407,7 @@ class GatewayRobustnessTests(unittest.TestCase):
         execute.atomic(self.store/'state.json',previous)
         self.gateway.batch=lambda calls:[dict(ok=False,error={}) for c in calls]
         result,_=self.finish()
-        self.assertEqual(set(result['failed']),set(self.config['accounts']))
+        self.assertEqual(set(result.get('failed', {})),set(self.config['accounts']))
         listing=execute.read(self.store/'inbox.json')
         plan=triage.build_plan(listing,[],[],self.config,previous)
         triage.number_decisions(self.store,plan,listing)
@@ -1481,6 +1482,20 @@ class PresentationGroupTests(unittest.TestCase):
             self.assertIn('(3) · '+('latest: ' if language=='en' else 'más reciente: ')+'Subject 2', '\n'.join(lines))
             self.assertIn('(3)', triage.render_report(plan, listing, language))
             self.assertEqual(sum(len(g) for g in triage.presentation_groups(outcomes)), 3)
+
+    def test_r157_majority_sender_label(self):
+        plan, listing = self.fixture()
+        listing['messages'][2]['sender'] = 'Newest <build@example.net>'
+        plan = triage.build_plan(listing, [], [], dict(accounts={'cedar': {}}))
+        outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [])
+        for language in ('en', 'es'):
+            text = triage.group_text(outcomes, language)
+            self.assertTrue(text.startswith('Cedar Builds <build@example.net> (3)'), text)
+            self.assertIn('Cedar Builds <build@example.net> (3)', triage.render_report(plan, listing, language))
+        listing['messages'][1]['sender'] = 'Middle <build@example.net>'
+        plan = triage.build_plan(listing, [], [], dict(accounts={'cedar': {}}))
+        outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [])
+        self.assertTrue(triage.group_text(outcomes, 'en').startswith('Newest <build@example.net> (3)'))
 
     def test_group_partition_table(self):
         plan, listing = self.fixture()

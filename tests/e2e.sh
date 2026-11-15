@@ -73,7 +73,7 @@ while True:
 
 run(blocks[10],token)
 message=run(blocks[11],token)
-assert '1 handled' in message and 'Still in Inbox' in message
+assert '2 handled' in message and 'Still in Inbox' in message
 run(re.search(r'`(rm -f [^`]+run-message\.md)`',text).group(1),token)
 assert not (store/'run-message.md').exists()
 assert json.loads(run(blocks[12],token))['done']

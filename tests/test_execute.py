@@ -2484,11 +2484,7 @@ class ExecuteTests(unittest.TestCase):
                         expected = 'run not saved' if language == 'en' else 'ejecución sin guardar'
                     if kind == 'failure':
                         expected = 'run failed' if language == 'en' else 'ejecución fallida'
-                    if kind == 'dry':
-                        self.assertNotIn('requiere', message.splitlines()[0])
-                        self.assertNotIn('need', message.splitlines()[0])
-                    else:
-                        self.assertIn(' · '+expected+' · ', message.splitlines()[0])
+                    self.assertIn(' · '+expected+' · ', message.splitlines()[0])
                     if kind == 'real':
                         self.assertIn('1 handled' if language == 'en' else '1 gestionado', message.splitlines()[0])
 
@@ -2766,8 +2762,7 @@ class ExecuteTests(unittest.TestCase):
                     tag = lambda l: re.split(r' · (?:latest: |más reciente: )?Matrix item', l, maxsplit=1)[1]
                     self.assertEqual(tag(dry_lines[0]), tag(real_lines[0]))
                 if not failure:
-                    self.assertNotIn('need', dry.splitlines()[0])
-                    self.assertNotIn('requiere', dry.splitlines()[0])
+                    self.assertEqual(dry.splitlines()[0].split(' · ')[2], real.splitlines()[0].split(' · ')[2])
                 count = len(re.findall(r'^\d+\. ', real, re.M))
                 owner = real.splitlines()[0].split(' · ')[2]
                 self.assertEqual(count, int(owner.split()[0]) if owner[0].isdigit() else 0, real)
@@ -3049,7 +3044,7 @@ class ExecuteTests(unittest.TestCase):
                 real = self.run_cli('triage.py', 'message', '--token', self.token, '--plan', str(self.path)).stdout
                 count = 1 if setting == 'new_plus_count' else 2
                 need = (str(count)+(' needs you' if count == 1 else ' need you')) if language == 'en' else (str(count)+(' requiere tu decisión' if count == 1 else ' requieren tu decisión'))
-                self.assertNotIn(need, dry.splitlines()[0])
+                self.assertIn(need, dry.splitlines()[0])
                 self.assertIn('run failed' if language == 'en' else 'ejecución fallida', real.splitlines()[0])
                 for subject in ('Old 0',):
                     self.assertEqual(subject in dry, setting == 'all')
@@ -3671,7 +3666,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertTrue(message.startswith('📬 Triage · '))
         self.assertIn('Dry run', message)
         self.assertIn('4 messages would be handled · dry run', message.splitlines()[0])
-        self.assertNotIn('nothing needs you', message.splitlines()[0])
+        self.assertIn('nothing needs you', message.splitlines()[0])
         self.assertNotIn('stopped', message.splitlines()[0])
         self.assertIn('would move', message)
         self.assertIn('no reply number is live', message)
@@ -3691,7 +3686,7 @@ class ExecuteTests(unittest.TestCase):
             save_plan(self.store, self.token, self.path, dict(plan,first_run=True,dry_run=True,run_token=self.token))
             opening=triage.render_message(self.store,self.token,self.path,None).splitlines()[0]
             expected='nothing needs you' if not count else '1 needs you'
-            self.assertNotIn(expected,opening)
+            self.assertIn(expected,opening)
             self.assertIn('0 messages would be handled',opening)
             self.assertNotIn('stopped',opening)
         listing=dict(self.listing,messages=[dict(self.listing['messages'][0],subject='trash')])
@@ -3714,7 +3709,7 @@ class ExecuteTests(unittest.TestCase):
         plan=triage.build_plan(listing,triage.parse_rules((self.store/'rules.toml').read_text()),holds,triage.state_config(self.store))
         save_plan(self.store, self.token, self.path, dict(plan,first_run=True,dry_run=True,run_token=self.token))
         message=triage.render_message(self.store,self.token,self.path,None)
-        self.assertNotIn('1 requiere tu decisión',message.splitlines()[0])
+        self.assertIn('1 requiere tu decisión',message.splitlines()[0])
         self.assertNotIn('Decisiones para el propietario',message)
         self.assertEqual(message.count('Protegido por never-touch'),1)
 
@@ -5676,6 +5671,40 @@ class MessageFormatTests(unittest.TestCase):
             triage.commit_state(self.store,self.token,self.path)
         return triage.render_message(self.store,self.token,self.path,None)
 
+    def test_r157_handled_copy_count(self):
+        (self.store/'config.toml').write_text('[accounts.cedar]\n[accounts.marble]\n')
+        self.listing = dict(accounts={'cedar':100,'marble':100}, messages=[
+            dict(account=a, id=a, folder='Inbox', sender='copy@example.org', subject='trash',
+                 internet_message_id='<copy@example.org>') for a in ('cedar','marble')])
+        execute.atomic(self.store/'inbox.json', self.listing)
+        rules_text = '[[rules]]\nid="t"\naccounts=["cedar","marble"]\nsubject="trash"\naction="trash"\nexclusions=[]\n'
+        (self.store/'rules.toml').write_text(rules_text)
+        rules = triage.parse_rules(rules_text)
+        self.plan = triage.build_plan(self.listing, rules, [], triage.state_config(self.store))
+        self.plan['first_run'] = True
+        save_plan(self.store, self.token, self.path, self.plan)
+        ids = ['cedar','marble']
+        for _ in range(2):
+            call = self.machine().step()
+            self.machine().step(MockProvider(ids))
+            ids.remove(call['id'])
+        self.machine().step()
+        text = triage.render_message(self.store,self.token,self.path,None)
+        self.assertIn('2 handled', text.splitlines()[0], text)
+        self.assertEqual(text.count('- trash: copy@example.org'), 1)
+
+    def test_r157_awaiting_merges_copies(self):
+        self.listing = dict(accounts={'cedar': 100, 'marble': 100}, messages=[
+            dict(account=a, id=a, folder='Inbox', sender='Copy <copy@example.org>',
+                 subject='trash', internet_message_id='<copy@example.org>') for a in ('cedar', 'marble')])
+        (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n[accounts.marble]\n')
+        rules = [dict(id='copy', accounts=['cedar','marble'], sender='copy@example.org', action='trash', exclusions=[])]
+        plan = triage.build_plan(self.listing, rules, [], triage.state_config(self.store))
+        text = triage.awaiting_message(self.store, plan, self.listing, 'en', new_question=True)
+        self.assertEqual(text.count('Copy <copy@example.org>'), 1, text)
+        self.assertIn('cedar: 1 message in Inbox', text)
+        self.assertIn('marble: 1 message in Inbox', text)
+
     def test_a_awaiting_counts(self):
         (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n')
         self.plan=triage.build_plan(self.listing,[],[],triage.state_config(self.store))
@@ -5746,6 +5775,7 @@ class MessageFormatTests(unittest.TestCase):
             call=self.machine().step();self.machine().step(MockProvider(ids));ids.remove(call['id'])
         self.machine().step()
         text=triage.render_message(self.store,self.token,self.path,None)
+        self.assertIn('22 handled', text.splitlines()[0])
         self.assertEqual(text.count('- trash: sender@example.net'),1)
         self.assertIn('sender@example.net (22)',text)
         self.assertNotIn('and 2 more',text)

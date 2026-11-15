@@ -2307,7 +2307,12 @@ def group_text(group, language):
         except (ValueError, OverflowError, OSError):
             return float('-inf')
     latest = max(group, key=timestamp)['item']
-    return (chat_text(latest['sender'])[:160] + ' (' + str(len(group)) + ') · '
+    counts = {}
+    for outcome in group:
+        sender = getaddresses([outcome['item']['sender']])[0][0]
+        counts[sender] = counts.get(sender, 0) + 1
+    sender = max(group, key=lambda o: (counts[getaddresses([o['item']['sender']])[0][0]], timestamp(o)))['item']['sender']
+    return (chat_text(sender)[:160] + ' (' + str(len(group)) + ') · '
             + ('latest: ' if language == 'en' else 'más reciente: ') + chat_text(latest['subject'])[:240] + suffix)
 
 
@@ -2586,11 +2591,12 @@ def awaiting_message(store, plan, listing, language, *, new_question=False, outc
     lines += account_problems(plan, listing, store, language)
     lines += [account_name(plan, a) + ': no new mail' for a in listing.get('quiet', [])]
     lookup = {(m['account'], m['id']): m for m in listing['messages']}
+    primary = {(o['item']['account'], o['item']['id']) for o in outcomes}
     for account, count in plan['counts'].items():
         lines.append(account_name(plan, account) + ': ' + str(count) + ((' message' if count == 1 else ' messages') + ' in Inbox' if language == 'en' else (' mensaje' if count == 1 else ' mensajes') + ' en Recibidos'))
         groups = {}
         for action in plan['actions']:
-            if action['account'] == account and action['action'] != 'create-folder':
+            if action['account'] == account and action['action'] != 'create-folder' and (account, action['id']) in primary:
                 groups.setdefault((action['action'], action['rule']), []).append(action)
         for (kind, rule), actions in groups.items():
             examples = list(dict.fromkeys(chat_text(lookup.get((account, a['id']), {}).get('sender', ''))[:160]
@@ -2860,7 +2866,7 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
         summary = (str(total) + (' message' if total == 1 else ' messages') + ' would be handled · dry run') if language == 'en' else (str(total) + (' mensaje previsto' if total == 1 else ' mensajes previstos') + ' · simulación')
         if plan['reasons']:
             summary += ' · ' + STRINGS[language][1].lower()
-        opening = ' · '.join(message_opening(store).splitlines()[0].split(' · ')[:2])
+        opening = ' · '.join(message_opening(store, plan, outcomes).splitlines()[0].split(' · ')[:3])
         lines = [opening + ' · ' + summary] + lines
         lines[1:1] = account_problems(plan, listing, store, language)
         lines += [account_name(plan, a) + ': no new mail' for a in listing.get('quiet', [])]
@@ -2929,7 +2935,8 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
     need = (str(count) + (' needs you' if count == 1 else ' need you') if count else 'nothing needs you') if language == 'en' else (str(count) + (' requiere tu decisión' if count == 1 else ' requieren tu decisión') if count else 'nada requiere tu decisión')
     if not committed:
         need = 'run not saved' if language == 'en' else 'ejecución sin guardar'
-    total = sum(o['section'] == 'handled' or bool(o['actions']) for o in outcomes)
+    total = sum(len(o.get('copies', [o['item']])) for o in outcomes
+                if o['section'] == 'handled' or o['actions'])
     stopped = bool(plan['reasons']) or bool(execution.stop_reason()) or len(results['results']) != len(plan['actions'])
     summary = str(total) + (' handled' if language == 'en' else ' gestionado' if total == 1 else ' gestionados')
     if stopped: summary += ' · ' + STRINGS[language][1].lower()
@@ -3570,7 +3577,7 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
                 listing['messages'] += d['messages']
         validate_inputs(listing, config, {})
         execute.atomic(target / ('approval-inbox.json' if approval else 'final-inbox.json' if ids_only else 'inbox.json'), listing)
-        return dict(done=True, counts={a:len(d['ids']) for a,d in state['data'].items() if a not in state['failed']}, failed=state['failed'],
+        return dict(done=True, counts={a:len(d['ids']) for a,d in state['data'].items() if a not in state['failed']}, **({'failed': state['failed']} if state['failed'] or not any(state.get('attempts', {}).values()) else {}),
                     retries={a: 'retried once, still failing' if a in state['failed'] else 'retried once, succeeded' for a, n in state.get('attempts', {}).items() if n})
 
 
