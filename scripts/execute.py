@@ -90,7 +90,7 @@ class Execution:
         triage.known_keys(self.plan.get('counts'), set(self.plan.get('counts', {})), str(self.plan_path) + '.counts')
         creates = set()
         for action in self.plan['actions']:
-            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to'}, str(self.plan_path) + '.actions')
+            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'reason'}, str(self.plan_path) + '.actions')
             if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action', 'rule')):
                 raise ValueError(str(self.plan_path) + '.actions: expected account, id, action and rule strings')
             if 'target_path' in action:
@@ -185,7 +185,7 @@ class Execution:
             raise ValueError(label + '.pending: expected null or the next planned action')
         pending = self.state['pending']
         if pending is not None:
-            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to'}, label + '.pending')
+            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to', 'reason'}, label + '.pending')
             if len(results) == len(self.plan['actions']) or pending != self.plan['actions'][len(results)]:
                 raise ValueError(label + '.pending: expected the next planned action unchanged')
 

@@ -5705,6 +5705,20 @@ class MessageFormatTests(unittest.TestCase):
         self.assertIn('cedar: 1 message in Inbox', text)
         self.assertIn('marble: 1 message in Inbox', text)
 
+    def test_awaiting_keeps_different_rules_on_copies(self):
+        self.listing = dict(accounts={'cedar': 100, 'marble': 100}, messages=[
+            dict(account=a, id=a, folder='Inbox', sender='Copy <copy@example.org>',
+                 subject='copy', internet_message_id='<copy@example.org>') for a in ('cedar', 'marble')])
+        (self.store / 'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n[accounts.marble]\n')
+        rules = [dict(id='ruleA', accounts=['cedar'], sender='copy@example.org', action='archive'),
+                 dict(id='ruleB', accounts=['marble'], sender='copy@example.org', action='archive')]
+        plan = triage.build_plan(self.listing, rules, [], triage.state_config(self.store))
+        for language in ('en', 'es'):
+            text = triage.awaiting_message(self.store, plan, self.listing, language, new_question=True)
+            self.assertIn('ruleA: 1', text)
+            self.assertIn('ruleB: 1', text)
+            self.assertEqual(text.count('Copy <copy@example.org>'), 2)
+
     def test_a_awaiting_counts(self):
         (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n')
         self.plan=triage.build_plan(self.listing,[],[],triage.state_config(self.store))

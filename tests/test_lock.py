@@ -729,6 +729,41 @@ class QuietTests(unittest.TestCase):
         self.config['schedule']['always_full'] = ['08:00']
         self.assertEqual(self.decide(), 'full')
 
+    def test_day_type_full_slots(self):
+        self.config['schedule']['always_full'] = {'weekdays': ['08:00']}
+        self.assertEqual(self.decide(), 'full')
+        self.now = datetime.fromisoformat('2026-11-14T09:10:00+00:00')
+        self.assertEqual(self.decide(), 'skip')
+        self.config['schedule']['always_full'] = {'weekends': ['09:00']}
+        self.assertEqual(self.decide(), 'full')
+
+    def test_delayed_day_type_slot_reproduction(self):
+        self.config['timezone'] = 'America/Bogota'
+        self.config['schedule'].update(weekdays=['08:00', '23:30'], weekends=['10:00', '23:30'])
+        for stamp, day in [('2026-11-14T05:10:00+00:00', 'weekdays'),
+                           ('2026-11-16T05:10:00+00:00', 'weekends')]:
+            self.now = datetime.fromisoformat(stamp)
+            self.config['schedule']['always_full'] = {day: ['23:30']}
+            self.assertEqual(self.decide(), 'full')
+            self.config['schedule']['always_full'] = ['23:30']
+            self.assertEqual(self.decide(), 'full')
+
+    def test_day_type_full_validation_and_timezone(self):
+        import copy
+        for full in ({'other': []}, {'weekdays': '08:00'}, {'weekdays': ['09:00']},
+                     {'weekends': [True]}, {'weekends': ['09:00', '09:00']}):
+            config = copy.deepcopy(self.config)
+            config['schedule']['always_full'] = full
+            with self.subTest(full=full), self.assertRaisesRegex(ValueError, 'config.schedule.always_full'):
+                triage.validate_inputs(dict(accounts={}, messages=[]), config, {})
+        self.config['schedule']['always_full'] = {'weekends': ['09:00']}
+        triage.validate_inputs(dict(accounts={}, messages=[]), self.config, {})
+        self.config['timezone'] = 'Asia/Kolkata'
+        self.now = datetime.fromisoformat('2026-11-14T03:45:00+00:00')
+        self.assertEqual(triage.full_slots(self.config, self.now), ['09:00'])
+        self.config['schedule']['always_full'] = {}
+        self.assertEqual(triage.full_slots(self.config, self.now), [])
+
     def test_on_demand_full(self):
         self.assertEqual(self.decide(False), 'full')
 

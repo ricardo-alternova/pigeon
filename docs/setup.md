@@ -34,10 +34,10 @@ Both files use TOML arrays of tables named [[rules]]. In rules.toml, order matte
 | draft_to | Required only for forward: 1–5 bare addresses from the rule. Refuse it on reply; take no recipients from mail. |
 | accounts | Nonempty account-handle string array required in rules; optional in never-touch (absent means all). |
 | sender | Case-insensitive exact address; accept address or Name <address>. Ignore +tag for never-touch. |
-| domain | Case-insensitive exact domain; protect subdomains in never-touch. |
+| domain | Case-insensitive domain and its subdomains at a label boundary (example.org matches mail.example.org, never notexample.org or example.org.evil.test). |
 | subject | String, a Python regular expression searched anywhere in the subject without case sensitivity. Escape regex punctuation when you mean literal text. |
 | body | Optional non-blank literal substring in the plain-text excerpt, matched with Python re.IGNORECASE without Unicode normalization. Regex punctuation is literal. rules.toml only; absent excerpts do not match. |
-| question | Optional non-blank string, at most 500 characters, on report rules only. Leaves the message in Inbox and shows this question with the message under Still in Inbox, without a mailbox call or removal count. Place a settling rule before the question rule. Propose edits through [Writing a rule](../AGENTS.md#writing-a-rule). |
+| question | Optional non-blank string, at most 500 characters, on report rules only. Leaves the message in Inbox and shows this question with the message under Still in Inbox, without a mailbox call or removal count. Place a settling rule before the question rule; a sender/domain settling rule must also win specificity within its leading run. Propose edits through [Writing a rule](../AGENTS.md#writing-a-rule). |
 | has_attachment | Optional boolean; absent message flag means false. |
 | exclusions | Case-insensitive substring array for subject and body (when used). Require on trash, even []; optional elsewhere, forbidden in never-touch. |
 | after_unsubscribe | Optional trash/archive on unsubscribe only. Plan separately after safe unsubscribe even on failure; turn unsafe requests and companions into decisions. |
@@ -52,6 +52,10 @@ Require a sender, domain, subject or body predicate on each rules.toml entry; re
 The top level of rules.toml accepts only rules; use rules = [] explicitly for no rules. The top level of never-touch.toml accepts rules and allow_empty (boolean). An empty never-touch file is refused; to explicitly disable protection replace its entries with allow_empty = true. Never-touch entries accept only accounts, sender, domain, subject and has_attachment.
 
 See the [rule examples](../rules/rules.example.toml), including commented-out examples for every feature.
+
+Full addresses still match exactly. Never-touch wins over every action; ties in specificity keep file order.
+
+On an unsubscribe rule, `unsubscribe_fallback = "ask"` (default), `"trash"` or `"archive"` chooses what happens when no safe link exists. Removal uses ordinary limits and approval, with the reason “No usable unsubscribe link found”. Spam/phishing stays a decision. This option never handles a failed or unknown unsubscribe attempt; `after_unsubscribe` still applies only to the unsubscribe path.
 
 ## Convert a rules table
 
@@ -70,7 +74,7 @@ all = ["cedar", "marble"]
 "owner@example.com" = ["cedar"]
 ```
 
-Separate scope names in a table cell with commas. Put each match token in backticks: `digest@example.net` for an exact sender, `example.org` or `@example.org` for an exact domain, or `subject:Weekly [news]` for literal subject text. Use double backticks around a token containing a backtick; escape a cell pipe as \| or put it inside the code span. Use several sender/domain tokens to produce separate rules with IDs ID, ID-2, ID-3. Send combinations containing a subject token and another token to review.
+Separate scope names in a table cell with commas. Put each match token in backticks: `digest@example.net` for an exact sender, `example.org` or `@example.org` for a domain and its subdomains, or `subject:Weekly [news]` for literal subject text. Use double backticks around a token containing a backtick; escape a cell pipe as \| or put it inside the code span. Use several sender/domain tokens to produce separate rules with IDs ID, ID-2, ID-3. Send combinations containing a subject token and another token to review.
 
 Use trash, archive, spam, move PATH, mover PATH, unsubscribe, baja or baja HTTPS://example.org/leave as actions, ignoring case around the action words. Preserve move path spelling. Join unsubscribe or baja with + trash or + archive for a companion removal. Keep the source cell as a comment.
 
@@ -80,13 +84,13 @@ Review the three outcomes:
 - Switched off: every cell is understood and the pattern also contains notes or warning marks. Read the note comment above each enabled = false rule. Translate exceptions into exclusions or narrower predicates, then set enabled = true.
 - Review: a cell is unknown, the pattern has no token, or an ID is invalid or duplicated. Read each row ID, table line number and fixed reason; correct the original row and convert to a new output path.
 
-Keep converted rules in table order. Apply never-touch protection first, then the first matching enabled rule in file order, under the kit's action limits. Check scopes against config.toml with validate.
+Keep converted rules in table order. Apply never-touch protection first, then the most specific matching enabled rule within the leading sender/domain run (full address, longest domain, then file order). File order is the base: a first match without sender/domain wins; otherwise only matching sender/domain rules before the first matching rule without either compete, under the kit's action limits. Check scopes against config.toml with validate.
 
 Install the converted file as rules.toml in the private store. Run `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py validate`. Take the lock, copy a fixture or fresh Inbox listing to inbox.json in the private store and follow [Dry run](#dry-run) before using the rules.
 
 ## Rule cases
 
-Write optional cases.toml in the private store after editing or converting rules. Use [[cases]] entries with a unique nonempty name, account, sender, subject and expect. Add has_attachment, body and expect_rule when needed. Use an action name, none for no matching rule, or never-touch as expect; use a rule ID as expect_rule. Run `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py validate` to check never-touch precedence and the first enabled matching rule. Read the failing case names, expected and found actions/rules, and totals. Correct failures before running mail.
+Write optional cases.toml in the private store after editing or converting rules. Use [[cases]] entries with a unique nonempty name, account, sender, subject and expect. Add has_attachment, body and expect_rule when needed. Use an action name, none for no matching rule, or never-touch as expect; use a rule ID as expect_rule. Run `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py validate` to check never-touch precedence and the same rule selection as plan. Read the failing case names, expected and found actions/rules, and totals. Correct failures before running mail.
 
 Copy these cases for the example rules:
 
@@ -143,11 +147,11 @@ Follow [Commit and message](quickstart.md#commit-and-message). Keep plan.json, i
 | drafts | Drafts | Drafts |
 | calendar | Calendar | Calendar |
 
-Account totals count messages; owner totals count numbered lines. Spam/phishing-flagged messages stay on separate lines. Other messages with equal sender address, tag and answerability share one Inbox line: sender (most frequent display name, ties newest), count, newest subject. Singletons keep their form. Across accounts, copies require equal sender address and subject, plus equal internet message ids or received times within five minutes. Missing times require matching internet message ids. Copies with the same outcome print once under the first configured account holding them, naming the others; account Inbox counts retain each copy. A saved group number includes every copy, with protections and limits per copy. Awaiting-approval messages replace the Inbox list with per-account counts and action groups by kind and rule, merging equal-outcome copies as above, with visible-message counts and at most three sender examples; saved reports retain the grouped list. Limits count expanded messages. Group handled messages by account and list action, sender and subject; show every message with a planned action, including failures. Group the Inbox list by account without repeating its name on item lines. Leave unmatched mail untagged; tag protection, refused rules, unconfirmed actions and stopped runs. In dry runs put the planned action inline, including the move destination. Use the saved numbers and print reply examples only when numbers exist. Combine empty accounts on one line without headings. Put account problems directly after the first line, once per account with status and “retried once” only after a retry. Use accounts.HANDLE.name or HANDLE throughout the message and report. Show draft kind, recipients and full text above Inbox; tag successful drafts and unsubscribes on their numbered Inbox lines; handled lists only messages that left Inbox, joining their actions on one line. The first-line handled count counts messages. Tag partial success with done and failed actions; leave it unnumbered. If the message left Inbox, keep it handled and name any failed or unattempted action after the action that ran. Put the stop reason directly after account problems; put unplanned calls and folder help in Run notes. Check uncertain folder creation by hand before creating it. Use config.language and config.timezone. For new_plus_count, show protected/new items and count older items per account. Keep quiet runs silent.
+Account totals count messages; owner totals count numbered lines. Spam/phishing-flagged messages stay on separate lines. Other messages with equal sender address, tag and answerability share one Inbox line: sender (most frequent real display name, ignoring missing names unless all are missing; ties newest), count, newest subject. Singletons keep their form. Across accounts, copies require equal sender address and subject, plus equal internet message ids or received times within five minutes. Missing times require matching internet message ids. Copies with the same outcome print once under the first configured account holding them, naming the others; account Inbox counts retain each copy. A saved group number includes every copy, with protections and limits per copy. Awaiting-approval messages replace the Inbox list with per-account counts and action groups by kind and rule, merging copies only for equal action and rule, with visible-message counts and at most three sender examples; saved reports retain the grouped list. Limits count expanded messages. Group handled messages by account and list action, sender and subject; show every message with a planned action, including failures. Group the Inbox list by account without repeating its name on item lines. Leave unmatched mail untagged; tag protection, refused rules, unconfirmed actions and stopped runs. In dry runs put the planned action inline, including the move destination. Use the saved numbers and print reply examples only when numbers exist. Combine empty accounts on one line without headings. Put account problems directly after the first line, once per account with status and “retried once” only after a retry. Use accounts.HANDLE.name or HANDLE throughout the message and report. Show draft kind, recipients and full text above Inbox; tag successful drafts and unsubscribes on their numbered Inbox lines; handled lists only messages that left Inbox, joining their actions on one line. The first-line handled count counts messages. Tag partial success with done and failed actions; leave it unnumbered. If the message left Inbox, keep it handled and name any failed or unattempted action after the action that ran. Put the stop reason directly after account problems; put unplanned calls and folder help in Run notes. Check uncertain folder creation by hand before creating it. Use config.language and config.timezone. For new_plus_count, show protected/new items and count older items per account. Keep quiet runs silent.
 
 ## Decision and stop reasons
 
-Read decisions and reasons in plan.json. Keep decisions in Still in Inbox once. After commit, print their saved number and line record; before commit, print no numbers. Keep optional questions; never number protected messages. Treat report rules, missing/ambiguous move targets, invalid dates, missing folder information, invalid senders, unsafe unsubscribes and unmatched mail as decisions. Follow [Approval question](quickstart.md#approval-question) for threshold approvals and [Run exits](../AGENTS.md#run-exits) for command refusals.
+Read decisions and reasons in plan.json. Keep decisions in Still in Inbox once. After commit, print their saved number and line record; before commit, print no numbers. Keep optional questions; never number protected messages. Treat report rules, missing/ambiguous move targets, invalid dates, missing folder information, invalid senders, unsafe unsubscribes without a removal option and unmatched mail as decisions. Follow [Approval question](quickstart.md#approval-question) for threshold approvals and [Run exits](../AGENTS.md#run-exits) for command refusals.
 
 Stop for missing state with prior records, unconfigured accounts, no configured account listed, or an unexpectedly empty account whose saved expected count was at least three.
 
@@ -244,6 +248,7 @@ Read one JSON object on success or a nonzero one-line Refused: on stderr; follow
 | `draft` | Reply or forward. |
 | `draft_text` | Full rule body. |
 | `draft_to` | Rule forward recipients; empty for reply. |
+| `reason` | No usable unsubscribe link found: ordinary alternative removal. |
 
 ### Result statuses
 
@@ -282,6 +287,8 @@ For a developer runner, replace paths and pass the scheduled instruction:
 20 8 * * * cd /absolute/pigeon && PIGEON_HOME=/absolute/private-store /absolute/assistant-runner
 ```
 
+`schedule.always_full` also accepts a table: `weekdays = ["08:00"]` and `weekends = ["09:00"]`. Each list uses slots configured for that day type; an omitted key has no full slot. Saturday and Sunday use `config.timezone`. The single list keeps its existing meaning.
+
 ## Maintainer publication checks
 
 Never force private content into allowed files. Enable hooks with `git config core.hooksPath hooks`; use the [.gitignore allowlist](../.gitignore). Require maintainer review for checker, ignore, hook and workflow edits.
@@ -300,7 +307,7 @@ It records its own status; do not submit a gateway observation. See the listing 
 
 The client allows HTTPS on port 443 only, checks every DNS answer for public addresses, pins a checked address and verifies the host certificate. It follows at most three redirects, rechecking the scheme and addresses at each hop. It refuses credentials in URLs, authentication challenges, password forms and oversized headers; never handle login prompts yourself. It sends no cookies or credentials.
 
-The planner makes unsafe unsubscribe links and provider-flagged spam or phishing decisions for the user; it plans neither the request nor its companion action. Reports show safe planned unsubscribe destinations as hosts; mail values remain plain text on their item lines. Do not write unsubscribe rules for senders you suspect of spam or phishing; use spam instead. See the status table for local refusals and remembered failures.
+The planner makes unsafe unsubscribe links decisions by default; unsubscribe_fallback may instead plan an ordinary removal. Provider-flagged spam or phishing stays a decision. No unsafe request or companion is planned. Reports show safe planned unsubscribe destinations as hosts; mail values remain plain text on their item lines. Do not write unsubscribe rules for senders you suspect of spam or phishing; use spam instead. See the status table for local refusals and remembered failures.
 
 The network request releases the store gate. Ownership and the unchanged checkpoint are checked before saving its outcome or failure memory. Lost ownership leaves the issued call uncertain.
 

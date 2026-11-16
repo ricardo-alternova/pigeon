@@ -31,6 +31,76 @@ class MatcherTests(unittest.TestCase):
         self.config['accounts'] = {'cedar': {}}
         self.rules = [dict(id='r' + str(i), accounts=['cedar'], sender='s' + str(i) + '@example.net', action=verb, exclusions=[]) for i in range(groups)]
 
+    def test_subdomain_boundary_and_specificity(self):
+        self.batch(1, verb='archive')
+        self.rules = [dict(id='base', accounts=['cedar'], domain='example.org', action='archive'),
+                      dict(id='sub', accounts=['cedar'], domain='mail.example.org', action='spam'),
+                      dict(id='exact', accounts=['cedar'], sender='a@' + 'b.mail.example.org', action='report')]
+        for sender, expected in [('a@example.org', 'base'), ('a@' + 'MAIL.EXAMPLE.ORG', 'sub'),
+                                 ('a@' + 'b.mail.example.org', None), ('b@' + 'b.mail.example.org', 'sub'),
+                                 ('a@' + 'notexample.org', None), ('a@' + 'example.org.evil.test', None)]:
+            self.listing['messages'][0]['sender'] = sender
+            with self.subTest(sender=sender):
+                plan = self.plan()
+                self.assertEqual([x['rule'] for x in plan['actions']], [] if expected is None else [expected])
+        self.listing['messages'][0]['sender'] = 'b@' + 'b.mail.example.org'
+        self.holds = [dict(domain='EXAMPLE.ORG')]
+        self.assertEqual(self.plan()['actions'], [])
+        self.assertEqual(self.plan()['decisions'][0]['reason'], 'Protected by never-touch')
+
+    def test_published_examples_keep_plan(self):
+        from unittest.mock import patch
+        current = self.plan()
+        original = triage.matches
+        def exact_domain(message, rule, protection=False):
+            if not protection and 'domain' in rule and message['sender'].rsplit('@', 1)[-1].casefold() != rule['domain'].casefold().rstrip('.'):
+                return False
+            return original(message, rule, protection)
+        with patch.object(triage, 'matches', exact_domain):
+            self.assertEqual(current, self.plan())
+        self.assertEqual([a['id'] for a in current['actions']], ['m1', 'm4'])
+
+    def test_unsubscribe_fallback_actions_and_safety(self):
+        self.batch(1, verb='unsubscribe')
+        message = self.listing['messages'][0]
+        for option in ('ask', 'trash', 'archive'):
+            self.rules[0]['unsubscribe_fallback'] = option
+            for url in ('', 'http://example.net/leave', 'https://localhost/leave'):
+                message['unsubscribe_url'] = url
+                with self.subTest(option=option, url=url):
+                    plan = self.plan()
+                    if option == 'ask':
+                        self.assertEqual(plan['actions'], [])
+                        self.assertEqual(plan['decisions'][0]['reason'], 'Unsafe unsubscribe')
+                    else:
+                        self.assertEqual([a['action'] for a in plan['actions']], [option])
+                        self.assertEqual(plan['actions'][0]['reason'], 'No usable unsubscribe link found')
+                        self.assertIn('No usable unsubscribe link found', triage.render_report(dict(plan, dry_run=True), self.listing))
+            message['unsubscribe_url'] = 'https://example.net/leave'
+            self.assertEqual([a['action'] for a in self.plan()['actions']], ['unsubscribe'])
+        self.rules[0]['unsubscribe_fallback'] = 'trash'
+        message['unsubscribe_url'] = ''
+        self.holds = [dict(sender=message['sender'])]
+        self.assertEqual(self.plan()['actions'], [])
+        self.holds = []
+        self.batch(51, verb='unsubscribe')
+        self.rules[0]['unsubscribe_fallback'] = 'archive'
+        for message in self.listing['messages']: message.pop('unsubscribe_url')
+        plan = self.plan()
+        self.assertEqual(plan['approval_state'], 'awaiting approval')
+        self.assertEqual(len(plan['actions']), 51)
+        self.assertTrue(any(t['kind'] == 'destructive' for t in plan['approval_thresholds']))
+
+    def test_unsubscribe_fallback_validation(self):
+        self.batch(1, verb='unsubscribe')
+        for value in ('spam', '', None, True, [], {}):
+            self.rules[0]['unsubscribe_fallback'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'unsubscribe_fallback'):
+                self.plan()
+        self.rules[0].update(action='archive', unsubscribe_fallback='trash')
+        with self.assertRaisesRegex(ValueError, 'unsubscribe_fallback'):
+            self.plan()
+
     def test_configured_accounts(self):
         for totals in ({}, {'cedar': 100, 'marble': 100, 'extra': 100}):
             self.listing['accounts'] = totals
@@ -660,6 +730,34 @@ class CalendarTests(unittest.TestCase):
 
     def section(self, data):
         return '\n'.join(triage.calendar_section(data, self.config, self.now))
+
+    def test_spanish_calendar_labels_in_message_and_report(self):
+        self.config['language'] = 'es'
+        data = {'oak': [self.event('a', start='2026-03-28T07:00+01:00', end='2026-03-28T14:00+01:00'), self.event('b')]}
+        section = triage.calendar_section(data, self.config, self.now)
+        text = '\n'.join(section)
+        for label in ('Calendario', 'Invitaciones pendientes de respuesta', 'Solapamientos',
+                      'fuera del horario laboral', 'dentro del horario de silencio', 'tiene prioridad',
+                      'no leído; no se comprobaron los solapamientos con este calendario'):
+            self.assertIn(label, text)
+        listing = dict(accounts={'cedar': 0}, messages=[])
+        plan = triage.build_plan(listing, [], [], self.config)
+        plan['calendar_section'] = section
+        self.assertIn(text, triage.render_report(plan, listing, 'es'))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            (store / 'config.toml').write_text('language="es"\n[accounts.cedar]\n')
+            token = triage.acquire(store)
+            plan['dry_run'] = True
+            plan['first_run'] = True
+            (store / 'guardrails.md').write_text('Fixture policy\n')
+            (store / 'inbox.json').write_text(json.dumps(listing))
+            (store / 'rules.toml').write_text('rules=[]\n')
+            (store / 'never-touch.toml').write_text('allow_empty=true\n')
+            save_plan(store, token, store / 'plan.json', plan)
+            self.assertIn(text, triage.render_message(store, token, store / 'plan.json', None))
+        self.config['language'] = 'en'
+        self.assertIn('Calendar', self.section(data))
 
     def test_all_day_has_no_work_or_quiet_marks(self):
         event = self.event(start='2026-03-28', end='2026-03-29')
@@ -1497,6 +1595,19 @@ class PresentationGroupTests(unittest.TestCase):
         outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [])
         self.assertTrue(triage.group_text(outcomes, 'en').startswith('Newest <build@example.net> (3)'))
 
+    def test_real_name_beats_missing_name(self):
+        plan, listing = self.fixture()
+        for index in (0, 1): listing['messages'][index]['sender'] = 'build@example.net'
+        listing['messages'][2]['sender'] = 'Named <build@example.net>'
+        plan = triage.build_plan(listing, [], [], dict(accounts={'cedar': {}}))
+        outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [])
+        for language in ('en', 'es'):
+            self.assertTrue(triage.group_text(outcomes, language).startswith('Named <build@example.net> (3)'))
+        listing['messages'][2]['sender'] = 'build@example.net'
+        plan = triage.build_plan(listing, [], [], dict(accounts={'cedar': {}}))
+        outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [])
+        self.assertTrue(triage.group_text(outcomes, 'en').startswith('build@example.net (3)'))
+
     def test_group_partition_table(self):
         plan, listing = self.fixture()
         outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [])
@@ -1633,3 +1744,90 @@ class CrossAccountIdentityTests(unittest.TestCase):
             self.assertEqual(len(saved), 1)
             self.assertEqual(saved[0]['number'], 2)
             self.assertEqual(saved[0]['members'], [members[1]])
+
+class AuditSelectionTests(unittest.TestCase):
+    def test_question_before_domain_reproduction(self):
+        message = dict(account='cedar', id='c1', folder='Inbox', sender='billing@example.org', subject='Invoice 12 due')
+        rules = [dict(id='invoice-ask', accounts=['cedar'], subject='invoice', action='report', question='Keep?'),
+                 dict(id='vendor-trash', accounts=['cedar'], domain='example.org', action='trash', exclusions=[])]
+        plan = triage.build_plan(dict(accounts={'cedar': 100}, messages=[message]), rules, [], dict(accounts={'cedar': {}}))
+        self.assertEqual(plan['actions'], [])
+        self.assertEqual(plan['decisions'][0]['reason'], 'Rule requests a decision')
+
+    def test_empty_domain_labels_reproduction(self):
+        for sender in ['a@.example.org', 'a@evil..example.org']:
+            message = dict(account='cedar', sender=sender, subject='')
+            rule = dict(accounts=['cedar'], domain='example.org')
+            self.assertFalse(triage.matches(message, rule))
+            self.assertTrue(triage.matches(message, rule, protection=True))
+
+    def test_validate_specificity_reproduction(self):
+        rules = [dict(id='vendor-archive', accounts=['marble'], domain='example.org', action='archive'),
+                 dict(id='news-trash', accounts=['marble'], sender='news@example.org', action='trash', exclusions=[])]
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            (store / 'cases.toml').write_text('[[cases]]' + '\nname="news goes to trash"\naccount="marble"\nsender="news@example.org"\nsubject=""\nexpect="trash"\nexpect_rule="news-trash"\n')
+            self.assertEqual(triage.rule_cases(store, dict(accounts={'marble': {}}), rules, []), ([], 1))
+            plan = triage.build_plan(dict(accounts={'marble': 100}, messages=[dict(account='marble', id='n', folder='Inbox', sender='news@example.org', subject='')]), rules, [], dict(accounts={'marble': {}}))
+            self.assertEqual(plan['actions'][0]['rule'], 'news-trash')
+
+    def test_randomized_published_selection_comparison(self):
+        import random
+        import re
+        from unittest.mock import patch
+        # Published 188d621: exact action domains, first matching rule in file order.
+        def published_matches(message, rule):
+            if not rule.get('enabled', True) or message['account'] not in rule.get('accounts', []):
+                return False
+            sender = message['sender'].casefold()
+            if 'sender' in rule and sender != rule['sender'].casefold().rstrip('.'):
+                return False
+            if 'domain' in rule and sender.rsplit('@', 1)[-1] != rule['domain'].casefold().rstrip('.'):
+                return False
+            if 'subject' in rule and not re.search(rule['subject'], message['subject'], re.IGNORECASE):
+                return False
+            if 'body' in rule and ('body' not in message or not re.search(re.escape(rule['body']), message['body'], re.IGNORECASE)):
+                return False
+            if 'has_attachment' in rule and message.get('has_attachment', False) != rule['has_attachment']:
+                return False
+            return not any(word.casefold() in text.casefold()
+                           for word in rule.get('exclusions', [])
+                           for text in [message['subject']] + ([message['body']] if 'body' in rule else []))
+        def published_select(message, rules):
+            return next((r for r in rules if published_matches(message, r)), None)
+        for seed in range(1500):
+            rng = random.Random(seed)
+            rules = []
+            for i in range(3):
+                for kind, predicate in [('sender', {'sender': rng.choice(['a@example.org', 'a@' + 'mail.example.org', 'a@example.net'])}),
+                                        ('domain', {'domain': rng.choice(['example.org', 'mail.example.org', 'example.net'])}),
+                                        ('subject', {'subject': rng.choice(['invoice', 'weekly'])}),
+                                        ('body', {'body': rng.choice(['receipt', 'notice'])}),
+                                        ('question', {'subject': 'invoice', 'question': 'Keep?'})]:
+                    rules.append(dict(id=kind+str(i), accounts=['cedar'], action='report' if kind == 'question' else rng.choice(['archive', 'trash']), exclusions=[], **predicate))
+            rng.shuffle(rules)
+            messages = [dict(account='cedar', id=str(i), folder='Inbox', sender='a@'+domain,
+                             subject=rng.choice(['invoice', 'weekly', 'other']), body=rng.choice(['receipt', 'notice', 'other']))
+                        for i, domain in enumerate(['example.org', 'mail.example.org', 'b.mail.example.org', 'example.net', 'elsewhere.example.net', 'other.invalid'])]
+            for message in messages:
+                matching = [r for r in rules if triage.matches(message, r)]
+                leading = []
+                for rule in matching:
+                    if not ('sender' in rule or 'domain' in rule):
+                        break
+                    leading.append(rule)
+                expected = max(leading, key=lambda r: ('sender' in r, len(r.get('domain', '').rstrip('.')))) if leading else next(iter(matching), None)
+                chosen = triage.select_rule(message, rules)
+                self.assertEqual(chosen, expected, seed)
+                old = published_select(message, rules)
+                if chosen != old:
+                    widened = any(not published_matches(message, r) for r in matching[:matching.index(chosen)+1])
+                    more_specific = chosen in leading and old in leading and leading.index(chosen) > leading.index(old)
+                    self.assertTrue(widened or more_specific, seed)
+            listing = dict(accounts={'cedar': 1000}, messages=messages)
+            config = dict(accounts={'cedar': {}})
+            current = triage.build_plan(listing, rules, [], config)
+            with patch.object(triage, 'select_rule', published_select):
+                published = triage.build_plan(listing, rules, [], config)
+            if all(triage.select_rule(m, rules) == published_select(m, rules) for m in messages):
+                self.assertEqual(current, published, seed)

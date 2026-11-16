@@ -134,6 +134,24 @@ class FlowTests(unittest.TestCase):
         save_plan(self.store, self.token, self.store / 'plan.json', plan)
         return execute.Execution(self.store, self.token, self.store / 'plan.json')
 
+    def test_fallback_executes_as_ordinary_removal(self):
+        with (self.store / 'rules.toml').open('a') as out:
+            out.write('unsubscribe_fallback="archive"\n')
+        self.message.pop('unsubscribe_url')
+        machine = self.machine()
+        self.assertEqual(machine.plan['actions'][0]['action'], 'archive')
+        self.assertEqual(machine.step()['action'], 'archive')
+
+    def test_fallback_never_follows_failed_attempt(self):
+        path = self.store / 'rules.toml'
+        path.write_text(path.read_text().replace('after_unsubscribe="trash"', 'unsubscribe_fallback="archive"'))
+        machine = self.machine()
+        machine.step()
+        with patch.object(client, 'request', return_value='failed'):
+            self.assertEqual(machine.step(local=True)['status'], 'failed')
+        self.assertTrue(machine.step()['done'])
+        self.assertEqual([r['action'] for r in execute.read(self.store / 'results.json')['results']], ['unsubscribe'])
+
     def test_unsafe_unsubscribe_is_decision_without_companion(self):
         for url, flags in [('mailto:leave@example.net', {}), ('http://example.net/', {}),
                            ('https://example.net/', {'spam': True}),

@@ -292,7 +292,7 @@ class KitTextTests(unittest.TestCase):
             content = (ROOT / name).read_text().casefold()
             if name == 'docs/hosted-setup.md':
                 content = content.split('## private store')[1].split('## configuration')[0]
-            self.assertNotIn('fallback', content)
+            self.assertNotIn('fallback', content.replace('unsubscribe_fallback', 'unsubscribe_option'))
         section = (ROOT / '.agents/skills/email-triage/SKILL.md').read_text().split('## Standard run message')[1]
         for term in ('message', 'rules.toml', 'never-touch.toml', 'plan.json'):
             self.assertIn(term, section)
@@ -683,7 +683,7 @@ class ConverterDocumentationTests(unittest.TestCase):
         text = setup_text()
         section = text.split('## Convert a rules table')[1].split('## Run message format')[0]
         for term in ('--table', '--scopes', '--out', '--review', 'Active:', 'Switched off:', 'Review:',
-                     'enabled = true', 'exclusions', 'validate', 'Dry run', 'first matching enabled'):
+                     'enabled = true', 'exclusions', 'validate', 'Dry run', 'most specific matching enabled'):
             self.assertIn(term, section)
         self.assertIn('| enabled | Optional boolean, default true.', text)
         self.assertIn('#convert-a-rules-table', (ROOT/'docs/quickstart.md').read_text())

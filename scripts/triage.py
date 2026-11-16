@@ -1060,8 +1060,8 @@ def validate_rules(rules):
                 raise ValueError('Rule id and action must be non-empty strings')
             if 'target' in rule and (rule['action'] != 'move' or not isinstance(rule['target'], str)):
                 raise ValueError('rule.target: expected a folder name string on move rules only')
-            if set(rule) - {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'body', 'question', 'limit', 'enabled', 'draft', 'draft_text', 'draft_to'}:
-                known_keys(rule, {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'body', 'question', 'limit', 'enabled', 'draft', 'draft_text', 'draft_to'}, 'rule')
+            if set(rule) - {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'unsubscribe_fallback', 'body', 'question', 'limit', 'enabled', 'draft', 'draft_text', 'draft_to'}:
+                known_keys(rule, {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'unsubscribe_fallback', 'body', 'question', 'limit', 'enabled', 'draft', 'draft_text', 'draft_to'}, 'rule')
             if rule['action'] == 'draft':
                 if rule.get('draft') not in ('reply', 'forward'):
                     raise ValueError('draft: expected reply or forward')
@@ -1089,6 +1089,8 @@ def validate_rules(rules):
                     or not isinstance(rule['question'], str) or not rule['question'].strip()
                     or len(rule['question']) > QUESTION_LIMIT):
                 raise ValueError('question: expected a non-empty string of at most 500 characters on report rules only')
+            if 'unsubscribe_fallback' in rule and (rule['action'] != 'unsubscribe' or rule['unsubscribe_fallback'] not in ('ask', 'trash', 'archive')):
+                raise ValueError('unsubscribe_fallback: expected ask, trash or archive on unsubscribe rules')
             if 'after_unsubscribe' in rule and (rule['action'] != 'unsubscribe' or rule['after_unsubscribe'] not in ('trash', 'archive')):
                 raise ValueError('after_unsubscribe: expected trash or archive on unsubscribe rules')
             if rule['id'] in ids:
@@ -1120,7 +1122,9 @@ def matches(message, rule, protection=False):
     if 'domain' in rule:
         domain = sender.rsplit('@', 1)[-1]
         wanted = rule['domain'].casefold().rstrip('.')
-        if domain != wanted and not (protection and domain.endswith('.' + wanted)):
+        if not protection and any(not label for label in domain.split('.')):
+            return False
+        if domain != wanted and not domain.endswith('.' + wanted):
             return False
     if 'subject' in rule and not re.search(rule['subject'], message['subject'], re.IGNORECASE):
         return False
@@ -1135,6 +1139,20 @@ def matches(message, rule, protection=False):
     return not any(word.casefold() in text.casefold()
                    for word in rule.get('exclusions', [])
                    for text in [message['subject']] + ([message['body']] if 'body' in rule else []))
+
+
+
+def select_rule(message, rules):
+    leading = []
+    for rule in rules:
+        if not matches(message, rule):
+            continue
+        if 'sender' not in rule and 'domain' not in rule:
+            if not leading:
+                return rule
+            break
+        leading.append(rule)
+    return max(leading, key=lambda r: ('sender' in r, len(r.get('domain', '').rstrip('.'))), default=None)
 
 
 def validate_actions(actions, listing):
@@ -1256,6 +1274,12 @@ def gateway_account(config, account):
     return {k: fields[k] for k in ('executor_app', 'executor_account') if k in fields}
 
 
+def full_slots(config, now):
+    full = config['schedule']['always_full']
+    day = 'weekends' if schedule_slot(config, now).weekday() >= 5 else 'weekdays'
+    return full.get(day, []) if isinstance(full, dict) else full
+
+
 def quiet_check(store, config, previous, observation, scheduled, now, *, dry_run=False):
     import execute
     path = store / 'quiet-check.json'
@@ -1271,7 +1295,7 @@ def quiet_check(store, config, previous, observation, scheduled, now, *, dry_run
         decision = {'decision': 'full', 'reason': 'no schedule'}
     elif not scheduled:
         decision = {'decision': 'full', 'reason': 'on demand'}
-    elif schedule_slot(config, now).strftime('%H:%M') in config['schedule']['always_full']:
+    elif schedule_slot(config, now).strftime('%H:%M') in full_slots(config, now):
         decision = {'decision': 'full', 'reason': 'always-full slot'}
     elif (store / 'run-message.md').exists():
         decision = {'decision': 'full', 'reason': 'undelivered message'}
@@ -1289,7 +1313,7 @@ def quiet_check(store, config, previous, observation, scheduled, now, *, dry_run
     if observed is not None and not observed[0]:
         decision = {'decision': 'full', 'reason': 'account errors'}
     if (observed and scheduled and 'schedule' in config
-            and schedule_slot(config, now).strftime('%H:%M') not in config['schedule']['always_full']
+            and schedule_slot(config, now).strftime('%H:%M') not in full_slots(config, now)
             and not (store / 'run-message.md').exists()):
         decision['quiet_accounts'] = observed[2]
     gateway = store/'quiet-gateway.json'
@@ -1428,15 +1452,21 @@ def validate_inputs(listing, config, previous):
     if 'schedule' in config:
         schedule = config['schedule']
         known_keys(schedule, {'weekdays', 'weekends', 'always_full'}, 'config.schedule')
-        for key in ('weekdays', 'weekends', 'always_full'):
-            times = schedule.get(key)
+        full = schedule.get('always_full')
+        if isinstance(full, dict):
+            known_keys(full, {'weekdays', 'weekends'}, 'config.schedule.always_full')
+        for key, times in list((k, schedule.get(k)) for k in ('weekdays', 'weekends')) + list(
+                (('always_full.' + k, v) for k, v in full.items()) if isinstance(full, dict)
+                else [('always_full', full)]):
             if (not isinstance(times, list) or any(not isinstance(t, str) or
                     not re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]', t) for t in times)
                     or len(times) != len(set(times))
-                    or (key != 'always_full' and not times)):
+                    or (key in ('weekdays', 'weekends') and not times)):
                 raise ValueError('config.schedule.' + key + ': expected unique HH:MM times (nonempty day slots)')
-        if not set(schedule['always_full']) <= set(schedule['weekdays'] + schedule['weekends']):
-            raise ValueError('config.schedule.always_full: expected configured slot times')
+            if key.startswith('always_full'):
+                slots = schedule.get(key.split('.')[-1], []) if '.' in key else schedule['weekdays'] + schedule['weekends']
+                if not set(times) <= set(slots):
+                    raise ValueError('config.schedule.' + key + ': expected configured slot times')
     accounts = config.get('accounts')
     if not isinstance(accounts, dict) or not accounts:
         raise ValueError('config.accounts: expected a non-empty table')
@@ -1561,9 +1591,8 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
             reason = 'Protected by never-touch'
         else:
             candidates = rules if selections is None else [selections[(message["account"], message["id"])]] if (message["account"], message["id"]) in selections else []
-            for rule in candidates:
-                if selections is None and not matches(message, rule):
-                    continue
+            selected = select_rule(message, candidates) if selections is None else next(iter(candidates), None)
+            for rule in [selected] if selected is not None else []:
                 if rule['action'] == 'draft' and any(d['account'] == message['account'] and d['id'] == message['id'] for d in (previous or {}).get('_drafts', [])):
                     reason = 'Draft waiting'
                     break
@@ -1609,8 +1638,13 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                 if verb == 'unsubscribe':
                     action['url'] = message.get('unsubscribe_url', '')
                     if not safe_unsubscribe_host(action['url']) or message.get('spam') or message.get('phishing'):
-                        reason = 'Unsafe unsubscribe'
-                        break
+                        fallback = rule.get('unsubscribe_fallback', 'ask')
+                        if fallback == 'ask' or message.get('spam') or message.get('phishing'):
+                            reason = 'Unsafe unsubscribe'
+                            break
+                        verb = fallback
+                        action.update(action=fallback, reason='No usable unsubscribe link found')
+                        action.pop('url')
                 if verb == 'report':
                     reason = 'Rule requests a decision'
                     question = {'question': rule['question']} if 'question' in rule else {}
@@ -2120,6 +2154,8 @@ def action_label(action, listing, language='en', planned=False):
         target = action.get('target_path', action.get('target', ''))
         target = next((f['name'] for f in listing.get('folders', {}).get(action['account'], []) if f['id'] == target), target)
         verb += (' to ' if language == 'en' else ' a ') + chat_text(target)
+    if action.get('reason'):
+        verb += ' (' + ('No usable unsubscribe link found' if language == 'en' else 'No se encontró un enlace de baja utilizable') + ')'
     return (('would ' if language == 'en' else 'previsto: ') if planned else '') + verb
 
 
@@ -2307,11 +2343,13 @@ def group_text(group, language):
         except (ValueError, OverflowError, OSError):
             return float('-inf')
     latest = max(group, key=timestamp)['item']
+    named = [o for o in group if getaddresses([o['item']['sender']])[0][0]]
+    voters = named or group
     counts = {}
-    for outcome in group:
+    for outcome in voters:
         sender = getaddresses([outcome['item']['sender']])[0][0]
         counts[sender] = counts.get(sender, 0) + 1
-    sender = max(group, key=lambda o: (counts[getaddresses([o['item']['sender']])[0][0]], timestamp(o)))['item']['sender']
+    sender = max(voters, key=lambda o: (counts[getaddresses([o['item']['sender']])[0][0]], timestamp(o)))['item']['sender']
     return (chat_text(sender)[:160] + ' (' + str(len(group)) + ') · '
             + ('latest: ' if language == 'en' else 'más reciente: ') + chat_text(latest['subject'])[:240] + suffix)
 
@@ -2385,10 +2423,11 @@ def calendar_section(data, config, now):
     settings = config.get('calendar', {})
     start = datetime.combine(today, datetime.min.time(), zone).timestamp()
     end = datetime.combine(today + timedelta(days=settings.get('days', 3)), datetime.min.time(), zone).timestamp()
+    es = config.get('language', 'en') == 'es'
     events, pending, unread = [], [], []
     for name in sorted(config['calendars']):
         if name not in data or data[name] == {'failed': True}:
-            unread.append(chat_text(name) + ': not read; overlaps against it were not checked')
+            unread.append(chat_text(name) + (': no leído; no se comprobaron los solapamientos con este calendario' if es else ': not read; overlaps against it were not checked'))
             continue
         for event in data[name]:
             if event['cancelled'] or event['response'] == 'declined':
@@ -2406,27 +2445,27 @@ def calendar_section(data, config, now):
     def describe(item):
         _, name, ident, _, event, a, b = item
         return chat_text(name + ' · ' + ident + ' · ' + a.isoformat() + ' — ' + b.isoformat() + ' · ' + event.get('subject', ''))
-    lines = ['', 'Calendar', '', 'Invitations waiting for an answer']
+    lines = ['', 'Calendario' if es else 'Calendar', '', 'Invitaciones pendientes de respuesta' if es else 'Invitations waiting for an answer']
     for item in sorted(pending):
         a, b = item[5:]
         marks = []
         clock = a.strftime('%H:%M')
         if not item[4]['all_day'] and 'work_start' in settings and (clock < settings['work_start'] or clock >= settings['work_end'] or (b.date() == a.date() and b.strftime('%H:%M') > settings['work_end'])):
-            marks.append('outside working hours')
+            marks.append('fuera del horario laboral' if es else 'outside working hours')
         if not item[4]['all_day'] and 'quiet_start' in settings:
             qstart = a.replace(hour=int(settings['quiet_start'][:2]), minute=int(settings['quiet_start'][3:]), second=0, microsecond=0).timestamp()
             qend = a.replace(hour=int(settings['quiet_end'][:2]), minute=int(settings['quiet_end'][3:]), second=0, microsecond=0).timestamp()
             if a.timestamp() < qend and b.timestamp() > qstart:
-                marks.append('inside quiet window')
+                marks.append('dentro del horario de silencio' if es else 'inside quiet window')
         lines.append('- ' + describe(item) + (' · ' + ', '.join(marks) if marks else ''))
-    lines.append('Overlaps')
+    lines.append('Solapamientos' if es else 'Overlaps')
     ordered = sorted(events)
     for i, first in enumerate(ordered):
         for second in ordered[i + 1:]:
             if second[0] >= first[3]:
                 break
             winner = next((x[1] for x in (first, second) if config['calendars'][x[1]].get('wins')), None)
-            lines.append('- ' + describe(first) + ' / ' + describe(second) + (' · ' + chat_text(winner) + ' stays' if winner else ''))
+            lines.append('- ' + describe(first) + ' / ' + describe(second) + (' · ' + chat_text(winner) + (' tiene prioridad' if es else ' stays') if winner else ''))
     lines += unread
     return lines
 
@@ -2591,12 +2630,22 @@ def awaiting_message(store, plan, listing, language, *, new_question=False, outc
     lines += account_problems(plan, listing, store, language)
     lines += [account_name(plan, a) + ': no new mail' for a in listing.get('quiet', [])]
     lookup = {(m['account'], m['id']): m for m in listing['messages']}
-    primary = {(o['item']['account'], o['item']['id']) for o in outcomes}
+    primary = set()
+    for outcome in outcomes:
+        seen = set()
+        for copy in outcome.get('copies', [outcome['item']]):
+            for action in plan['actions']:
+                if (action['account'], action['id']) != (copy['account'], copy['id']):
+                    continue
+                signature = (action['action'], action['rule'])
+                if signature not in seen:
+                    primary.add((action['account'], action['id'], *signature))
+                    seen.add(signature)
     for account, count in plan['counts'].items():
         lines.append(account_name(plan, account) + ': ' + str(count) + ((' message' if count == 1 else ' messages') + ' in Inbox' if language == 'en' else (' mensaje' if count == 1 else ' mensajes') + ' en Recibidos'))
         groups = {}
         for action in plan['actions']:
-            if action['account'] == account and action['action'] != 'create-folder' and (account, action['id']) in primary:
+            if action['account'] == account and action['action'] != 'create-folder' and (account, action['id'], action['action'], action['rule']) in primary:
                 groups.setdefault((action['action'], action['rule']), []).append(action)
         for (kind, rule), actions in groups.items():
             examples = list(dict.fromkeys(chat_text(lookup.get((account, a['id']), {}).get('sender', ''))[:160]
@@ -3076,7 +3125,7 @@ def rule_cases(store, config, rules, holds):
             if any(matches(message, h, protection=True) for h in holds):
                 found = 'never-touch'
             else:
-                rule = next((r for r in rules if matches(message, r)), None)
+                rule = select_rule(message, rules)
                 if rule is not None: found, rule_id = rule['action'], rule['id']
         if found != case['expect'] or ('expect_rule' in case and case['expect_rule'] != rule_id):
             expected_rule = case.get('expect_rule')
@@ -3109,7 +3158,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         actions = set()
         for i, action in enumerate(plan['actions']):
             label = str(plan_path) + '.actions.' + str(i)
-            known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to'}, label)
+            known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'reason'}, label)
             if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action')):
                 raise ValueError(label + ': expected account, id and action strings')
             if action['action'] not in PLAN_VERBS or action['account'] not in counts:
