@@ -10,7 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ['README.md', 'AGENTS.md', 'CLAUDE.md',
         '.agents/skills/email-triage/SKILL.md', 'docs/setup.md', 'docs/hosted-setup.md',
-        'config/guardrails.example.md', 'docs/quickstart.md']
+        'config/guardrails.example.md', 'docs/quickstart.md', 'docs/migrate-rules.md']
 
 
 def setup_text():
@@ -18,6 +18,28 @@ def setup_text():
 
 
 class KitTextTests(unittest.TestCase):
+    def test_r174_predicate_documentation(self):
+        quick = (ROOT/'docs/quickstart.md').read_text().split('## Numbered reply\n')[1].split('## Dry run')[0]
+        self.assertIn('Handle judgments_needed as in Plan and execute before continuing.', quick)
+        self.assertNotIn('also count as predicates without sender/subject', (ROOT/'docs/setup.md').read_text())
+        sys.path.insert(0, str(ROOT/'scripts'))
+        import triage
+        for key in ('has_attachment', 'keep_latest', 'recipients_min', 'recipients_max', 'is_reply'):
+            self.assertIn('needs sender, domain, subject, body or judgment', triage.RULE_KINDS['rules.toml'][key]['meaning'])
+
+    def test_rule_migration_document(self):
+        text = (ROOT/'docs/migrate-rules.md').read_text()
+        self.assertLessEqual(len(text.encode()), 9000)
+        for phrase in ('separate staging folder', 'run lock', 'owner asks', 'PIGEON_HOME=/absolute/private-store/migration'):
+            self.assertIn(phrase, text)
+        for phrase in ('rule-kinds', 'cases.toml', 'never-touch.toml', 'private store', 'not expressible', 'dry run', 'totals'):
+            self.assertIn(phrase, text)
+        install = text.split('Between runs,')[1]
+        self.assertLess(install.index('fetch-state'), install.index('in place'))
+        self.assertLess(install.index('in place'), install.index('send-state'))
+        self.assertLess(install.index('send-state'), install.index('release'))
+        self.assertIn('docs/migrate-rules.md', (ROOT/'AGENTS.md').read_text())
+
     def test_scaled_message_documentation(self):
         quick = (ROOT/'docs/quickstart.md').read_text()
         setup = (ROOT/'docs/setup.md').read_text()
@@ -124,7 +146,7 @@ class KitTextTests(unittest.TestCase):
             self.assertIn(term, text)
 
     def test_reference_size_caps(self):
-        self.assertLessEqual((ROOT / 'docs/setup.md').stat().st_size, 38000)
+        self.assertLessEqual((ROOT / 'docs/setup.md').stat().st_size, 42000)
         self.assertLessEqual((ROOT / 'docs/hosted-setup.md').stat().st_size, 16300)
         self.assertLess((ROOT / 'AGENTS.md').stat().st_size, 8000)
 

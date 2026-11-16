@@ -99,6 +99,9 @@ For every call use `{accountId,input}`. Replace APP in tool paths with accounts.
 
 Prefix table tools with tools.APP.; use tools["APP-SLUG"].rest for other app slugs. Pass action calls as printed.
 
+For conditional recipient/reply fields, extend only affected accounts using
+[Conditional rules](setup.md#conditional-rules); use the manual-part path.
+
 ### Gmail
 
 Use path {userId:"me"} for every Gmail call; add id for message/label reads. Page every list until no nextPageToken.

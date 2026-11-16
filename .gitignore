@@ -1,4 +1,4 @@
-# Only the files listed below are public. Everything else stays ignored.
+# Public files are explicitly un-ignored below. Everything else stays ignored.
 # Un-ignore each parent directory before its contents.
 # Private kit data belongs in ~/.config/pigeon/ or the folder PIGEON_HOME names,
 # outside the checkout; private/demo is for fictional data only.
@@ -36,6 +36,7 @@ tests/fixtures/*
 !.gitignore
 !.agents/skills/email-triage/SKILL.md
 !.claude/skills
+!docs/migrate-rules.md
 !docs/setup.md
 !docs/hosted-setup.md
 !docs/quickstart.md

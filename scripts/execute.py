@@ -81,7 +81,7 @@ class Execution:
         triage.require_plan_token(self.plan, token)
         if self.plan.get('dry_run'):
             raise ValueError('dry-run plan: execution is refused; no call issued')
-        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds'}, str(self.plan_path))
+        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'judgments', 'judgment_token'}, str(self.plan_path))
         for key in ('actions', 'decisions', 'reasons'):
             if not isinstance(self.plan.get(key), list):
                 raise ValueError(str(self.plan_path) + '.' + key + ': expected an array')
@@ -90,7 +90,7 @@ class Execution:
         triage.known_keys(self.plan.get('counts'), set(self.plan.get('counts', {})), str(self.plan_path) + '.counts')
         creates = set()
         for action in self.plan['actions']:
-            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'reason'}, str(self.plan_path) + '.actions')
+            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'reason', 'judgment'}, str(self.plan_path) + '.actions')
             if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action', 'rule')):
                 raise ValueError(str(self.plan_path) + '.actions: expected account, id, action and rule strings')
             if 'target_path' in action:
@@ -185,7 +185,7 @@ class Execution:
             raise ValueError(label + '.pending: expected null or the next planned action')
         pending = self.state['pending']
         if pending is not None:
-            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to', 'reason'}, label + '.pending')
+            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to', 'reason', 'judgment'}, label + '.pending')
             if len(results) == len(self.plan['actions']) or pending != self.plan['actions'][len(results)]:
                 raise ValueError(label + '.pending: expected the next planned action unchanged')
 
@@ -220,14 +220,17 @@ class Execution:
                     raise ValueError('reply.json: expected current token')
             source = self.plan.get('reply_source', {})
             expected = triage.reply_plan(self.store, listing, holds, config, previous, saved['parts'], stops,
-                                         numbers=source.get('numbers'))
+                                         numbers=source.get('numbers'), judgments=self.plan.get('judgments'), run_token=self.plan.get('judgment_token'))
+            if 'judgments_needed' in expected:
+                raise ValueError('judgments: answers required; plan the reply again')
             if self.plan['reply'] != expected['reply']:
                 raise ValueError('reply: expected saved user selections')
         elif self.plan['reasons'] and self.plan['reasons'][0].startswith('Reply refused:'):
             expected = triage.build_plan(listing, [], holds, config, previous, self.plan['reasons'])
         else:
-            expected = triage.build_plan(listing, rules, holds, config, previous, stops)
+            expected = triage.build_plan(listing, rules, holds, config, previous, stops, judgments=self.plan.get('judgments'), run_token=self.plan.get('judgment_token'))
         if self.plan.get('approval_state') == 'approved':
+            triage.check_question_judgments(self.store, self.plan)
             if expected['reasons'] != self.plan.get('approved_thresholds'):
                 raise ValueError('approval: thresholds changed; plan again')
             history = self.store / 'history.log'
@@ -235,7 +238,7 @@ class Execution:
                       if ' approval ' in line] if history.exists() else []
             run = str(self.plan.get('run_id'))
             marker = 'approved: ' + run + ' ' + hashlib.sha256(self.token.encode()).hexdigest()
-            if len(events) < 2 or events[-2:] != ['asked: ' + run, marker]:
+            if len(events) < 2 or events[-2:] != [triage.question_event(self.plan), marker]:
                 raise ValueError('approval: no recorded approval for this run id and current lock; plan again')
             if triage.state_setting(config)['kind'] != 'local':
                 exchange = read(self.store / 'state-exchange.json')
@@ -344,7 +347,7 @@ class Execution:
             holds = triage.parse_rules(triage.read_text(self.store / 'never-touch.toml'), protection=True)
             messages = {(m['account'], m['id']): m for m in listing['messages']}
             for item in items:
-                if any(triage.matches(messages[item['account'], item['id']], rule, protection=True) for rule in holds):
+                if any(triage.matches(messages[item['account'], item['id']], rule, protection=True) for rule in holds if 'judgment' not in rule):
                     item['reason'] = 'Protected by never-touch'
                     item.pop('number', None)
                     item.pop('question', None)
@@ -850,6 +853,8 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
             atomic(scratch / 'inbox.json', plan['dry_listing'])
         real_plan = {k: v for k, v in plan.items() if k not in ('dry_run', 'dry_listing', 'ungrouped_run')}
         real_plan['run_token'] = simulated_token
+        if 'reply_source' in real_plan:
+            atomic(scratch / 'reply.json', dict(token=simulated_token, parts=real_plan['reply_source']['parts']))
         path = scratch / 'simulation-plan.json'
         atomic(path, real_plan)
         if real_plan.get('approval_state') == 'awaiting approval':

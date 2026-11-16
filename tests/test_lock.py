@@ -1716,6 +1716,29 @@ class DriveStateTests(unittest.TestCase):
             result = self.exchange('send', observation)
         return names, result
 
+    def test_r174_documented_migration_install_drive(self):
+        self.configured('onedrive')
+        self.fetch()
+        self.send()
+        call = self.start('release', self.token)['call']
+        self.observe(self.drive.perform(call), 'release', self.token)
+        self.token = self.acquire()
+        install = (ROOT/'docs/migrate-rules.md').read_text().split('Between runs,')[1]
+        if 'fetch-state' in install:
+            self.fetch()
+        migrated = '[[rules]]\nid="migrated"\naccounts=["cedar"]\nsubject="Migration"\naction="archive"\n'
+        (self.store/'rules.toml').write_text(migrated)
+        if 'send-state' in install:
+            self.send()
+        call = self.start('release', self.token)['call']
+        self.observe(self.drive.perform(call), 'release', self.token)
+        self.token = self.acquire()
+        self.fetch()
+        listing = dict(accounts={'cedar':100}, messages=[dict(account='cedar', id='migration', sender='news@example.org', subject='Migration', folder='Inbox')])
+        config, rules, holds = triage.load_safety([self.store/n for n in ('config.toml','rules.toml','never-touch.toml','guardrails.md')])
+        plan = triage.build_plan(listing, rules, holds, config)
+        self.assertEqual([a['rule'] for a in plan['actions']], ['migrated'])
+
     def test_r149_malformed_log_counters_drive(self):
         for value in ['x', None, True, -1, 1.5, 10 ** 100]:
             with self.subTest(value=value):

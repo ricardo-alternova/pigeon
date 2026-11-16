@@ -541,7 +541,7 @@ def validate_state_file(name, raw, config, folder):
                     raise ValueError(name + ': invalid call log')
     elif name == 'history.log':
         for line in text.splitlines():
-            if not re.fullmatch(r'[0-9T:.+Z-]{20,40} (?:skipped: no new mail|abandoned: earlier lock exchange|approval (?:asked|skipped|expired|replaced|stale): [0-9a-f]{64}|approval approved: [0-9a-f]{64} [0-9a-f]{64})', line):
+            if not re.fullmatch(r'[0-9T:.+Z-]{20,40} (?:skipped: no new mail|abandoned: earlier lock exchange|approval (?:asked: [0-9a-f]{64}(?: [0-9a-f]{64})?|(?:skipped|expired|replaced|stale): [0-9a-f]{64})|approval approved: [0-9a-f]{64} [0-9a-f]{64})', line):
                 raise ValueError('history.log: invalid skip line')
             if state_timestamp(line.split(' ')[0], folder / name).utcoffset() != timedelta(0):
                 raise ValueError('history.log: expected UTC')
@@ -667,7 +667,7 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
             plan = parse_json(contents['plan.json'].decode('utf-8'), plan_path) if contents.get('plan.json') else {}
             events = [line.split(' approval ', 1)[1] for line in contents.get('history.log', b'').decode('utf-8').splitlines() if ' approval ' in line]
             waiting = (plan.get('approval_state') == 'awaiting approval' and not plan.get('dry_run')
-                       and events and events[-1] == 'asked: ' + str(plan.get('run_id'))
+                       and events and events[-1] == question_event(plan)
                        and not question_closed(store, plan))
             if waiting and 'inbox.json' not in contents:
                 raise ValueError('approval: awaiting plan requires inbox.json for drive state')
@@ -798,13 +798,180 @@ def finish_run(store, token, plan=None, observation=None, *, now=None):
     return {'calls': uploads + [released['call']]}
 
 
+RULE_KINDS = {'rules.toml': {'id': {'type': 'string',
+                       'allowed_values': None,
+                       'limits': {},
+                       'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                       'meaning': 'Unique rule identifier.'},
+                'action': {'type': 'string',
+                           'allowed_values': ['archive', 'draft', 'move', 'report', 'spam', 'trash', 'unsubscribe'],
+                           'limits': {},
+                           'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                           'meaning': 'Action selected by the rule.'},
+                'accounts': {'type': 'array',
+                             'allowed_values': None,
+                             'limits': {'min_items': 1},
+                             'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                             'meaning': 'Configured account handles to match.'},
+                'sender': {'type': 'string',
+                           'allowed_values': None,
+                           'limits': {'min_length': 1},
+                           'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                           'meaning': 'Exact sender address, ignoring case.'},
+                'domain': {'type': 'string',
+                           'allowed_values': None,
+                           'limits': {'min_length': 1},
+                           'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                           'meaning': 'Sender domain and its subdomains.'},
+                'subject': {'type': 'string',
+                            'allowed_values': None,
+                            'limits': {'min_length': 1},
+                            'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                            'meaning': 'Case insensitive Python regex on subject; must not match empty text.'},
+                'has_attachment': {'type': 'boolean',
+                                   'allowed_values': None,
+                                   'limits': {},
+                                   'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                                   'meaning': 'Match the attachment flag; absent means false. This condition needs sender, domain, subject, body or judgment beside it.'},
+                'judgment': {'type': 'string',
+                             'allowed_values': None,
+                             'limits': {'min_length': 1, 'max_length': 500},
+                             'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report'],
+                             'meaning': 'Assistant criterion evaluated after other predicates.'},
+                'body': {'type': 'string',
+                         'allowed_values': None,
+                         'limits': {'min_length': 1},
+                         'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                         'meaning': 'Case insensitive literal substring in excerpt.'},
+                'exclusions': {'type': 'array',
+                               'allowed_values': None,
+                               'limits': {},
+                               'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                               'meaning': 'Literal subject or excerpt substrings that exclude mail.'},
+                'enabled': {'type': 'boolean',
+                            'allowed_values': None,
+                            'limits': {},
+                            'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                            'meaning': 'Whether the rule participates; default true.'},
+                'limit': {'type': 'integer',
+                          'allowed_values': None,
+                          'limits': {'min': 1, 'max': 50},
+                          'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'],
+                          'meaning': 'Per rule action ceiling; default ten, excess asks approval.'},
+                'question': {'type': 'string',
+                             'allowed_values': None,
+                             'limits': {'min_length': 1, 'max_length': 500},
+                             'actions': ['report'],
+                             'meaning': 'Owner question accompanying a report decision.'},
+                'target': {'type': 'string',
+                           'allowed_values': None,
+                           'limits': {'min_length': 1, 'max_length': 255, 'max_segments': 8},
+                           'actions': ['move'],
+                           'meaning': 'Move folder path, optionally using {year} and {month}.'},
+                'after_unsubscribe': {'type': 'string',
+                                      'allowed_values': ['trash', 'archive'],
+                                      'limits': {},
+                                      'actions': ['unsubscribe'],
+                                      'meaning': 'Companion removal after unsubscribe.'},
+                'unsubscribe_fallback': {'type': 'string',
+                                         'allowed_values': ['ask', 'trash', 'archive'],
+                                         'limits': {},
+                                         'actions': ['unsubscribe'],
+                                         'meaning': 'Outcome when no usable unsubscribe link exists; default ask.'},
+                'draft': {'type': 'string',
+                          'allowed_values': ['reply', 'forward'],
+                          'limits': {},
+                          'actions': ['draft'],
+                          'meaning': 'Draft kind, never sends.'},
+                'draft_text': {'type': 'string',
+                               'allowed_values': None,
+                               'limits': {'min_length': 1, 'max_length': 4000},
+                               'actions': ['draft'],
+                               'meaning': 'Owner supplied draft body.'},
+                'draft_to': {'type': 'array',
+                             'allowed_values': None,
+                             'limits': {'min_items': 1, 'max_items': 5},
+                             'actions': ['draft'],
+                             'meaning': 'Owner supplied bare addresses for forward drafts only.'},
+                'keep_latest': {'type': 'boolean',
+                                'allowed_values': None,
+                                'limits': {},
+                                'actions': ['trash', 'archive', 'move'],
+                                'meaning': 'Keep every newest dated match per account; omit invalid dates from actions. This condition needs sender, domain, subject, body or judgment beside it.'},
+                'recipients_min': {'type': 'integer',
+                                   'allowed_values': None,
+                                   'limits': {'min': 1, 'max': 1000},
+                                   'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe'],
+                                   'meaning': 'Minimum distinct To/Cc addresses; absent evidence does not match. This condition needs sender, domain, subject, body or judgment beside it.'},
+                'recipients_max': {'type': 'integer',
+                                   'allowed_values': None,
+                                   'limits': {'min': 1, 'max': 1000},
+                                   'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe'],
+                                   'meaning': 'Maximum distinct To/Cc addresses; not below minimum. This condition needs sender, domain, subject, body or judgment beside it.'},
+                'is_reply': {'type': 'boolean',
+                             'allowed_values': None,
+                             'limits': {},
+                             'actions': ['trash', 'archive', 'move', 'spam', 'unsubscribe'],
+                             'meaning': 'Reply status from headers; absent evidence does not match. This condition needs sender, domain, subject, body or judgment beside it.'}},
+ 'never-touch.toml': {'accounts': {'type': 'array',
+                                   'allowed_values': None,
+                                   'limits': {'min_items': 1},
+                                   'actions': ['protect'],
+                                   'meaning': 'Configured account handles to match.'},
+                      'sender': {'type': 'string',
+                                 'allowed_values': None,
+                                 'limits': {'min_length': 1},
+                                 'actions': ['protect'],
+                                 'meaning': 'Exact sender address, ignoring case.'},
+                      'domain': {'type': 'string',
+                                 'allowed_values': None,
+                                 'limits': {'min_length': 1},
+                                 'actions': ['protect'],
+                                 'meaning': 'Sender domain and its subdomains.'},
+                      'subject': {'type': 'string',
+                                  'allowed_values': None,
+                                  'limits': {'min_length': 1},
+                                  'actions': ['protect'],
+                                  'meaning': 'Case insensitive Python regex on subject; must not match empty text.'},
+                      'has_attachment': {'type': 'boolean',
+                                         'allowed_values': None,
+                                         'limits': {},
+                                         'actions': ['protect'],
+                                         'meaning': 'Match the attachment flag; absent means false. This condition needs sender, domain, subject or judgment beside it.'},
+                      'judgment': {'type': 'string',
+                                   'allowed_values': None,
+                                   'limits': {'min_length': 1, 'max_length': 500},
+                                   'actions': ['protect'],
+                                   'meaning': 'Assistant criterion evaluated after other predicates.'}}}
+
+
+def validate_rule_fields(entry, protection=False):
+    table = RULE_KINDS['never-touch.toml' if protection else 'rules.toml']
+    known_keys(entry, set(table), 'never-touch' if protection else 'rule')
+    if not protection and entry.get('action') not in VERBS:
+        raise ValueError('rule.action: expected one of ' + ', '.join(sorted(VERBS)))
+    types = {'string': str, 'boolean': bool, 'integer': int, 'array': list}
+    for key, value in entry.items():
+        field = table[key]
+        if type(value) is not types[field['type']]:
+            raise ValueError(key + ': expected ' + ('a non-empty string' if key in ('sender', 'domain', 'subject', 'body') else field['type']))
+        if field['allowed_values'] is not None and value not in field['allowed_values']:
+            raise ValueError(key + ': expected one of ' + ', '.join(field['allowed_values']))
+        if not protection and entry.get('action') not in field['actions']:
+            raise ValueError(key + ': expected action ' + ', '.join(field['actions']))
+        for bound, limit in field['limits'].items():
+            if ((bound == 'min' and value < limit) or (bound == 'max' and value > limit)
+                    or (bound in ('min_length', 'min_items') and len(value) < limit)
+                    or (bound in ('max_length', 'max_items') and len(value) > limit)):
+                raise ValueError(key + ': expected ' + bound + ' ' + str(limit))
+
+
 def validate_holds(holds):
     for i, hold in enumerate(holds, 1):
         try:
             if not isinstance(hold, dict):
                 raise ValueError('Never-touch entry must be a table')
-            if set(hold) - {'accounts', 'sender', 'domain', 'subject', 'has_attachment'}:
-                known_keys(hold, {'accounts', 'sender', 'domain', 'subject', 'has_attachment'}, 'never-touch')
+            validate_rule_fields(hold, protection=True)
             validate_predicate(hold)
         except ValueError as error:
             raise ValueError(('never-touch entry ' + str(i)) + ': ' + str(error)) from error
@@ -823,8 +990,10 @@ def validate_predicate(rule):
     for key in ('sender', 'domain', 'subject', 'body'):
         if key in rule and (not isinstance(rule[key], str) or not rule[key].strip()):
             raise ValueError(key + ': expected a non-empty string')
-    if not any(k in rule for k in ('sender', 'domain', 'subject', 'body')):
-        raise ValueError('Rule requires a message predicate: expected sender, domain, subject or body')
+    if 'judgment' in rule and (not isinstance(rule['judgment'], str) or not rule['judgment'].strip() or len(rule['judgment']) > 500 or rule.get('action') == 'draft'):
+        raise ValueError('judgment: expected a non-blank string of at most 500 characters, never on draft')
+    if not any(k in rule for k in ('sender', 'domain', 'subject', 'body', 'judgment')):
+        raise ValueError('Rule requires a message predicate: expected sender, domain, subject, body or judgment')
     for key in ('subject',):
         try:
             if key in rule and re.search(rule[key], '', re.IGNORECASE):
@@ -1060,8 +1229,16 @@ def validate_rules(rules):
                 raise ValueError('Rule id and action must be non-empty strings')
             if 'target' in rule and (rule['action'] != 'move' or not isinstance(rule['target'], str)):
                 raise ValueError('rule.target: expected a folder name string on move rules only')
-            if set(rule) - {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'unsubscribe_fallback', 'body', 'question', 'limit', 'enabled', 'draft', 'draft_text', 'draft_to'}:
-                known_keys(rule, {'id', 'action', 'accounts', 'sender', 'domain', 'subject', 'has_attachment', 'exclusions', 'target', 'after_unsubscribe', 'unsubscribe_fallback', 'body', 'question', 'limit', 'enabled', 'draft', 'draft_text', 'draft_to'}, 'rule')
+            validate_rule_fields(rule)
+            if 'is_reply' in rule and (type(rule['is_reply']) is not bool or rule['action'] in ('draft', 'report')):
+                raise ValueError('is_reply: expected boolean, never on draft or report')
+            for key in ('recipients_min', 'recipients_max'):
+                if key in rule and (type(rule[key]) is not int or not 1 <= rule[key] <= 1000 or rule['action'] in ('draft', 'report')):
+                    raise ValueError(key + ': expected integer from 1 to 1000, never on draft or report')
+            if rule.get('recipients_min', 1) > rule.get('recipients_max', 1000):
+                raise ValueError('recipients_min: expected no greater than recipients_max')
+            if 'keep_latest' in rule and (type(rule['keep_latest']) is not bool or rule['action'] not in ('trash', 'archive', 'move')):
+                raise ValueError('keep_latest: expected boolean on trash, archive or move')
             if rule['action'] == 'draft':
                 if rule.get('draft') not in ('reply', 'forward'):
                     raise ValueError('draft: expected reply or forward')
@@ -1134,12 +1311,28 @@ def matches(message, rule, protection=False):
         # Escaping every operator makes this a literal search without backtracking.
         if not re.search(re.escape(rule['body']), message['body'], re.IGNORECASE):
             return False
+    if 'is_reply' in rule and ('is_reply' not in message or message['is_reply'] != rule['is_reply']):
+        return False
+    if 'recipients_min' in rule or 'recipients_max' in rule:
+        if 'recipients' not in message:
+            return False
+        count = len({a.casefold() for a in message['recipients']})
+        if not rule.get('recipients_min', 1) <= count <= rule.get('recipients_max', 1000):
+            return False
     if 'has_attachment' in rule and message.get('has_attachment', False) != rule['has_attachment']:
         return False
     return not any(word.casefold() in text.casefold()
                    for word in rule.get('exclusions', [])
                    for text in [message['subject']] + ([message['body']] if 'body' in rule else []))
 
+
+
+def received_date(message):
+    try:
+        date = datetime.fromisoformat(message.get('date', '').replace('Z', '+00:00'))
+        return date if date.tzinfo is not None else None
+    except ValueError:
+        return None
 
 
 def select_rule(message, rules):
@@ -1153,6 +1346,55 @@ def select_rule(message, rules):
             break
         leading.append(rule)
     return max(leading, key=lambda r: ('sender' in r, len(r.get('domain', '').rstrip('.'))), default=None)
+
+
+def judgments_needed(listing, rules, holds, run_token, reply=None):
+    """Derive the complete permitted question set from trusted configuration."""
+    binding = hashlib.sha256(json.dumps([run_token, listing, rules, holds] + ([reply] if reply is not None else []), sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+    pairs = []
+    for original in listing['messages']:
+        sender = normalize_sender(original['sender'])
+        if sender is None:
+            continue
+        message = dict(original, sender=sender)
+        if any('judgment' not in h and matches(message, h, protection=True) for h in holds):
+            continue
+        if reply is not None and [message['account'], message['id']] not in reply['members']:
+            continue
+        for kind, entries in ([('never-touch', holds)] if reply is not None else [('rule', rules), ('never-touch', holds)]):
+            for index, entry in enumerate(entries):
+                if 'judgment' not in entry or not matches(message, entry, protection=kind == 'never-touch'):
+                    continue
+                if reply is None and kind == 'never-touch' and not any(matches(message, r) for r in rules):
+                    continue
+                pairs.append(dict(pair=[kind, index, message['account'], message['id']], criterion=entry['judgment']))
+    return dict(binding=binding, pairs=pairs)
+
+
+def judgment_answers(needed, document):
+    known_keys(document, {'binding', 'answers'}, 'judgments')
+    if document.get('binding') != needed['binding']:
+        raise ValueError('judgments.binding: expected this run and unchanged listing and rules')
+    if not isinstance(document.get('answers'), list):
+        raise ValueError('judgments.answers: expected an array')
+    asked = {tuple(p['pair']) for p in needed['pairs']}
+    answers = {}
+    for entry in document['answers']:
+        known_keys(entry, {'pair', 'answer', 'reason'}, 'judgments answer')
+        pair = entry.get('pair')
+        if (not isinstance(pair, list) or len(pair) != 4 or not isinstance(pair[0], str)
+                or type(pair[1]) is not int or any(not isinstance(v, str) for v in pair[2:])):
+            raise ValueError('judgments.pair: expected kind, entry index, account and message id')
+        key = tuple(pair)
+        if key not in asked or key in answers:
+            raise ValueError('judgments.pair: expected an asked pair exactly once')
+        if type(entry.get('answer')) is not bool:
+            raise ValueError('judgments.answer: expected boolean')
+        reason = entry.get('reason')
+        if not isinstance(reason, str) or not reason.strip() or not 1 <= len(reason) <= 200:
+            raise ValueError('judgments.reason: expected 1 to 200 non-blank characters')
+        answers[key] = entry
+    return answers
 
 
 def validate_actions(actions, listing):
@@ -1514,10 +1756,14 @@ def validate_inputs(listing, config, previous):
     for i, message in enumerate(listing['messages']):
         label = 'Inbox.messages.' + str(i)
         required = {'account', 'id', 'folder', 'sender', 'subject'}
-        flags = {'has_attachment', 'spam', 'phishing', 'unsubscribe_one_click'}
+        flags = {'has_attachment', 'spam', 'phishing', 'unsubscribe_one_click', 'is_reply'}
         strings = required | {'body', 'sender_name', 'unsubscribe_url', 'date', 'conversation_id', 'internet_message_id'}
-        known_keys(message, strings | flags, label)
-        for key in required | set(message):
+        known_keys(message, strings | flags | {'recipients'}, label)
+        if 'recipients' in message:
+            recipients = message['recipients']
+            if (not isinstance(recipients, list) or len(recipients) > 2000 or any(not isinstance(a, str) or len(a) > 254 or normalize_sender(a) != a.casefold() or any(unicodedata.category(c).startswith('C') for c in a) for a in recipients)):
+                raise ValueError(label + '.recipients: expected at most 2000 bare addresses, each at most 254 characters')
+        for key in required | (set(message) - {'recipients'}):
             if key not in message or (type(message[key]) is not bool if key in flags else not isinstance(message[key], str)):
                 raise ValueError(label + '.' + key + ': expected ' + ('boolean' if key in flags else 'string'))
         if 'body' in message and len(message['body']) > BODY_LIMIT:
@@ -1546,20 +1792,31 @@ def validate_inputs(listing, config, previous):
         raise ValueError('state.json: expected non-negative integer counts')
 
 
-def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=(), *, selections=None):
+def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=(), *, selections=None, judgments=None, run_token=None, judgment_request=None):
     validate_inputs(listing, config, previous if previous is not None else {})
     validate_rules(rules)
     validate_holds(never_touch)
     for rule in rules + never_touch:
         if any(a not in config['accounts'] for a in rule.get('accounts', [])):
             raise ValueError(('rules.toml: rule ' + repr(rule['id']) if 'id' in rule else 'never-touch.toml: entry ' + str(never_touch.index(rule) + 1)) + ': account ' + repr(next(a for a in rule['accounts'] if a not in config['accounts'])) + ' expected one of config.toml accounts: ' + ', '.join(config['accounts']))
+    needed = judgment_request if judgment_request is not None else judgments_needed(listing, rules, never_touch, run_token)
+    if judgments is None and (selections is not None or stop_reasons):
+        judgments = dict(binding=needed['binding'], answers=[])
+    if needed['pairs'] and judgments is None:
+        raise ValueError('judgments: answers required; run the plan step to obtain judgments-needed.json')
+    answers = judgment_answers(needed, judgments) if judgments is not None else {}
+    asked = {tuple(p['pair']) for p in needed['pairs']}
+    def chosen(message, entries, kind):
+        return [entry for index, entry in enumerate(entries) if 'judgment' not in entry or
+                ((kind, index, message['account'], message['id']) in asked and
+                 answers.get((kind, index, message['account'], message['id']), {}).get('answer', kind == 'never-touch'))]
     messages = listing['messages']
     totals = listing['accounts']
     not_listed = [a for a in config['accounts'] if a not in totals and a not in listing.get('quiet', [])]
     if set(totals) - set(config['accounts']) or not set(totals) & set(config['accounts']):
         return {'account_names': {a: f.get('name', a) for a, f in config['accounts'].items()}, 'relist_inbox': config.get('relist_inbox', 'all'),
                 'remaining': [dict(account=m['account'], id=m['id'], sender=m['sender'], subject=m['subject'], reason='Run stopped') for m in messages], 'actions': [],
-                'decisions': [{'account': m['account'], 'id': m['id'], 'reason': 'Protected by never-touch' if any(matches(m, h, protection=True) for h in never_touch) else 'Run stopped'} for m in messages],
+                'decisions': [{'account': m['account'], 'id': m['id'], 'reason': 'Protected by never-touch' if any(matches(m, h, protection=True) for h in chosen(m, never_touch, 'never-touch')) else 'Run stopped'} for m in messages],
                 'reasons': list(stop_reasons) + ['Listing has an unconfigured account' if set(totals) - set(config['accounts']) else 'No configured account listed'],
                 'not_listed': not_listed, 'skip_reasons': {a:listing.get('skipped', {}).get(a, 'pigeon error (listing answer)') for a in not_listed},
                 'counts': {a: sum(m['account'] == a for m in messages) for a in totals}}
@@ -1585,14 +1842,29 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         message = dict(original, sender=sender)
         reason = 'No matching rule'
         question = {}
+        judged = {}
+        active_holds = chosen(message, never_touch, 'never-touch')
         if sender is None:
             reason = 'Invalid sender'
-        elif any(matches(message, hold, protection=True) for hold in never_touch):
+        elif any(matches(message, hold, protection=True) for hold in active_holds):
             reason = 'Protected by never-touch'
+            hold = next(h for h in active_holds if matches(message, h, protection=True))
+            if 'judgment' in hold:
+                index = next(i for i, entry in enumerate(never_touch) if entry is hold)
+                judged = dict(judgment=dict(entry='never-touch:' + str(index), reason=answers.get(('never-touch', index, message['account'], message['id']), {}).get('reason', 'Judgment missing; protected')))
+        elif any(p['pair'][0] == 'rule' and p['pair'][2:] == [message['account'], message['id']] and tuple(p['pair']) not in answers for p in needed['pairs']):
+            reason = 'Judgment missing'
         else:
-            candidates = rules if selections is None else [selections[(message["account"], message["id"])]] if (message["account"], message["id"]) in selections else []
+            candidates = chosen(message, rules, 'rule') if selections is None else [selections[(message["account"], message["id"])]] if (message["account"], message["id"]) in selections else []
             selected = select_rule(message, candidates) if selections is None else next(iter(candidates), None)
             for rule in [selected] if selected is not None else []:
+                if rule.get('keep_latest'):
+                    date = received_date(message)
+                    peers = [dict(m, sender=normalize_sender(m['sender'])) for m in messages if m['account'] == message['account'] and normalize_sender(m['sender']) is not None]
+                    dates = [received_date(m) for m in peers if rule in chosen(m, rules, 'rule') and matches(m, rule)]
+                    valid = [d for d in dates if d is not None]
+                    if date is None or not valid or date == max(valid):
+                        break
                 if rule['action'] == 'draft' and any(d['account'] == message['account'] and d['id'] == message['id'] for d in (previous or {}).get('_drafts', [])):
                     reason = 'Draft waiting'
                     break
@@ -1601,6 +1873,10 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                     hits[key] = hits.get(key, 0) + 1
                 verb = rule['action']
                 action = {'account': message['account'], 'id': message['id'], 'action': verb, 'rule': rule['id']}
+                if 'judgment' in rule:
+                    index = rules.index(rule)
+                    judged = dict(judgment=dict(entry=rule['id'], reason=answers[('rule', index, message['account'], message['id'])]['reason']))
+                    action.update(judged)
                 if verb == 'draft':
                     if not message_id(message['id']):
                         raise ValueError('Inbox.messages.id: expected a valid message id for draft creation')
@@ -1652,11 +1928,11 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                 actions.append(action)
                 if verb == 'unsubscribe' and 'after_unsubscribe' in rule:
                     actions.append(dict(account=action['account'], id=action['id'],
-                                        action=rule['after_unsubscribe'], rule=rule['id']))
+                                        action=rule['after_unsubscribe'], rule=rule['id'], **judged))
                 reason = None
                 break
         if reason:
-            decisions.append({'account': message['account'], 'id': message['id'], 'reason': reason, **question})
+            decisions.append({'account': message['account'], 'id': message['id'], 'reason': reason, **question, **judged})
     # Choose spelling by rule order, independently of Inbox ordering.
     rank = {r['id']: i for i, r in enumerate(rules)}
     paths = {}
@@ -1702,7 +1978,8 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         for r in reasons)}
     if unconditional:
         actions = []
-        decisions = [{'account': m['account'], 'id': m['id'], 'reason': 'Protected by never-touch' if any(matches(m, h, protection=True) for h in never_touch) else 'Run stopped; rule refused by brake' if (m['account'], m['id']) in refused else 'Run stopped'} for m in messages]
+        protections = {(d['account'], d['id']): d for d in decisions if d['reason'] == 'Protected by never-touch'}
+        decisions = [protections.get((m['account'], m['id']), {'account': m['account'], 'id': m['id'], 'reason': 'Protected by never-touch' if any(matches(m, h, protection=True) for h in chosen(m, never_touch, 'never-touch')) else 'Run stopped; rule refused by brake' if (m['account'], m['id']) in refused else 'Run stopped'}) for m in messages]
     validate_actions(actions, listing)
     expected = dict(counts)
     for action in actions:
@@ -1944,6 +2221,8 @@ def number_decisions(store, plan, listing, *, read_only=False, language='en', ou
             i['number'] in reply_numbers and (outcome_plan is None or (
                 any((m['account'], m['id']) in inbox_keys for m in i.get('members', [i]))
                 and not any((m['account'], m['id']) in failed for m in i.get('members', [i])))))]
+        saved_items = [i for i in saved_items if not protected & {
+            (m['account'], m['id']) for m in i.get('members', [i])}]
         saved_items = [i for i in saved_items if len({
             answers.get((m['account'], m['id'])) for m in i.get('members', [i])}) == 1]
         groups = [g for account in plan['counts']
@@ -1965,7 +2244,14 @@ def number_decisions(store, plan, listing, *, read_only=False, language='en', ou
             for outcome in group:
                 outcome['item']['number'] = number
             record = next(i for i in saved_items if i['number'] == number)
-            record['presentation'] = group
+            record['presentation'] = json.loads(json.dumps(group))
+            for saved_outcome in record['presentation']:
+                saved_outcome['saved_number'] = number
+                suffix = judgment_tag(outcome_plan or plan, saved_outcome['item'], language)
+                if suffix:
+                    saved_outcome['tag'] = saved_outcome['tag'].removesuffix(suffix).removesuffix('; ')
+                for action in saved_outcome['actions']:
+                    action.pop('judgment', None)
             if 'run_token' in plan:
                 record['run_token'] = plan['run_token']
             for outcome in group:
@@ -2014,7 +2300,7 @@ def parse_reply(text):
     return parts
 
 
-def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numbers=None):
+def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numbers=None, judgments=None, run_token=None):
     # Reuse listing validation, never-touch precedence, ceilings and brakes.
     source = read_numbers(store, numbers)
     selected = {p['number'] for p in parts}
@@ -2034,17 +2320,20 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
                     raise ValueError('Number is not in the fresh Inbox for its saved account')
                 continue
             message = dict(messages[key], sender=normalize_sender(messages[key]['sender']))
-            if message['sender'] is None or any(matches(message, h, protection=True) for h in holds):
+            if message['sender'] is None or any(matches(message, h, protection=True) for h in holds if 'judgment' not in h):
                 raise ValueError('Number is protected by never-touch or has an invalid sender')
             entry = dict(part, account=key[0], id=key[1])
             entries.append(entry)
             if part['verb'] in {'leave', 'yes', 'no'}:
                 continue
             selections[key] = dict(id='numbered-reply', accounts=[key[0]], sender=message['sender'], action=part['verb'], exclusions=[], **({'target': part['target']} if part['target'] is not None else {}))
+    needed = judgments_needed(listing, [], holds, run_token, dict(parts=parts, numbers=source, members=[list(k) for k in selections]))
+    if judgments is None and needed['pairs']:
+        return dict(judgments_needed=needed)
     # One reply batch has the existing default per-rule limit of ten.
     ceiling_rule = dict(id='numbered-reply', accounts=list(config['accounts']), subject='reply', action='report')
-    result = build_plan(listing, [ceiling_rule], holds, config, previous, stops, selections=selections)
-    if len(result['actions']) != len(selections) and not result['reasons']:
+    result = build_plan(listing, [ceiling_rule], holds, config, previous, stops, selections=selections, judgments=judgments, run_token=run_token, judgment_request=needed)
+    if len(result['actions']) + sum((d['account'], d['id']) in selections and d['reason']=='Protected by never-touch' for d in result['decisions']) != len(selections) and not result['reasons']:
         raise ValueError('Reply action could not be planned')
     if result['reasons'] and result.get('approval_state') != 'awaiting approval':
         raise ValueError('; '.join(result['reasons']))
@@ -2165,6 +2454,17 @@ def presentation_listing(original, current):
     return dict(current, messages=current['messages'] + [m for m in original['messages'] if (m['account'], m['id']) not in keys])
 
 
+def judgment_text(record, language):
+    return ('judged' if language == 'en' else 'evaluado') + ' (' + chat_text(record['entry'])[:80] + '): ' + chat_text(record['reason'])[:200]
+
+
+def judgment_tag(plan, item, language):
+    key = item['account'], item['id']
+    records = [entry['judgment'] for entry in plan['actions'] + plan['decisions']
+               if (entry['account'], entry['id']) == key and entry.get('judgment')]
+    return judgment_text(records[0], language) if records else ''
+
+
 def message_outcomes(plan, listing, items, observed=None, language='en', *, known_left=None, final_listing=None, excluded=(), owner_answers=None, ungrouped=False):
     """Classify message presentation once for real and rehearsal messages."""
     if final_listing is not None:
@@ -2236,7 +2536,7 @@ def message_outcomes(plan, listing, items, observed=None, language='en', *, know
         if item['account'] in listing.get('skipped', {}):
             reason = re.sub(r': (?:provider|pigeon) error \([^)]*\)', '', reason)
         if language == 'es':
-            for source, target in {'Protected by never-touch': 'Protegido por never-touch', 'Run stopped': 'Ejecución detenida', 'action not confirmed': 'acción no confirmada', 'rule refused by brake': 'regla rechazada por el freno', 'failed': 'falló', 'unexecuted': 'sin ejecutar', 'issued_unknown': 'resultado desconocido'}.items():
+            for source, target in {'Protected by never-touch': 'Protegido por never-touch', 'Run stopped': 'Ejecución detenida', 'action not confirmed': 'acción no confirmada', 'rule refused by brake': 'regla rechazada por el freno', 'Judgment missing': 'Falta evaluación', 'failed': 'falló', 'unexecuted': 'sin ejecutar', 'issued_unknown': 'resultado desconocido'}.items():
                 reason = reason.replace(source, target)
         if section == 'handled':
             completed = handled.get(key, []) or planned
@@ -2252,6 +2552,10 @@ def message_outcomes(plan, listing, items, observed=None, language='en', *, know
                 item.pop('number', None)
         if section == 'inbox' and kept and 'Kept by owner reply' not in tag:
             tag = (tag + '; ' if tag else '') + 'Kept by owner reply'
+        suffix = judgment_tag(plan, item, language)
+        if suffix:
+            tag += ('; ' if tag else '') + suffix
+        item.pop('judgment', None)
         outcomes.append(dict(item=item, kind=kind, actions=handled.get(key, []), failure=failure,
                              visible=visible, hidden=hidden, remaining=section == 'inbox', section=section, tag=tag,
                              owner=section == 'inbox' and visible and (
@@ -2653,7 +2957,7 @@ def awaiting_message(store, plan, listing, language, *, new_question=False, outc
             examples = [e for e in examples if e]
             lines.append('- ' + action_label(actions[0], listing, language, planned=True) + ' · '
                          + (('your reply' if language == 'en' else 'tu respuesta') if rule == 'numbered-reply' else ('rule ' if language == 'en' else 'regla ') + chat_text(rule))
-                         + ': ' + str(len(actions)) + (' · ' + ', '.join(examples) if examples else ''))
+                         + ': ' + str(len(actions)) + (' · ' + ', '.join(examples) if examples else '') + (' · ' + judgment_text(actions[0]['judgment'], language) if 'judgment' in actions[0] else ''))
     lines += [('Approval question expired; the next run asks again.' if language == 'en' else 'La pregunta de aprobación caducó; la próxima ejecución volverá a preguntar.') if expired else approval_question(plan, language)]
     return '\n'.join(lines) + '\n'
 
@@ -2682,6 +2986,8 @@ def approval_reply(store, args):
         waiting = plan.get('approval_state') == 'awaiting approval' and not plan.get('dry_run')
         if not waiting and text not in words:
             return False
+        if args.dry_run:
+            raise ValueError('dry-run reply: cannot answer a real approval question')
         if args.scheduled:
             raise ValueError('Replies require a user-initiated run')
         if not waiting:
@@ -2705,9 +3011,8 @@ def question_created(store, plan):
     if plan.get('dry_run'):
         return plan['approval_created']
     history = store / 'history.log'
-    marker = ' approval asked: ' + str(plan.get('run_id'))
     stamps = [state_timestamp(line.split(' ')[0], history).timestamp()
-              for line in (read_text(history).splitlines() if history.exists() else []) if line.endswith(marker)]
+              for line in (read_text(history).splitlines() if history.exists() else []) if line.split(' approval ', 1)[-1].split(' ')[:2] == ['asked:', str(plan.get('run_id'))]]
     if stamps:
         return min(stamps)
     raise ValueError('approval: expected recorded question time')
@@ -2743,8 +3048,24 @@ def approval_hours(config):
     return hours
 
 
+def question_event(plan):
+    marker = 'asked: ' + str(plan.get('run_id'))
+    if 'judgments' in plan:
+        marker += ' ' + hashlib.sha256(json.dumps(plan['judgments'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return marker
+
+
+def check_question_judgments(store, plan):
+    events = [line.split(' approval ', 1)[1] for line in read_text(store / 'history.log').splitlines() if ' approval ' in line]
+    asked = [event for event in events if event.split(' ')[:2] == ['asked:', str(plan.get('run_id'))]]
+    if asked and any(event != question_event(plan) for event in asked):
+        raise ValueError('approval: judgment answers changed since the question; plan again')
+
+
 def approval_event(store, plan, event):
     line = datetime.now(timezone.utc).isoformat() + ' approval ' + event + ': ' + plan['run_id']
+    if event == 'asked':
+        line = line.rsplit(' approval ', 1)[0] + ' approval ' + question_event(plan)
     if event == 'approved':
         line += ' ' + hashlib.sha256(plan['run_token'].encode()).hexdigest()
     line += '\n'
@@ -2779,10 +3100,11 @@ def approve_plan(store, token, path, run_id, *, validate_only=False, reading=Non
             raise ValueError('approval: run id does not match awaiting plan')
         history_path = store / 'history.log'
         events = [line.split(' approval ', 1)[1] for line in read_text(history_path).splitlines() if ' approval ' in line] if history_path.exists() else []
-        asked = [event[7:] for event in events if event.startswith('asked: ')]
+        asked = [event.split(' ')[1] for event in events if event.startswith('asked: ')]
         if not asked or asked[-1] != run_id or any(event.split(' ')[:2] == [kind + ':', run_id] for event in events for kind in ('approved', 'skipped', 'expired', 'replaced', 'stale')):
             raise ValueError('approval: plan replaced or approval already used or expired; plan again')
         check_approval_age(store, plan)
+        check_question_judgments(store, plan)
         if validate_only:
             return plan
         if reading is None:
@@ -2901,7 +3223,11 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
         config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')])
         previous = execute.read(store / 'state.json') if (store / 'state.json').exists() else {}
         stops = ['Missing state; prior run records exist'] if not (store / 'state.json').exists() and not plan.get('first_run') else []
-        expected = build_plan(listing, rules, holds, config, previous, stops)
+        if 'reply_source' in plan:
+            source = plan['reply_source']
+            expected = reply_plan(store, listing, holds, config, previous, source['parts'], stops, numbers=source['numbers'], judgments=plan.get('judgments'), run_token=plan.get('judgment_token'))
+        else:
+            expected = build_plan(listing, rules, holds, config, previous, stops, judgments=plan.get('judgments'), run_token=plan.get('judgment_token'))
         number_decisions(store, expected, listing, read_only=True)
         if any(plan.get(k) != expected[k] for k in expected):
             raise ValueError('dry-run plan: expected unchanged private inputs and listing')
@@ -2951,6 +3277,10 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
     outcomes = message_outcomes(plan, metadata, remaining, observed, language,
                                 final_listing=execution.state.get('final_listing', {}), excluded=covered, ungrouped=saved.get('ungrouped_run') == token)
     for record in records:
+        for outcome in record['presentation']:
+            suffix = judgment_tag(plan, outcome['item'], language)
+            if suffix:
+                outcome['tag'] += ('; ' if outcome['tag'] else '') + suffix
         outcomes.extend(record['presentation'])
     handled = {}
     for outcome in outcomes:
@@ -3106,7 +3436,7 @@ def rule_cases(store, config, rules, holds):
     if not isinstance(cases, list): raise ValueError('cases.toml: expected cases array')
     failures, names = [], set()
     for case in cases:
-        known_keys(case, {'name', 'account', 'sender', 'subject', 'has_attachment', 'body', 'expect', 'expect_rule'}, 'cases.toml case')
+        known_keys(case, {'name', 'account', 'sender', 'subject', 'has_attachment', 'body', 'expect', 'expect_rule', 'judgments', 'date', 'recipients', 'is_reply'}, 'cases.toml case')
         name = case.get('name')
         if not isinstance(name, str) or not name.strip() or name in names:
             raise ValueError('cases.toml: expected unique nonempty case name')
@@ -3115,18 +3445,30 @@ def rule_cases(store, config, rules, holds):
             raise ValueError('cases.toml: expected configured account and supported expectation')
         if 'expect_rule' in case and (not isinstance(case['expect_rule'], str) or not case['expect_rule']):
             raise ValueError('cases.toml: expected rule id string')
-        message = {k:v for k,v in case.items() if k in {'account', 'sender', 'subject', 'has_attachment', 'body'}}
+        message = {k:v for k,v in case.items() if k in {'account', 'sender', 'subject', 'has_attachment', 'body', 'date', 'recipients', 'is_reply'}}
         message.update(id='case', folder='Inbox')
         validate_inputs(dict(accounts={case['account']:1},messages=[message]),config,{})
         sender = normalize_sender(message['sender'])
         message['sender'] = sender
+        case_rules, case_holds, missing = rules, holds, False
+        if any('judgment' in r for r in rules + holds):
+            fixture = dict(accounts={case['account']: 1}, messages=[message])
+            needed = judgments_needed(fixture, rules, holds, 'case')
+            document = dict(binding=needed['binding'], answers=case.get('judgments', []))
+            answers = judgment_answers(needed, document)
+            missing = any(p['pair'][0] == 'rule' and tuple(p['pair']) not in answers for p in needed['pairs'])
+            case_rules = [r for i, r in enumerate(rules) if 'judgment' not in r or answers.get(('rule', i, message['account'], 'case'), {}).get('answer', False)]
+            asked = {tuple(p['pair']) for p in needed['pairs']}
+            case_holds = [r for i, r in enumerate(holds) if 'judgment' not in r or (('never-touch', i, message['account'], 'case') in asked and answers.get(('never-touch', i, message['account'], 'case'), {}).get('answer', True))]
+        elif 'judgments' in case:
+            judgment_answers(dict(binding='case', pairs=[]), dict(binding='case', answers=case['judgments']))
         found, rule_id = 'none', None
         if sender is not None:
-            if any(matches(message, h, protection=True) for h in holds):
+            if any(matches(message, h, protection=True) for h in case_holds):
                 found = 'never-touch'
             else:
-                rule = select_rule(message, rules)
-                if rule is not None: found, rule_id = rule['action'], rule['id']
+                rule = None if missing else select_rule(message, case_rules)
+                if rule is not None and not rule.get('keep_latest'): found, rule_id = rule['action'], rule['id']
         if found != case['expect'] or ('expect_rule' in case and case['expect_rule'] != rule_id):
             expected_rule = case.get('expect_rule')
             failures.append(safe_text(name) + ': expected ' + case['expect'] + (' rule ' + safe_text(expected_rule) if expected_rule else '') + ', found ' + found + (' rule ' + safe_text(rule_id) if rule_id else ''))
@@ -3147,7 +3489,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         require_plan_token(plan, token)
         if plan.get('dry_run'):
             raise ValueError('dry-run plan: commit-state is refused')
-        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds'}, str(plan_path))
+        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'judgments', 'judgment_token'}, str(plan_path))
         for key in ('actions', 'reasons', 'not_listed'):
             if not isinstance(plan.get(key), list):
                 raise ValueError(str(plan_path) + '.' + key + ': expected an array')
@@ -3158,7 +3500,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         actions = set()
         for i, action in enumerate(plan['actions']):
             label = str(plan_path) + '.actions.' + str(i)
-            known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'reason'}, label)
+            known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'reason', 'judgment'}, label)
             if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action')):
                 raise ValueError(label + ': expected account, id and action strings')
             if action['action'] not in PLAN_VERBS or action['account'] not in counts:
@@ -3519,16 +3861,19 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
         quiet_path = store / 'quiet-check.json'
         quiet_cache = parse_json(read_text(quiet_path), quiet_path) if quiet_path.exists() and not dry_run else {}
         quiet_names = quiet_cache.get('decision', {}).get('quiet_accounts', []) if quiet_cache.get('token') == token and not ids_only else []
-        manual = [a for a in names if a not in skip and a not in quiet_names and not ids_only and any('body' in r and a in r.get('accounts', []) for r in rules + holds)]
+        manual = [a for a in names if a not in skip and a not in quiet_names and not ids_only and any(any(k in r for k in ('body', 'judgment', 'recipients_min', 'recipients_max', 'is_reply')) and a in r.get('accounts', [a]) for r in rules + holds)]
         part = None
         if manual:
             if manual_part is None:
-                raise ValueError('listing: body accounts require --manual-part: ' + ', '.join(manual))
+                kinds = [label for keys, label in [(('body',), 'body'), (('judgment',), 'judgment'), (('recipients_min', 'recipients_max', 'is_reply'), 'conditional')]
+                         if any(any(k in r for k in keys) and any(a in r.get('accounts', [a]) for a in manual) for r in rules + holds)]
+                raise ValueError('listing: ' + ', '.join(k + ' entries' for k in kinds) + ' require --manual-part: ' + ', '.join(manual))
             part = parse_json(read_text(manual_part), manual_part)
             validate_inputs(part, config, {})
             if set(part['accounts']) != set(manual) or any(m['account'] not in manual for m in part['messages']) or set(part.get('folders', {})) - set(manual):
                 raise ValueError('listing: manual part must contain exactly: ' + ', '.join(manual))
-            build_plan(part, rules, holds, config, {})
+            if not any('judgment' in r for r in rules + holds):
+                build_plan(part, rules, holds, config, {})
         elif manual_part is not None:
             raise ValueError('listing: no manual accounts expected')
         names = [a for a in names if a not in manual and a not in quiet_names]
@@ -3853,6 +4198,7 @@ def _main(argv=None, *, now=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('validate', allow_abbrev=False)
+    sub.add_parser('rule-kinds', allow_abbrev=False)
     for name in ('tool-save', 'tool-show', 'tool-drop'):
         tool = sub.add_parser(name, allow_abbrev=False)
         if name != 'tool-show':
@@ -3908,8 +4254,9 @@ def _main(argv=None, *, now=None):
     quiet.add_argument('--progress', help='Saved dry-run quiet response')
     for command_name in ('plan', 'reply'):
         plan = sub.add_parser(command_name, allow_abbrev=False)
+        plan.add_argument('--dry-run', action='store_true')
+        plan.add_argument('--judgments')
         if command_name == 'plan':
-            plan.add_argument('--dry-run', action='store_true')
             plan.add_argument('--calendar')
         if command_name == 'reply':
             plan.add_argument('--reply', required=True)
@@ -3920,9 +4267,12 @@ def _main(argv=None, *, now=None):
         for name in ('config', 'rules', 'never-touch', 'guardrails', 'plan-out', 'report-out'):
             plan.add_argument('--' + name)
     args = parser.parse_args(argv)
-    for name in ('inbox', 'config', 'rules', 'never_touch', 'guardrails', 'plan_out', 'report_out', 'plan', 'results', 'reply'):
+    for name in ('inbox', 'config', 'rules', 'never_touch', 'guardrails', 'plan_out', 'report_out', 'plan', 'results', 'reply', 'judgments'):
         if getattr(args, name, None) == '':
             raise ValueError('--' + name.replace('_', '-') + ': expected a non-empty path')
+    if args.command == 'rule-kinds':
+        print(json.dumps(RULE_KINDS, sort_keys=True))
+        return
     if args.command == 'convert-rules':
         convert_rules(args.table, args.scopes, args.out, args.review)
         return
@@ -3975,7 +4325,7 @@ def _main(argv=None, *, now=None):
         print(f'version: {config.get("version", FORMAT_VERSION)}')
         for account, fields in config['accounts'].items():
             available = all(fields.get(k) for k in ('provider', 'executor_app', 'executor_account'))
-            manual = any('body' in r and account in r.get('accounts', []) for r in rules + holds)
+            manual = any(any(k in r for k in ('body', 'judgment', 'recipients_min', 'recipients_max', 'is_reply')) and account in r.get('accounts', [account]) for r in rules + holds)
             print(account + ': scripted listing ' + ('manual part required' if manual else 'available' if available else 'unavailable'))
         print(f'switched off: {sum(not r.get("enabled", True) for r in rules)}')
         print(f'ok: {len(config["accounts"])} accounts, {len(rules)} rules, {len(holds)} never-touch entries')
@@ -4068,6 +4418,9 @@ def _main(argv=None, *, now=None):
         protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'numbers.json', 'reply.json', 'reply.txt', 'decisions.jsonl', 'history.log', 'run-message.md', 'quiet-observation.json', 'positions-observation.json', 'quiet-check.json', 'lock-exchange.json', 'lock-observation.json', 'lock-commit-observation.json', 'state-exchange.json', 'finish-exchange.json', 'final-inbox.json', 'state-incoming', 'state-outgoing', 'state-observation.json', 'upload-observation.json', 'state-lock-observation.json', 'tool-paths.json', 'cases.toml', 'run-refusal.json', 'inbox.json', 'config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md')}
         if args.command == 'reply':
             protected.add(Path(args.reply).resolve())
+        if getattr(args, 'judgments', None):
+            protected.add(Path(args.judgments).resolve())
+        protected.add(store / 'judgments-needed.json')
         protected = {p.resolve() for p in protected}
         protected |= {p.resolve() for p in store.glob('execution-*.json')}
         for name in (args.plan_out, args.report_out):
@@ -4112,8 +4465,23 @@ def _main(argv=None, *, now=None):
                         raise ValueError(str(state) + ': state.json.' + account + ': expected a non-negative integer count')
                 first_run = not state.exists() and not any((store / name).exists() for name in ('numbers.json', *LOG_NAMES))
                 stops = ['Missing state; prior run records exist'] if not state.exists() and not first_run else []
+                judgments = None
+                if args.command == 'plan':
+                    validate_inputs(listing, config, previous)
+                    needed = judgments_needed(listing, rules, holds, args.token)
+                    if args.judgments:
+                        judgments = parse_json(load_inputs([args.judgments])[0], 'judgments')
+                        judgment_answers(needed, judgments)
+                    elif needed['pairs']:
+                        build_plan(listing, rules, holds, config, previous, stops, judgments=dict(binding=needed['binding'], answers=[]), run_token=args.token)
+                        import execute
+                        destination = store / ('.dry-run' if args.dry_run else '') / 'judgments-needed.json'
+                        destination.parent.mkdir(mode=0o700, exist_ok=True)
+                        execute.atomic(destination, needed)
+                        print(json.dumps(dict(judgments_needed=str(destination))))
+                        return
                 try:
-                    result = build_plan(listing, rules, holds, config, previous, stops)
+                    result = build_plan(listing, [] if args.command == 'reply' and any('judgment' in r for r in rules + holds) else rules, holds, config, previous, stops, judgments=judgments, run_token=args.token)
                 except ValueError as error:
                     message = str(error)
                     if message.startswith('rules.toml:') or message.startswith('never-touch.toml:'):
@@ -4136,15 +4504,30 @@ def _main(argv=None, *, now=None):
                         except UnicodeError:
                             raise ValueError('--reply: expected UTF-8 text') from None
                         parts = parse_reply(reply_text)
-                        result = reply_plan(store, listing, holds, config, previous, parts, stops)
+                        if args.judgments:
+                            judgments = parse_json(load_inputs([args.judgments])[0], 'judgments')
+                        result = reply_plan(store, listing, holds, config, previous, parts, stops, judgments=judgments, run_token=args.token)
+                        if 'judgments_needed' in result:
+                            import execute
+                            destination = store / ('.dry-run' if args.dry_run else '') / 'judgments-needed.json'
+                            destination.parent.mkdir(mode=0o700, exist_ok=True)
+                            execute.atomic(destination, result['judgments_needed'])
+                            print(json.dumps(dict(judgments_needed=str(destination))))
+                            return
                         import execute
-                        execute.atomic(store / 'reply.json', dict(token=args.token, parts=parts))
+                        if not args.dry_run:
+                            execute.atomic(store / 'reply.json', dict(token=args.token, parts=parts))
                     except ValueError as error:
+                        if str(error).startswith('judgments'):
+                            raise
                         refusal = str(error)
                         result = build_plan(listing, [], holds, config, previous, ['Reply refused: ' + ' '.join(refusal.split())])
                 if args.command == 'plan' and config.get('calendars'):
                     data = parse_json(load_inputs([args.calendar])[0], args.calendar) if args.calendar else {}
                     result['calendar_section'] = calendar_section(data, config, now or datetime.now(timezone.utc))
+                if judgments is not None:
+                    result['judgments'] = judgments
+                    result['judgment_token'] = args.token
                 result['run_id'] = secrets.token_hex(32)
                 result['run_token'] = args.token
                 if result.get('approval_state') == 'awaiting approval':
@@ -4178,11 +4561,15 @@ def _main(argv=None, *, now=None):
                             entries = [e for e in result['reply'] if e['number'] == part['number']]
                             saved = next(i for i in source['numbers']['items'] if i['number'] == part['number'])
                             selected_accounts = {m['account'] for m in saved.get('members', [saved])}
-                            counts = {a: sum(e['account'] == a for e in entries) for a in config['accounts'] if a in selected_accounts}
+                            protected = [d for d in result['decisions'] if d['reason']=='Protected by never-touch' and any((d['account'],d['id'])==(e['account'],e['id']) for e in entries)]
+                            protected_keys = {(d['account'], d['id']) for d in protected}
+                            counts = {a: sum(e['account'] == a and (e['account'], e['id']) not in protected_keys for e in entries) for a in config['accounts'] if a in selected_accounts}
                             skipped = len(saved.get('members', [saved])) - len(entries)
                             accounts = ', '.join(account_name(result, a) + ': ' + str(n) + ((' message' if n == 1 else ' messages') if language == 'en' else (' mensaje' if n == 1 else ' mensajes')) for a, n in counts.items())
                             verb = part['verb'] + (' to ' + part['target'] if part['target'] else '')
                             print(str(part['number']) + ' ' + verb + ': ' + accounts + '; ' + str(skipped) + (' skipped as gone.' if language == 'en' else ' omitido' + ('s' if skipped != 1 else '') + ' por no estar en Recibidos.'))
+                            for decision in protected:
+                                print(str(part['number']) + ': ' + chat_text(decision['id']) + ' · ' + ('Protected by never-touch' if language == 'en' else 'Protegido por never-touch') + ' · ' + judgment_tag(result, decision, language))
                         if result.get('approval_state') == 'awaiting approval':
                             print('Nothing has run yet.' if language == 'en' else 'Todavía no se ha ejecutado nada.')
                             print(approval_question(result, language))
@@ -4216,7 +4603,7 @@ def _main(argv=None, *, now=None):
                     if not getattr(args, 'dry_run', False) and args.plan_out:
                         history = store / 'history.log'
                         events = [line.split(' approval ', 1)[1] for line in read_text(history).splitlines() if ' approval ' in line] if history.exists() else []
-                        asked = [event[7:] for event in events if event.startswith('asked: ')]
+                        asked = [event.split(' ')[1] for event in events if event.startswith('asked: ')]
                         if asked and not any(event.split(' ')[:2] == [kind + ':', asked[-1]] for event in events for kind in ('approved', 'skipped', 'expired', 'replaced', 'stale')):
                             approval_event(store, {'run_id': asked[-1]}, 'replaced')
                     if not getattr(args, 'dry_run', False) and args.plan_out and result.get('approval_state') == 'awaiting approval':
