@@ -1,8 +1,14 @@
 # Set up pigeon
 
+pigeon never sends anything without the owner's approval. Sending is off by default. With allow_send=true, "N send" ("N enviar") sends an unchanged draft it created from a draft rule. "N forward HANDLE" ("N reenviar HANDLE") forwards one message to another configured account's address, with no added text, through the mailbox forward-draft operation. Both read the draft back before sending; at most five sends per reply. Rules, proceed and judgments can never send. It never composes mail or takes draft text or forward recipients from mail; replies use the mailbox reply operation. It never deletes permanently; the calendar stays read-only.
+
 ## Developer machine
 
 Run the [sample-mail demo](../README.md#developer-machine), then follow [storage choice](hosted-setup.md#storage-choice), private store, gateway and attended setup before scheduling.
+
+| Config key | Meaning |
+| --- | --- |
+| `allow_send` | Boolean, default `false`; permits saving a tool that sends an existing draft by id. Allows only owner-approved numbered send replies for kit-created drafts. |
 
 ## Calendar input
 
@@ -45,7 +51,7 @@ Both files use TOML arrays of tables named [[rules]]. In rules.toml, order matte
 | limit | Optional integer, 1 to 50 (hard cap), default 10. Counts actions across all accounts of the rule, including unsubscribes and companion removals, excluding folder creation. Exceeding it asks for owner approval, naming the rule id. Report rules create no actions and consume no limit; question rules also consume no twenty-percent brake count. |
 | target | Move-only exact folder path. Require a unique existing fixed path; resolve dated {year}/{month} from message date to four/two digits. Leave missing/invalid dates or years outside 1990–2100 as decisions. Require 1–255 characters and at most eight segments; refuse empty, dot, dot-dot, control, format, surrogate, line/paragraph separator, backslash and unknown placeholders. Refuse slash look-alikes U+2044, U+2215, U+2571, U+2572, U+27CB, U+27CD, U+29F5, U+29F8, U+FE68, U+FF0F, U+FF3C. Compare paths with casefold(), without normalization. Leave missing folder information as a decision; refuse leaf-only metadata for nested destinations. Plan one create-folder per missing dated account/path before dependent moves, comparing with casefold() and retaining the first matching rule's spelling. Forbid in never-touch.toml. |
 
-Keep target, after_unsubscribe and question off draft rules. Keep messages in Inbox after creating drafts. Apply the approval procedure for draft, per-rule and twenty-percent limits. Count no draft toward removals. After sending by hand, file the original with a numbered reply.
+Optional after_send="archive" or "trash" files the original after a confirmed kit send or a detected hand send, under normal caps and never-touch. Keep target, after_unsubscribe and question off draft rules. Keep messages in Inbox after creating drafts. Apply the approval procedure for draft, per-rule and twenty-percent limits. Count no draft toward removals. When the kit’s draft is gone and the owner sent anything later in that conversation, after_send files the original; nothing is deleted permanently.
 
 Require a sender, domain, subject, body or judgment predicate on each rules.toml entry; require sender, domain, subject or judgment on never-touch. Refuse invalid regexes and regexes matching empty text.
 
@@ -187,7 +193,7 @@ PIGEON_HOME=/absolute/private-store python3 scripts/triage.py tool-show
 PIGEON_HOME=/absolute/private-store python3 scripts/triage.py tool-drop --token TOKEN --account cedar --kind move
 ```
 
-Use kinds archive, attachments, create-draft, create-folder, folders, history, ids, labels, message, message-read, move, profile, report, spam, trash and unsubscribe. Fetch and send tool-paths.json with drive state.
+Use kinds archive, attachments, create-draft, create-folder, folders, history, ids, labels, message, message-read, move, profile, report, send-draft, sent-read, spam, trash and unsubscribe. Fetch and send tool-paths.json with drive state.
 
 ## Run message format
 
@@ -237,6 +243,8 @@ Follow [Dry run](quickstart.md#dry-run).
 
 ## Numbered replies
 
+With allow_send=true, the owner's "N send" or "N enviar" approves the recorded draft for every member of that Inbox number. Save kind send-draft for each sending account before replying; a missing send tool refuses the whole reply at planning. Each member needs exactly one kit-created draft with a digest and its draft rule still available. Maximum five sends per reply run. Inbox size never blocks a send or forward. A mixed send/forward reply that needs threshold approval is refused as a whole: reply with the send alone and the other actions separately. After-send filing that needs threshold approval is omitted; file it by hand. Proceed never sends. Rules cannot send. Never-touch applies, including judgments. The machine reads each draft afresh and compares its digest and recipients; changed, deleted or unreadable drafts stay for hand sending. Carry the read calls and report their results as for actions; that result step may issue one send call, which is carried and reported once. Before sending, the number is retired and the draft marked issued without a digest; both are saved and, for drive state, uploaded before the call. Failed or unknown sends are never retried. After interruption, any issued record without a saved result blocks send and forward for that original while it remains in Inbox, on every host and under any new number: check Sent and Drafts by hand. Confirmed sends mark their draft records sent and appear near the top of message and report with kind and recipients. Originals stay in Inbox unless the draft rule has after_send="archive" or "trash"; filing runs only after a confirmed send, under caps and never-touch. Dry run and simulation rehearse sends and after_send without draft reads or send calls; the real store stays unchanged.
+
 Follow [Numbered reply](quickstart.md#numbered-reply). Leave numbering to the planner; never reset its counter. A number stays bound to its saved messages until retired. Keep numbers for unlisted accounts. Stores without numbers.json plan normally.
 
 When reply prints judgments_needed, answer the asked never-touch pairs and repeat the identical reply command with --judgments PATH, as in Judgment rules. True or missing answers protect that member; false permits the requested action. No action-rule judgments are asked. Answers are bound to this reply and run. The same flow works with --dry-run and simulation.
@@ -253,7 +261,7 @@ Keep every file in the private store. Keep the original inbox.json and plan inpu
 - reply.txt: verbatim user text, never a call template.
 - plan.json: proposals and stop reasons; dry_run=true marks rehearsal.
 - report.md: plain-text proposals, refreshed at commit from confirmed results. Leave New rules empty; write rules only through the owner-confirmation procedure.
-- state.json: version 1 counts and reserved _positions, _drafts, _run_counter and _next_number; remove an account's saved entry after removing it from config. Preserve uncertain drafts (null draft_id); check Drafts before any manual action. Keep the original's reply number; retire its draft record after it leaves Inbox.
+- state.json: version 1 counts and reserved _positions, _drafts, _run_counter and _next_number; remove an account's saved entry after removing it from config. Preserve uncertain drafts (null draft_id) and issued drafts (issued timestamp, no digest); check Sent and Drafts before any manual action. Keep finished draft records with their status while the original stays in Inbox, beyond log trimming. Remove a record only after a full fresh listing in a committed run shows the original gone. No draft rule creates another draft while that record exists.
 - results.json: script-owned confirmed/failed/uncertain outcomes; omitted entries did not execute. Use this run's own file for commit-state, never hand-written results or another --results path.
 - execution-report.md: handled counts, unfinished actions, folder help and disclosed unplanned calls. Follow AGENTS.md for delivery.
 - history.log: quiet skips and abandoned lock exchanges.
@@ -263,7 +271,7 @@ Keep every file in the private store. Keep the original inbox.json and plan inpu
 
 Commit only under the held lock with this run's plan and checkpoint. Planning writes no state; preserve previous state until commit, even after completed mail actions. Refuse malformed state. Follow [Commit and message](quickstart.md#commit-and-message) and [Gateway results](quickstart.md#gateway-results).
 
-For a draft without a provider, search and describe its creation tool. Carry only issued draft_text and draft_to; use the mailbox reply operation for reply. Return {"outcome":"ok","draft_id":"draft-a"}; use error for failure or unknown for uncertainty. Require a draft_id of 1–512 ASCII letters, digits or _ - = + / for executed. Otherwise retain uncertain evidence and tell the owner "check Drafts by hand". Never retry an uncertain draft in this or a later run. Send drafts by hand from the mailbox.
+For a draft without a provider, search and describe its creation tool. Carry only issued draft_text and draft_to; use the mailbox reply operation for reply. Return {"outcome":"ok","draft_id":"draft-a"}; use error for failure or unknown for uncertainty. Require a draft_id of 1–512 ASCII letters, digits or _ - = + / for executed. Otherwise retain uncertain evidence and tell the owner "check Drafts by hand". Never retry an uncertain draft in this or a later run. Without a provider, send drafts by hand from the mailbox.
 
 For accounts without providers, return outcome with in_inbox boolean or complete inbox_ids, read after the action. Count removal only for ok and in_inbox=false; keep ok/true unexecuted, error/true failed, error/false issued_unknown. Use whole Inbox IDs for create-folder. Use optional observation.account for another listed account; confirm a result with its own account's reading. Refuse duplicate IDs and wrong types.
 
@@ -305,7 +313,8 @@ Read one JSON object on success or a nonzero one-line Refused: on stderr; follow
 | `recorded` | Disclosure logged. |
 | `draft` | Reply or forward. |
 | `draft_text` | Full rule body. |
-| `draft_to` | Rule forward recipients; empty for reply. |
+| `draft_to` | Rule forward recipients; original sender for a send reply, empty for reply creation. |
+| `digest` | Recorded SHA-256 binding a send action to its approved draft values. |
 | `reason` | No usable unsubscribe link found: ordinary alternative removal. |
 | `judgment` | Entry and assistant reason; bookkeeping, never gateway input. |
 
@@ -383,3 +392,11 @@ Keep calls.jsonl, history.log and decisions.jsonl to the script-owned 262144-byt
 For history use a 1–128 ASCII-digit position and up to 1000 Inbox arrival IDs. For ids use at most ten unique newest-first IDs, each 1–512 ASCII letters, digits or _ - = + /. Run full for unknown fields, missing/extra accounts, wrong types, files over 65536 bytes, unreadable/absent files or decreasing positions. Prove quiet only with empty arrivals or unchanged ordered IDs for every account.
 
 Approved execution first reads planned accounts’ Inbox IDs; missing planned mail closes the question as stale, while read failure leaves it open. Follow [Approval question](quickstart.md#approval-question) for the exchanges.
+
+Draft read-back and digest recording require allow_send=true; drafts made while sending was off cannot be sent by the kit. A rule draft with attachments is never sent. The digest includes sender, reply-to and attachment metadata as well as recipients, subject and body.
+
+With after_send, planning checks whether the recorded draft is gone and a message in the original conversation was sent later than its creation. The original is then filed under the ordinary limits, approval and never-touch checks. A gone draft is closed even when no matching sent message exists. A failed reading skips that account; missing inputs skip only the unchecked record and report an after_send reading problem. No allow_send setting is needed. Without after_send there is no Sent reading. See the quick start for the draft-check results exchange. Sent reads retain no message content or metadata in the store; only the original record closure and filing decision travel with the plan. The read-only sent-read tool kind accepts gmail.users.threads.get or meMailFolder.meMailFoldersListMessages for its provider. Readings are limited to the original conversation and identifiers/dates. Draft existence is read with the existing by-id reading.
+
+Requested forwarding: N must stand for exactly one message; HANDLE names another configured account with a bare accounts.HANDLE.address. Only the Outlook mailbox forward-draft operation is available; other providers refuse. Never-touch, including judgment protection, and the shared five-send cap apply. The reply approves one forward with no added text. Before creating the draft, the machine saves the forward request and uploads it on drive state. It creates the draft once, reads and digests it, then uses the ordinary fresh-read and send-draft step. Failure leaves the draft for hand handling; an issued forward with no saved result blocks further send and forward for the original across hosts and new numbers; check Sent and Drafts by hand. The original stays in Inbox. Dry run and simulation rehearse the flow without provider calls. An existing recorded draft refuses another forward for that original. A confirmed, failed or unknown forward cannot be repeated while the original stays in Inbox. Later message and report lines for an issued send or forward without a saved result say the result is unknown and to check Sent and Drafts by hand, including with new_plus_count.
+
+Before any action of a reply containing send or forward, the selected number is retired. On drive state, state_send_required asks for the normal send-state exchanges; only a completed upload of that retirement permits the mail write. A new report gives the original a new number for another request.

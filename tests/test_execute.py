@@ -30,6 +30,32 @@ class ExecuteTests(unittest.TestCase):
         save_plan(self.store, self.token, self.path, self.plan)
 
 
+    def test_r177_dry_numbered_reply_checks_real_question(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails')
+        (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n')
+        self.assertEqual(self.plan_cli().returncode, 0)
+        before = self.path.read_bytes()
+        (self.store/'reply.txt').write_text('1 archive')
+        result = self.run_cli('triage.py', 'reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.store/'rehearsal.json'), '--dry-run')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('dry-run', result.stderr)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_r177_refused_dry_reply_renders_and_simulates(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails')
+        for text in ('999 trash', '1 explode', '2 send'):
+            with self.subTest(reply=text):
+                (self.store/'reply.txt').write_text(text)
+                path = self.store/'rehearsal.json'
+                result = self.run_cli('triage.py', 'reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--reply', str(self.store/'reply.txt'), '--plan-out', str(path), '--dry-run')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('Next: execute.py next', result.stdout)
+                self.assertIn('Dry run', result.stdout)
+                message = triage.render_message(self.store, self.token, path, None)
+                self.assertIn('Dry run', message)
+                self.assertIn('Reply refused:', message)
+                self.assertTrue(execute.simulate(self.store, path)['dry_run'])
+
     def test_r174_dry_reply_does_not_close_real_question(self):
         (self.store/'guardrails.md').write_text('Fixture guardrails')
         (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n')
@@ -66,6 +92,8 @@ class ExecuteTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(len(execute.read(self.path)['actions']), expected)
             self.assertIn('cedar: '+str(expected)+' message', result.stdout)
+            if expected < 4:
+                self.assertIn('a@example.net · move · Protected by never-touch', result.stdout)
             self.machine().validate()
         saved_plan = execute.read(self.path)
         damaged = dict(saved_plan)
@@ -649,6 +677,62 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(reply(str(lunch['number'])+' trash').returncode,0)
         self.assertEqual([(a['account'],a['id']) for a in execute.read(self.path)['actions']],
                          [('cedar','lunch')])
+
+    def test_r179_no_send_without_owner_reply_randomized(self):
+        import random
+        import re
+        import io
+        from unittest.mock import patch
+        class Output(io.StringIO):
+            def reconfigure(self, **kw): pass
+        def command(*args):
+            out = Output()
+            with patch.dict(os.environ, PIGEON_HOME=str(self.store)), patch('sys.stdout', out):
+                triage.main(list(args))
+            return out.getvalue()
+        for seed in tuple(range(12)):
+            with self.subTest(seed=seed):
+                self.setUp()
+                rng = random.Random(seed)
+                (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                (self.store/'rules.toml').write_text('rules=[]\n')
+                (self.store/'config.toml').write_text('allow_send=true\n[accounts.cedar]\n')
+                messages = [dict(account='cedar', id=str(i), folder='Inbox', sender='Boss <boss@example.org>', subject='Notice '+str(i)) for i in range(rng.randrange(2,5))]
+                answers = {}
+                for run in range(3):
+                    if run == 2:
+                        messages.append(dict(messages[0], id='arrival', subject='Lunch'))
+                    execute.atomic(self.store/'inbox.json', dict(accounts={'cedar':100}, messages=messages))
+                    if run == 1:
+                        (self.store/'reply.txt').write_text(str(saved[0]['number'])+' '+rng.choice(['leave','yes','no']))
+                        command('reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+                    elif run == 2:
+                        (self.store/'reply.txt').write_text(rng.choice(['999999 archive', '9 explode', '1 forward unknown', '1 reenviar cedar', '1 forward a@example.net']))
+                        command('reply','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--reply',str(self.store/'reply.txt'),'--plan-out',str(self.path))
+                    else:
+                        command('plan','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--plan-out',str(self.path))
+                    args = ['--token',self.token,'--plan',str(self.path)]
+                    machine = execute.Execution(self.store,self.token,self.path)
+                    output = machine.step()
+                    self.assertNotIn('send', json.dumps(output).casefold())
+                    command('commit-state',*args)
+                    message = command('message',*args)
+                    saved = triage.read_numbers(self.store)['items']
+                    self.assertEqual(re.findall(r'^(\d+)\. ',message,re.M),[str(i['number']) for i in saved],message)
+                    members = [ (m['account'],m['id']) for i in saved for m in i['members'] ]
+                    self.assertEqual(len(members),len(set(members)))
+                    numbered = dict(re.findall(r'^(\d+)\. (.*)$', message, re.M))
+                    for entry in (self.store/'decisions.jsonl').read_text().splitlines() if (self.store/'decisions.jsonl').exists() else []:
+                        for part in json.loads(entry)['parts']:
+                            if part['outcome'] == 'answered':
+                                answers[part['account'],part['id']] = part['verb']
+                    for record in saved:
+                        self.assertEqual(len({answers.get((m['account'],m['id'])) for m in record['members']}), 1)
+                        if run == 2 and any((m['account'],m['id']) in answers for m in record['members']):
+                            self.assertIn('Kept by owner reply', numbered[str(record['number'])])
+
+                    triage.release(self.store,self.token)
+                    self.token = triage.acquire(self.store)
 
     def test_r139_three_runs_randomized(self):
         import random
@@ -4062,7 +4146,7 @@ class ExecuteTests(unittest.TestCase):
             with self.subTest(provider=provider):
                 self.setUp()
                 saved = self.simulation_guard_fixture(provider)
-                self.assertEqual({a['action'] for a in self.plan['actions']}, execute.CALL_KINDS)
+                self.assertEqual({a['action'] for a in self.plan['actions']}, execute.CALL_KINDS - {'send-draft'})
                 before={p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
                 for fail in (None, *range(1,len(self.plan['actions'])+1)):
                     output=json.dumps(execute.simulate(self.store,self.path,fail))
@@ -5275,6 +5359,1912 @@ class ReplyTests(unittest.TestCase):
         self.output = output.getvalue()
         return execute.read(self.path)
 
+    def send_fixture(self):
+        self.config = {'allow_send': True, 'accounts': {'cedar': {'provider':'outlook', 'executor_app':'cedar', 'executor_account':'cedar-example'}}}
+        (self.store/'config.toml').write_text('allow_send=true\n[accounts.cedar]\nprovider="outlook"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
+        execute.atomic(self.store/'tool-paths.json', {'cedar': {'send-draft':'tools.cedar.meMessage.meMessagesMessageSend'}})
+        payload = dict(id='draft-example', isDraft=True, toRecipients=[dict(emailAddress=dict(address='a@example.net'))], ccRecipients=[], bccRecipients=[], subject='Re: Question', body=dict(contentType='text', content='Owner words'))
+        record = dict(account='cedar', id='0', draft_id='draft-example', rule='example', created='2026-11-11T00:00:00+00:00', digest=triage.draft_digest(payload, 'outlook'))
+        execute.atomic(self.store/'state.json', {'cedar':3, '_drafts':[record]})
+        (self.store/'rules.toml').write_text('[[rules]]\nid="example"\naccounts=["cedar"]\nsubject="Question"\naction="draft"\ndraft="reply"\ndraft_text="Owner words"\n')
+        return payload
+
+    def forward_fixture(self):
+        payload = self.send_fixture()
+        payload['id'] = 'forward-example'
+        payload['toRecipients'] = [dict(emailAddress=dict(address='owner-other@example.org'))]
+        self.config['accounts']['marble'] = dict(address='owner-other@example.org')
+        with (self.store/'config.toml').open('a') as out:
+            out.write('[accounts.marble]\naddress="owner-other@example.org"\n')
+        execute.atomic(self.store/'state.json', dict(cedar=3))
+        return payload
+
+    def r188_drive_reply(self, verb, send_failed=False, language="en", later_failure=False):
+        from mock_provider import MockDrive
+        self.setUp()
+        payload = self.forward_fixture() if 'forward' in verb or 'reenviar' in verb else self.send_fixture()
+        config_path = self.store/'config.toml'
+        config_path.write_text('language="' + language + '"\n' + config_path.read_text())
+        self.config['language'] = language
+        rules_path = self.store/'rules.toml'
+        rules_path.write_text(rules_path.read_text().replace('subject="Question"', 'subject="Question 0"'))
+        triage.release(self.store, self.token)
+        with (self.store/'config.toml').open('a') as out:
+            out.write('[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n[state]\nkind="gdrive"\naccount="state-example"\nfolder="files-example"\n')
+        drive = MockDrive(datetime.now(timezone.utc).isoformat())
+        observation = self.store/'observation.json'
+        def acquire():
+            response = triage.drive_lock(self.store, 'acquire')
+            while isinstance(response, dict):
+                execute.atomic(observation, drive.perform(response['call']))
+                response = triage.drive_lock(self.store, 'acquire', observation=observation)
+            return response
+        def fetch():
+            response = triage.drive_state(self.store, 'fetch', self.token)
+            execute.atomic(observation, {c['name']:drive.file_call(c)['status'] for c in response['calls']})
+            triage.drive_state(self.store, 'fetch', self.token, observation)
+        def upload():
+            response = triage.drive_state(self.store, 'send', self.token)
+            execute.atomic(observation, drive.perform(response['call']))
+            response = triage.drive_state(self.store, 'send', self.token, lock_observation=observation)
+            while 'call' in response:
+                execute.atomic(observation, drive.file_call(response['call']))
+                response = triage.drive_state(self.store, 'send', self.token, observation)
+            self.assertFalse(response.get('failed'), response)
+        self.token = acquire()
+        drive.files = {name:(self.store/name).read_bytes() for name in triage.STATE_FILES if (self.store/name).is_file() and name not in ('plan.json', 'inbox.json')}
+        fetch()
+        execute.atomic(self.store/'inbox.json', self.listing)
+        plan = self.reply('1 ' + verb)
+        self.assertFalse(plan['reasons'], self.output)
+        machine = execute.Execution(self.store, self.token, self.path)
+        for step in range(20):
+            response = machine.step()
+            if response.get('state_send_required'):
+                upload()
+                continue
+            if response.get('done'):
+                break
+            if response.get('final_reads'):
+                break
+            calls = response.get('calls', [])
+            self.assertTrue(calls, response)
+            while calls:
+                values = []
+                for call in calls:
+                    value = payload if 'GetMessages' in call.get('path', '') else dict(id=payload['id']) if call.get('action') == 'create-draft' else {}
+                    values.append(dict(ok=False, error={}) if send_failed and call.get('path', '').endswith('MessageSend') else dict(ok=True, value=value))
+                execute.atomic(observation, values)
+                response = machine.batch_result(observation)
+                calls = response.get('calls', [])
+        else:
+            self.fail('reply did not finish')
+        removed = {a['id'] for a in plan['actions'] if a['action'] in triage.REMOVALS}
+        self.listing = dict(self.listing, messages=[m for m in self.listing['messages'] if m['id'] not in removed])
+        machine.final(self.listing)
+        response = triage.drive_lock(self.store, 'commit', self.token)
+        execute.atomic(observation, drive.perform(response['call']))
+        triage.drive_lock(self.store, 'commit', self.token, observation=observation)
+        triage.commit_state(self.store, self.token, self.path, lock_verified=True)
+        message = triage.render_message(self.store, self.token, self.path, None)
+        self.assert_r193_agreement(message)
+        committed = {name:triage.state_bytes(self.store/name) for name in triage.STATE_FILES if (self.store/name).is_file() and name not in ('plan.json', 'inbox.json')}
+        delivered_numbers = triage.read_numbers(self.store)
+        upload()
+        for name, content in committed.items():
+            triage.validate_state_file(name, content, self.config, self.store)
+        old_store = self.store
+        temp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
+        self.addCleanup(temp.cleanup)
+        self.store = Path(temp.name)
+        self.path = self.store/'plan.json'
+        observation = self.store/'observation.json'
+        for name in ('config.toml', 'guardrails.md'):
+            (self.store/name).write_bytes((old_store/name).read_bytes())
+        drive.item = None
+        self.token = acquire()
+        fetch()
+        for name, content in committed.items():
+            self.assertEqual(triage.state_bytes(self.store/name), content, name)
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.assertTrue(message)
+        # The owner still holds the delivered message when another item leaves.
+        old_number = next(i['number'] for i in delivered_numbers['items'] if i['id'] == '1')
+        self.listing = dict(self.listing, messages=[m for m in self.listing['messages'] if m['id'] != '1'])
+        execute.atomic(self.store/'inbox.json', self.listing)
+        import contextlib, io
+        from unittest.mock import patch
+        output = io.StringIO()
+        output.reconfigure = lambda **kw: None
+        with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+            triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)])
+        self.assertTrue(execute.Execution(self.store, self.token, self.path).step().get('done'))
+        response = triage.drive_lock(self.store, 'commit', self.token)
+        execute.atomic(observation, drive.perform(response['call']))
+        triage.drive_lock(self.store, 'commit', self.token, observation=observation)
+        triage.commit_state(self.store, self.token, self.path, lock_verified=True)
+        later_message = triage.render_message(self.store, self.token, self.path, None)
+        if later_failure:
+            upload()
+            release = triage.drive_lock(self.store, 'release', self.token)
+            while isinstance(release, dict):
+                execute.atomic(observation, drive.perform(release['call']))
+                release = triage.drive_lock(self.store, 'release', self.token, observation=observation)
+            self.token = acquire()
+            fetch()
+            execute.atomic(self.store/'inbox.json', self.listing)
+            number = next(i['number'] for i in triage.read_numbers(self.store)['items'] if i['id'] == '0')
+            self.reply(str(number) + ' trash')
+            failed = execute.Execution(self.store, self.token, self.path)
+            self.assertTrue(failed.step()['calls'])
+            execute.atomic(observation, [dict(ok=False, error=dict(status=500))])
+            failed.batch_result(observation)
+            failed.final(self.listing)
+            response = triage.drive_lock(self.store, 'commit', self.token)
+            execute.atomic(observation, drive.perform(response['call']))
+            triage.drive_lock(self.store, 'commit', self.token, observation=observation)
+            triage.commit_state(self.store, self.token, self.path, lock_verified=True)
+            later_message = triage.render_message(self.store, self.token, self.path, None)
+            for rendered in (later_message, (self.store/'report.md').read_text()):
+                self.assertIn('trash failed' if language == 'en' else 'eliminar falló', rendered)
+        if send_failed:
+            for rendered in (later_message, (self.store/'report.md').read_text()):
+                for words in (('was issued', 'result is unknown', 'check Sent and Drafts by hand') if language == 'en' else ('Se emitió', 'resultado es desconocido', 'Sent y Drafts a mano')):
+                    self.assertIn(words, rendered)
+                self.assertNotIn('Draft waiting', rendered)
+        upload()
+        refused = self.reply(str(old_number) + ' trash')
+        self.assertEqual(refused['actions'], [])
+        self.assertIn('Unknown number', self.output)
+        response = triage.drive_lock(self.store, 'release', self.token)
+        while isinstance(response, dict):
+            execute.atomic(observation, drive.perform(response['call']))
+            response = triage.drive_lock(self.store, 'release', self.token, observation=observation)
+        return committed
+
+    def test_r188_drive_reply_verb_matrix(self):
+        for verb in ('trash', 'archive', 'spam', 'move to Billing', 'leave', 'yes', 'no', 'send', 'enviar', 'forward marble', 'reenviar marble'):
+            with self.subTest(verb=verb):
+                self.r188_drive_reply(verb)
+
+    def test_r188_drive_unknown_send_visible(self):
+        for verb in ('send', 'forward marble'):
+            for language in ('en', 'es'):
+                with self.subTest(verb=verb, language=language):
+                    self.r188_drive_reply(verb, send_failed=True, language=language)
+
+    def test_r188_written_state_validator_property(self):
+        # Generate records through the reply/execution/commit/upload commands.
+        # Repeated selections exercise fresh stores and every accepted verb.
+        import random
+        rng = random.Random(188)
+        verbs = ['trash', 'archive', 'spam', 'move to Billing', 'leave', 'yes', 'no', 'send', 'enviar', 'forward marble', 'reenviar marble']
+        rng.shuffle(verbs)
+        for verb in verbs:
+            with self.subTest(verb=verb):
+                records = self.r188_drive_reply(verb)
+                self.assertIn('decisions.jsonl', records)
+                for name, raw in records.items():
+                    triage.validate_state_file(name, raw, self.config, self.store)
+
+    def test_r188_closed_log_entry_never_reopens(self):
+        call = dict(account='cedar', id='0', action='create-draft')
+        execute.append_log(self.store, 'old', call, 'closed')
+        execute.append_log(self.store, 'new', call, 'issued')
+        self.assertIn(('cedar', '0'), triage.closed_drafts(self.store))
+        self.assertEqual(triage.recover_drafts(self.store, {'cedar': 3}, self.token).get('_drafts', []), [])
+
+    def test_r188_unknown_send_visible_in_later_messages_and_reports(self):
+        import contextlib, io
+        from unittest.mock import patch
+        for forward in (False, True):
+            for language in ('en', 'es'):
+                with self.subTest(forward=forward, language=language):
+                    self.setUp()
+                    payload = self.forward_fixture() if forward else self.send_fixture()
+                    rules = self.store/'rules.toml'
+                    rules.write_text(rules.read_text().replace('subject="Question"', 'subject="Question 0"'))
+                    config = self.store/'config.toml'
+                    config.write_text('relist_inbox="new_plus_count"\nlanguage="' + language + '"\n' + config.read_text())
+                    self.reply('1 forward marble' if forward else '1 send')
+                    machine = execute.Execution(self.store, self.token, self.path)
+                    machine.step()
+                    observation = self.store/'observation.json'
+                    if forward:
+                        execute.atomic(observation, [dict(ok=True, value=dict(id=payload['id']))])
+                        machine.batch_result(observation)
+                        execute.atomic(observation, [dict(ok=True, value=payload)])
+                        machine.batch_result(observation)
+                        machine.step()
+                    execute.atomic(observation, [dict(ok=True, value=payload)])
+                    self.assertTrue(machine.batch_result(observation)['calls'][0]['path'].endswith('MessageSend'))
+                    # Interrupt after issue, before reporting its result or committing.
+                    for run in range(2):
+                        triage.release(self.store, self.token)
+                        self.token = triage.acquire(self.store)
+                        output = io.StringIO()
+                        output.reconfigure = lambda **kw: None
+                        with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                            triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)])
+                        later = execute.Execution(self.store, self.token, self.path)
+                        self.assertTrue(later.step().get('done'))
+                        triage.commit_state(self.store, self.token, self.path)
+                        message = triage.render_message(self.store, self.token, self.path, None)
+                        report = (self.store/'report.md').read_text()
+                        for rendered in (message, report):
+                            for words in (('was issued', 'result is unknown', 'check Sent and Drafts by hand') if language == 'en' else ('Se emitió', 'resultado es desconocido', 'Sent y Drafts a mano')):
+                                self.assertIn(words, rendered)
+                            self.assertNotIn('Draft waiting', rendered)
+
+    def test_r198_uncertain_hidden_retains_number(self):
+        for sending in (False, True):
+            for mode in ('all', 'new_plus_count'):
+                self.setUp()
+                (self.store/'config.toml').write_text('allow_send=' + str(sending).lower() + '\nrelist_inbox="' + mode + '"\n[accounts.cedar]\n')
+                execute.append_log(self.store, 'cut-run', dict(account='cedar', id='0', action='create-draft'), 'issued')
+                import contextlib, io
+                from unittest.mock import patch
+                output = io.StringIO()
+                output.reconfigure = lambda **kw: None
+                with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                    triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)])
+                self.assertTrue(execute.Execution(self.store, self.token, self.path).step().get('done'))
+                triage.commit_state(self.store, self.token, self.path)
+                message = triage.render_message(self.store, self.token, self.path, None)
+                if mode == 'new_plus_count':
+                    self.assertNotIn('Question 0', message)
+                else:
+                    self.assertIn('draft may exist', message)
+                self.assertTrue(any(i['number'] == 1 and i['id'] == '0' for i in triage.read_numbers(self.store)['items']))
+                self.assertEqual([a['id'] for a in self.reply('1 trash')['actions']], ['0'])
+
+    def test_r195_recovered_draft_preview_and_unsaved_message(self):
+        import contextlib, io
+        from unittest.mock import patch
+        for language in ('en', 'es'):
+            self.setUp()
+            (self.store/'config.toml').write_text('language="' + language + '"\n[accounts.cedar]\n')
+            self.listing['messages'][1]['sender'] = self.listing['messages'][0]['sender']
+            execute.atomic(self.store/'inbox.json', self.listing)
+            execute.append_log(self.store, 'cut-run', dict(account='cedar', id='0', action='create-draft'), 'issued')
+            output = io.StringIO()
+            output.reconfigure = lambda **kw: None
+            with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)])
+            plan = execute.read(self.path)
+            for rendered in (output.getvalue(), triage.render_message(self.store, self.token, self.path, None)):
+                self.assertIn('draft may exist; check Drafts by hand', rendered)
+                self.assertNotIn('(2)', rendered)
+            numbers = {i['id']: i.get('number') for i in plan['remaining']}
+            self.assertNotEqual(numbers['0'], numbers['1'])
+
+    def test_r195_kept_issued_message_matches_report(self):
+        for language in ('en', 'es'):
+            for verb in ('leave', 'yes', 'no'):
+                self.setUp()
+                self.send_fixture()
+                config = self.store/'config.toml'
+                config.write_text('language="' + language + '"\nrelist_inbox="new_plus_count"\n' + config.read_text())
+                previous = execute.read(self.store/'state.json')
+                previous['_drafts'][0].update(status='unknown', issued='2026-11-11T01:00:00+00:00')
+                previous['_drafts'][0].pop('digest')
+                execute.atomic(self.store/'state.json', previous)
+                self.reply('1 ' + verb)
+                self.assertTrue(execute.Execution(self.store, self.token, self.path).step().get('done'))
+                triage.commit_state(self.store, self.token, self.path)
+                message = triage.render_message(self.store, self.token, self.path, None)
+                report = (self.store/'report.md').read_text()
+                for rendered in (message, report):
+                    line = next(line for line in rendered.splitlines() if 'Question 0' in line)
+                    self.assertIn('Kept by owner reply', line)
+                    self.assertIn('was issued' if language == 'en' else 'Se emitió', line)
+
+    def test_r195_randomized_recovered_and_kept_invariants(self):
+        import contextlib, io, random, re
+        from unittest.mock import patch
+        rng = random.Random(195)
+        for seed in range(150):
+            self.setUp()
+            execute.atomic(self.store/'numbers.json', dict(next=1, items=[]))
+            language = rng.choice(('en', 'es'))
+            issued = rng.choice((False, True))
+            config = 'language="' + language + '"\nrelist_inbox="' + rng.choice(('all', 'new_plus_count')) + '"\n[accounts.cedar]\n'
+            (self.store/'config.toml').write_text(config)
+            self.listing['messages'][1]['sender'] = self.listing['messages'][0]['sender']
+            execute.atomic(self.store/'inbox.json', self.listing)
+            if issued:
+                record = dict(account='cedar', id='0', draft_id='fixture-draft', rule=rng.choice(('example', 'numbered-forward')), created='2026-11-11T00:00:00+00:00', issued='2026-11-11T01:00:00+00:00', status='unknown')
+                execute.atomic(self.store/'state.json', dict(cedar=3, _drafts=[record]))
+            else:
+                execute.append_log(self.store, 'cut-run', dict(account='cedar', id='0', action='create-draft'), 'issued')
+            for run in range(3):
+                if run:
+                    triage.release(self.store, self.token)
+                    self.token = triage.acquire(self.store)
+                output = io.StringIO()
+                output.reconfigure = lambda **kw: None
+                with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                    if run == 1 and issued:
+                        number = next(i['number'] for i in triage.read_numbers(self.store)['items'] if any(m['id']=='0' for m in i['members']))
+                        self.reply(str(number) + ' ' + rng.choice(('leave', 'yes', 'no')))
+                    else:
+                        triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)])
+                hidden = not issued and run > 0 and 'new_plus_count' in config
+                if not issued and not hidden:
+                    self.assertIn('draft may exist; check Drafts by hand', triage.render_message(self.store, self.token, self.path, None))
+                self.assertTrue(execute.Execution(self.store, self.token, self.path).step().get('done'))
+                triage.commit_state(self.store, self.token, self.path)
+                before = {name:(self.store/name).read_bytes() for name in ('numbers.json', 'state.json')}
+                message = triage.render_message(self.store, self.token, self.path, None)
+                report = (self.store/'report.md').read_text()
+                for subject in ('Question 0', 'Question 1', 'Question 2'):
+                    a = [line for line in message.splitlines() if subject in line and '·' in line]
+                    b = [line for line in report.splitlines() if subject in line and '·' in line]
+                    self.assertEqual(a, b, (seed, run, subject))
+                line = next((line for line in message.splitlines() if 'Question 0' in line), '')
+                if hidden:
+                    self.assertEqual(line, '')
+                self.assertNotIn('(2)', line)
+                if issued:
+                    self.assertNotIn('Draft waiting', line)
+                    self.assertIn('was issued' if language == 'en' else 'Se emitió', line)
+                elif not hidden:
+                    self.assertIn('draft may exist; check Drafts by hand', line)
+                if run and issued:
+                    self.assertIn('Kept by owner reply', line)
+                numbers = triage.read_numbers(self.store)
+                printed = {int(m.group(1)) for m in re.finditer(r'^(\d+)\. ', message, re.M)}
+                committed = {i['number'] for i in numbers['items'] if i.get('run_token') == self.token}
+                self.assertEqual(printed, committed)
+                self.assertEqual(before, {name:(self.store/name).read_bytes() for name in before})
+
+    def test_r195_refused_read_is_not_an_issued_send(self):
+        for language in ('en', 'es'):
+            for value in (dict(ok=True, value={}), dict(ok=False, error=dict(status=404)), dict(ok=False, error=dict(status=503))):
+                self.setUp()
+                self.send_fixture()
+                config = self.store/'config.toml'
+                config.write_text('language="' + language + '"\n' + config.read_text())
+                self.reply('1 send')
+                machine = execute.Execution(self.store, self.token, self.path)
+                machine.step()
+                response = self.store/'response.json'
+                execute.atomic(response, [value])
+                result = machine.batch_result(response)
+                self.assertEqual(result['status'], 'failed')
+                machine.final(self.listing)
+                triage.commit_state(self.store, self.token, self.path)
+                for rendered in (triage.render_message(self.store, self.token, self.path, None), (self.store/'report.md').read_text()):
+                    line = next(line for line in rendered.splitlines() if 'Question 0' in line)
+                    self.assertIn('not sent' if language == 'en' else 'no se envió', line)
+                    self.assertNotIn('was issued', line)
+                    self.assertNotIn('Se emitió', line)
+                record = execute.read(self.store/'state.json')['_drafts'][0]
+                self.assertEqual(record['status'], 'refused')
+                self.assertNotIn('digest', record)
+                self.number()
+                number = next(i['number'] for i in triage.read_numbers(self.store)['items'] if i['id'] == '0')
+                self.reply(str(number) + ' send')
+                self.assertIn('not sent' if language == 'en' else 'no se envió', self.output)
+
+    def test_r198_issued_reply_prints_live_number(self):
+        for status in ('unknown', 'refused'):
+            for language in ('en', 'es'):
+                self.setUp()
+                self.send_fixture()
+                config = self.store/'config.toml'
+                config.write_text('language="' + language + '"\nrelist_inbox="new_plus_count"\n' + config.read_text())
+                state = execute.read(self.store/'state.json')
+                state['_drafts'][0].update(status=status, issued='2026-11-11T01:00:00+00:00')
+                state['_drafts'][0].pop('digest')
+                execute.atomic(self.store/'state.json', state)
+                self.reply('1 leave')
+                self.assertTrue(execute.Execution(self.store, self.token, self.path).step().get('done'))
+                triage.commit_state(self.store, self.token, self.path)
+                message = triage.render_message(self.store, self.token, self.path, None)
+                number = next(i['number'] for i in triage.read_numbers(self.store)['items'] if i['id']=='0')
+                line = next(line for line in message.splitlines() if 'Question 0' in line)
+                self.assertTrue(line.startswith(str(number) + '. '), line)
+
+    def test_r198_refused_read_later_plans(self):
+        import contextlib, io
+        from unittest.mock import patch
+        for language in ('en', 'es'):
+            for mode in ('all', 'new_plus_count'):
+                self.setUp()
+                self.send_fixture()
+                rules = self.store/"rules.toml"
+                rules.write_text(rules.read_text().replace('subject="Question"', 'subject="Question 0"'))
+                config = self.store/'config.toml'
+                config.write_text('language="' + language + '"\nrelist_inbox="' + mode + '"\n' + config.read_text())
+                self.reply('1 send')
+                machine = execute.Execution(self.store, self.token, self.path)
+                machine.step()
+                execute.atomic(self.store/'response.json', [dict(ok=True, value={})])
+                machine.batch_result(self.store/'response.json')
+                machine.final(self.listing)
+                triage.commit_state(self.store, self.token, self.path)
+                triage.release(self.store, self.token)
+                self.token = triage.acquire(self.store)
+                output = io.StringIO()
+                output.reconfigure = lambda **kw: None
+                with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                    triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)])
+                unsaved = triage.render_message(self.store, self.token, self.path, None)
+                self.assertTrue(execute.Execution(self.store, self.token, self.path).step().get('done'))
+                triage.commit_state(self.store, self.token, self.path)
+                for rendered in (unsaved, triage.render_message(self.store, self.token, self.path, None), (self.store/'report.md').read_text()):
+                    self.assertNotIn('Draft waiting', rendered)
+                    self.assertIn('not sent' if language == 'en' else 'no se envió', rendered)
+                number = next(i['number'] for i in triage.read_numbers(self.store)['items'] if i['id'] == '0')
+                self.reply(str(number) + ' leave')
+                self.assertNotIn('Draft waiting', triage.render_message(self.store, self.token, self.path, None))
+
+    def assert_r193_agreement(self, message):
+        report = (self.store/'report.md').read_text()
+        for subject in ('Question 0', 'Question 1', 'Question 2'):
+            message_lines = [line for line in message.splitlines() if subject in line and ('·' in line)]
+            report_lines = [line for line in report.splitlines() if subject in line and ('·' in line)]
+            for lines in (message_lines, report_lines):
+                for line in lines:
+                    if 'was issued' in line or 'Se emitió' in line:
+                        self.assertNotIn('Draft waiting', line)
+            def notes(lines):
+                import re
+                return [re.search(r'(?:A (?:send|forward) was issued|Se emitió).*?(?:by hand|a mano)|Draft waiting since [^;)]+', line).group()
+                        for line in lines if 'was issued' in line or 'Se emitió' in line or 'Draft waiting since' in line]
+            self.assertEqual(notes(message_lines), notes(report_lines))
+
+    def test_r193_handled_lines_have_no_record_note(self):
+        import random
+        rng = random.Random(1932)
+        self.send_fixture()
+        base = execute.read(self.store/'state.json')['_drafts'][0]
+        for seed in range(100):
+            language = rng.choice(('en', 'es'))
+            record = dict(base, status='unknown', issued=base['created'],
+                          rule=rng.choice(('example', 'numbered-forward')))
+            record.pop('digest', None)
+            execute.atomic(self.store/'state.json', dict(cedar=3, _drafts=[record]))
+            rule = dict(id='remove', accounts=['cedar'], subject='Question 0', action='trash', exclusions=[])
+            plan = triage.build_plan(self.listing, [rule], [], self.config, dict(cedar=3, _drafts=[record]))
+            observed = [a | dict(status='executed') for a in plan['actions']]
+            outcomes = triage.message_outcomes(plan, self.listing,
+                triage.remaining_items(plan, self.listing, observed), observed, language, store=self.store)
+            line = next(o for o in outcomes if o['item']['id'] == '0')
+            with self.subTest(seed=seed):
+                self.assertEqual(line['section'], 'handled')
+                self.assertNotIn('was issued', line['tag'])
+                self.assertNotIn('Se emitió', line['tag'])
+
+    def test_r193_randomized_drive_agreement(self):
+        import random
+        rng = random.Random(193)
+        scenarios = [(verb, failed, language) for verb in ('send', 'forward marble')
+                     for failed in (False, True) for language in ('en', 'es')]
+        rng.shuffle(scenarios)
+        for verb, failed, language in scenarios:
+            with self.subTest(verb=verb, failed=failed, language=language):
+                self.r188_drive_reply(verb, send_failed=failed, language=language)
+
+    def test_r193_failed_send_and_forward_notes(self):
+        for language in ('en', 'es'):
+            for forward in (False, True):
+                for failed in (False, True):
+                    with self.subTest(language=language, forward=forward, failed=failed):
+                        self.setUp()
+                        payload = self.forward_fixture() if forward else self.send_fixture()
+                        config = self.store/'config.toml'
+                        config.write_text('language="' + language + '"\n' + config.read_text())
+                        self.reply('1 forward marble' if forward else '1 send')
+                        machine = execute.Execution(self.store, self.token, self.path)
+                        machine.step()
+                        response = self.store/'response.json'
+                        if forward:
+                            execute.atomic(response, [dict(ok=True, value=dict(id=payload['id']))])
+                            machine.batch_result(response)
+                            execute.atomic(response, [dict(ok=True, value=payload)])
+                            machine.batch_result(response)
+                            machine.step()
+                        execute.atomic(response, [dict(ok=True, value=payload)])
+                        machine.batch_result(response)
+                        if failed:
+                            execute.atomic(response, [dict(ok=False, error=dict(status=500))])
+                            machine.batch_result(response)
+                        machine.final(self.listing)
+                        triage.commit_state(self.store, self.token, self.path)
+                        message = triage.render_message(self.store, self.token, self.path, None)
+                        report = (self.store/'report.md').read_text()
+                        self.assert_r193_agreement(message)
+                        for text in (message, report):
+                            line = next(line for line in text.splitlines() if 'Question 0' in line)
+                            self.assertNotIn('Draft waiting', line)
+                            self.assertEqual(line.count('was issued' if language == 'en' else 'Se emitió'), 1)
+                            self.assertNotIn('sent failed' if language == 'en' else 'enviado falló', line)
+
+    def test_r191_interrupted_send_then_failed_trash(self):
+        import contextlib, io
+        from unittest.mock import patch
+        for forward in (False, True):
+            for language in ('en', 'es'):
+                with self.subTest(forward=forward, language=language):
+                    self.setUp()
+                    payload = self.forward_fixture() if forward else self.send_fixture()
+                    rules = self.store/'rules.toml'
+                    rules.write_text(rules.read_text().replace('subject="Question"', 'subject="Question 0"'))
+                    config = self.store/'config.toml'
+                    config.write_text('relist_inbox="new_plus_count"\nlanguage="' + language + '"\n' + config.read_text())
+                    self.reply('1 forward marble' if forward else '1 send')
+                    machine = execute.Execution(self.store, self.token, self.path)
+                    machine.step()
+                    observation = self.store/'observation.json'
+                    if forward:
+                        execute.atomic(observation, [dict(ok=True, value=dict(id=payload['id']))])
+                        machine.batch_result(observation)
+                        execute.atomic(observation, [dict(ok=True, value=payload)])
+                        machine.batch_result(observation)
+                        machine.step()
+                    execute.atomic(observation, [dict(ok=True, value=payload)])
+                    self.assertTrue(machine.batch_result(observation)['calls'][0]['path'].endswith('MessageSend'))
+                    # Interrupt after issue, before reporting its result or committing.
+                    for run in range(1):
+                        triage.release(self.store, self.token)
+                        self.token = triage.acquire(self.store)
+                        output = io.StringIO()
+                        output.reconfigure = lambda **kw: None
+                        with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                            triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)])
+                        later = execute.Execution(self.store, self.token, self.path)
+                        self.assertTrue(later.step().get('done'))
+                        triage.commit_state(self.store, self.token, self.path)
+                        number = next(i['number'] for i in triage.read_numbers(self.store)['items'] if i['id'] == '0')
+                        triage.release(self.store, self.token)
+                        self.token = triage.acquire(self.store)
+                        self.reply(str(number) + ' trash')
+                        failed = execute.Execution(self.store, self.token, self.path)
+                        response = failed.step()
+                        self.assertTrue(response['calls'])
+                        execute.atomic(observation, [dict(ok=False, error=dict(status=500))])
+                        failed.batch_result(observation)
+                        failed.final(self.listing)
+                        triage.commit_state(self.store, self.token, self.path)
+                        message = triage.render_message(self.store, self.token, self.path, None)
+                        report = (self.store/'report.md').read_text()
+                        for rendered in (message, report):
+                            for words in (('was issued', 'result is unknown', 'check Sent and Drafts by hand') if language == 'en' else ('Se emitió', 'resultado es desconocido', 'Sent y Drafts a mano')):
+                                self.assertIn(words, rendered)
+                            self.assertNotIn('Draft waiting', rendered)
+                            self.assertIn('trash failed' if language == 'en' else 'eliminar falló', rendered)
+
+    def test_r191_record_status_with_action_outcomes(self):
+        import random
+        rng = random.Random(191)
+        for drive in (False, True):
+            for forward in (False, True):
+                for language in ('en', 'es'):
+                    self.setUp()
+                    self.forward_fixture() if forward else self.send_fixture()
+                    if drive:
+                        self.r188_drive_reply('forward marble' if forward else 'send', send_failed=True, language=language)
+                    previous = execute.read(self.store/'state.json')
+                    if not drive:
+                        record = dict(account='cedar', id='0', draft_id='example-draft', rule='numbered-forward' if forward else 'example', created='2026-11-11T00:00:00+00:00', issued='2026-11-11T00:00:00+00:00', status='unknown')
+                        previous['_drafts'] = [record]
+                        execute.atomic(self.store/'state.json', previous)
+                    before = (self.store/'state.json').read_bytes()
+                    for status in rng.sample(['failed', 'unconfirmed', 'unexecuted', 'issued_unknown'], 4):
+                        rule = dict(id='remove', accounts=['cedar'], subject='Question 0', action='trash', exclusions=[])
+                        plan = triage.build_plan(self.listing, [rule], [], self.config, previous)
+                        observed = [a | dict(status=status) for a in plan['actions']]
+                        items = triage.remaining_items(plan, self.listing, observed)
+                        outcomes = triage.message_outcomes(plan, self.listing, items, observed, language, store=self.store)
+                        line = next(o['tag'] for o in outcomes if o['item']['id'] == '0')
+                        prefix = ('A forward' if forward else 'A send') if language == 'en' else ('Se emitió un reenvío' if forward else 'Se emitió un envío')
+                        self.assertTrue(line.startswith(prefix), line)
+                        self.assertIn('trash' if language == 'en' else 'eliminar', line)
+                        report = triage.render_report(plan, self.listing, language, self.store, outcomes=outcomes)
+                        self.assertIn(line, report)
+                        self.assertEqual((self.store/'state.json').read_bytes(), before)
+
+    def test_r191_drive_unknown_then_failed_trash(self):
+        for verb in ('send', 'forward marble'):
+            for language in ('en', 'es'):
+                with self.subTest(verb=verb, language=language):
+                    self.r188_drive_reply(verb, send_failed=True, language=language, later_failure=True)
+
+    def test_r191_tag_pairs_and_record_statuses_randomized(self):
+        import copy, random
+        rng = random.Random(1911)
+        self.send_fixture()
+        base = execute.read(self.store/'state.json')['_drafts'][0]
+        for seed in range(160):
+            language = rng.choice(('en', 'es'))
+            status = rng.choice(('', 'sent', 'gone', 'hand-sent', 'unknown', 'forward-requested'))
+            record = dict(base, rule=rng.choice(('example', 'numbered-forward')))
+            record.pop('digest')
+            if status:
+                record['status'] = status
+            if status in ('sent', 'unknown', 'forward-requested'):
+                record['issued'] = record['created']
+            previous = dict(cedar=3, _drafts=[record])
+            execute.atomic(self.store/'state.json', previous)
+            protected = rng.choice((True, False))
+            holds = [dict(sender='a@example.net')] if protected else []
+            plan = triage.build_plan(self.listing, [], holds, self.config, previous)
+            mark = next(i for i in plan['remaining'] if i['id'] == '0')
+            kept = rng.choice((True, False))
+            if kept:
+                mark['reason'] += '; Kept by owner reply'
+            judged = rng.choice((True, False))
+            if judged:
+                decision = next(i for i in plan['decisions'] if i['id'] == '0')
+                decision['judgment'] = dict(entry='example', reason='Fixture judgment')
+            before = copy.deepcopy(plan), (self.store/'state.json').read_bytes()
+            outcomes = triage.message_outcomes(plan, self.listing, copy.deepcopy(plan['remaining']), [], language, store=self.store)
+            tag = next(o['tag'] for o in outcomes if o['item']['id'] == '0')
+            with self.subTest(seed=seed, status=status, protected=protected, kept=kept):
+                if status in ('unknown', 'forward-requested'):
+                    self.assertIn('result is unknown' if language == 'en' else 'resultado es desconocido', tag)
+                    self.assertTrue(tag.startswith(('A send', 'A forward', 'Se emitió')), tag)
+                elif not status:
+                    self.assertIn('Draft waiting since', tag)
+                else:
+                    self.assertNotIn('Draft waiting', tag)
+                    self.assertNotIn('result is unknown', tag)
+                if protected:
+                    self.assertIn('Protected by never-touch' if language == 'en' else 'Protegido por never-touch', tag)
+                if kept:
+                    self.assertIn('Kept by owner reply', tag)
+                if judged:
+                    self.assertIn('judged' if language == 'en' else 'evaluado', tag)
+                self.assertEqual((plan, (self.store/'state.json').read_bytes()), before)
+
+    def test_r191_repeated_send_refusal_matches_known_result(self):
+        for forward in (False, True):
+            for status in ('sent', 'unknown'):
+                for language in ('en', 'es'):
+                    self.setUp()
+                    self.forward_fixture() if forward else self.send_fixture()
+                    previous = execute.read(self.store/'state.json')
+                    record = dict(account='cedar', id='0', draft_id='example-draft', rule='numbered-forward' if forward else 'example', created='2026-11-11T00:00:00+00:00', issued='2026-11-11T00:00:00+00:00', status=status)
+                    previous['_drafts'] = [record]
+                    config = self.config | dict(language=language)
+                    for verb in ('send', 'forward marble') if forward else ('send',):
+                        with self.assertRaises(ValueError) as error:
+                            triage.reply_plan(self.store, self.listing, [], config, previous, triage.parse_reply('1 ' + verb))
+                        text = str(error.exception)
+                        if status == 'sent':
+                            self.assertEqual(text, ('The message was forwarded' if forward else 'The draft was sent') if language == 'en' else ('El mensaje fue reenviado' if forward else 'El borrador fue enviado'))
+                        else:
+                            self.assertIn(('A forward' if forward else 'A send') if language == 'en' else ('Se emitió un reenvío' if forward else 'Se emitió un envío'), text)
+                            self.assertIn('unknown' if language == 'en' else 'desconocido', text)
+
+    def test_r182_forward_parser_and_refusals(self):
+        for verb in ('forward', 'reenviar'):
+            self.assertEqual(triage.parse_reply('1 ' + verb + ' marble'), [dict(number=1, verb='forward', target='marble')])
+        for text in ('1 forward', '1 forward a@example.org', '1 forward marble cedar', '1 forward marble;cedar', '1 forward marble, 2 send bad', '1 forward ../../marble', '1 forward mar\nble'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                triage.parse_reply(text)
+        self.forward_fixture()
+        previous = execute.read(self.store/'state.json')
+        parts = triage.parse_reply('1 forward marble')
+        for target in ('cedar', 'unknown'):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                triage.reply_plan(self.store, self.listing, [], self.config, previous, triage.parse_reply('1 forward ' + target))
+        with self.assertRaisesRegex(ValueError, 'disabled'):
+            triage.reply_plan(self.store, self.listing, [], self.config | dict(allow_send=False), previous, parts)
+        with self.assertRaisesRegex(ValueError, 'address'):
+            triage.reply_plan(self.store, self.listing, [], self.config | dict(accounts=self.config['accounts'] | dict(marble={})), previous, parts)
+        with self.assertRaisesRegex(ValueError, 'protected'):
+            triage.reply_plan(self.store, self.listing, [dict(sender='a@example.net')], self.config, previous, parts)
+        numbers = triage.read_numbers(self.store)
+        numbers['items'][0].pop('presentation', None)
+        numbers['items'][0]['members'] = [dict(account='cedar', id='0'), dict(account='cedar', id='1')]
+        numbers['items'] = numbers['items'][:1]
+        with self.assertRaisesRegex(ValueError, 'exactly one'):
+            triage.reply_plan(self.store, self.listing, [], self.config, previous, parts, numbers=numbers)
+
+    def test_r182_forward_send(self):
+        payload = self.forward_fixture()
+        plan = self.reply('1 forward marble')
+        self.assertEqual([a['action'] for a in plan['actions']], ['create-draft', 'send-draft'])
+        self.assertEqual(plan['actions'][0]['draft_text'], '')
+        machine = execute.Execution(self.store, self.token, self.path)
+        call = machine.step()['calls'][0]
+        self.assertNotIn(1, [i['number'] for i in triage.read_numbers(self.store)['items']])
+        self.assertTrue(call['path'].endswith('meMessagesMessageCreateForward'))
+        self.assertEqual(call['input']['input'], dict(path={'message-id':'0'}, body=dict(message=dict(toRecipients=[dict(emailAddress=dict(address='owner-other@example.org'))]))))
+        response = self.store/'response.json'
+        execute.atomic(response, [dict(ok=True, value=dict(id='forward-example'))])
+        machine.batch_result(response)
+        execute.atomic(response, [dict(ok=True, value=payload)])
+        machine.batch_result(response)
+        self.assertNotIn('Send', json.dumps(machine.step()))
+        execute.atomic(response, [dict(ok=True, value=payload)])
+        send = machine.batch_result(response)['calls'][0]
+        self.assertTrue(send['path'].endswith('meMessagesMessageSend'))
+        self.assertEqual(send['input']['input'], dict(path={'message-id':'forward-example'}))
+        execute.atomic(response, [dict(ok=True, value={})])
+        machine.batch_result(response)
+        machine.final(self.listing)
+        triage.commit_state(self.store, self.token, self.path)
+        self.assertEqual(execute.read(self.store/'state.json')['_drafts'][0]['status'], 'sent')
+        message = triage.render_message(self.store, self.token, self.path, None)
+        self.assertIn('Sent messages', message)
+        self.assertNotIn('\nDrafts\n', message)
+        self.assertIn('owner-other@example.org', message)
+        self.assertEqual(execute.read(self.store/'state.json')['cedar'], len(self.listing['messages']))
+
+    def test_r182_forward_failed_creation_and_read(self):
+        for failure in ('create', 'unknown', 'read', 'recipients', 'changed', 'not-draft'):
+            with self.subTest(failure=failure):
+                self.setUp()
+                payload = self.forward_fixture()
+                self.reply('1 forward marble')
+                machine = execute.Execution(self.store, self.token, self.path)
+                machine.step()
+                response = self.store/'response.json'
+                execute.atomic(response, [dict(ok=False, error={}) if failure == 'create' else dict(ok=True, value={} if failure == 'unknown' else dict(id='forward-example'))])
+                machine.batch_result(response)
+                if failure not in ('create', 'unknown'):
+                    execute.atomic(response, [dict(ok=False, error={}) if failure == 'read' else dict(ok=True, value=payload)])
+                    machine.batch_result(response)
+                step = machine.step()
+                self.assertNotIn('meMessagesMessageSend', json.dumps(step))
+                if failure in ('recipients', 'changed', 'not-draft'):
+                    if failure == 'recipients': payload['ccRecipients'] = [dict(emailAddress=dict(address='wrong@example.net'))]
+                    if failure == 'changed': payload['subject'] += ' changed'
+                    if failure == 'not-draft': payload['isDraft'] = False
+                    execute.atomic(response, [dict(ok=True, value=payload)])
+                    self.assertNotIn('calls', machine.batch_result(response))
+                self.assertFalse(any(e['verb'] == 'send-draft' and e['outcome'] == 'issued' for e in [json.loads(line) for line in (self.store/'calls.jsonl').read_text().splitlines()]))
+
+    def test_r182_forward_rehearsal(self):
+        import contextlib, io
+        from unittest.mock import patch
+        self.forward_fixture()
+        (self.store/'guardrails.md').write_text('Fixture guardrails')
+        (self.store/'reply.txt').write_text('1 reenviar marble')
+        before = {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
+        output = io.StringIO()
+        output.reconfigure = lambda **kw: None
+        with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+            triage.main(['reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path), '--dry-run'])
+        for fail in (None, 1, 2):
+            result = execute.simulate(self.store, self.path, fail=fail)
+            encoded = json.dumps(result)
+            for forbidden in ('tools.cedar', 'meMessagesMessageSend', 'cedar-example', 'meMessagesMessageCreateForward'):
+                self.assertNotIn(forbidden, encoded)
+        self.assertIn('owner-other@example.org', output.getvalue())
+        self.assertIn('forward', output.getvalue())
+        self.assertNotIn('\nDrafts\n', output.getvalue())
+        for name, data in before.items():
+            if name != self.path.name:
+                self.assertEqual((self.store/name).read_bytes(), data, name)
+
+    def test_r182_forward_cap_judgments_and_provider(self):
+        self.forward_fixture()
+        previous = execute.read(self.store/'state.json')
+        parts = triage.parse_reply('1 forward marble')
+        holds = [dict(sender='a@example.net', judgment='Protect example')]
+        needed = triage.reply_plan(self.store, self.listing, holds, self.config, previous, parts, run_token=self.token)['judgments_needed']
+        for answer in (False, True, None):
+            document = dict(binding=needed['binding'], answers=[] if answer is None else [dict(pair=needed['pairs'][0]['pair'], answer=answer, reason='Fixture')])
+            plan = triage.reply_plan(self.store, self.listing, holds, self.config, previous, parts, judgments=document, run_token=self.token)
+            self.assertEqual(len(plan['actions']), 2 if answer is False else 0)
+        for provider in ('gmail', None):
+            config = json.loads(json.dumps(self.config))
+            if provider is None: config['accounts']['cedar'].pop('provider')
+            else: config['accounts']['cedar']['provider'] = provider
+            with self.subTest(provider=provider), self.assertRaisesRegex(ValueError, 'forward-draft'):
+                triage.reply_plan(self.store, self.listing, [], config, previous, parts)
+        with self.assertRaisesRegex(ValueError, 'disabled'):
+            triage.reply_plan(self.store, self.listing, [], dict(accounts=self.config['accounts']), previous, parts)
+        plan = triage.reply_plan(self.store, self.listing, [], self.config | dict(inbox_limit=1), previous, parts)
+        self.assertEqual(sum(a['action'] == 'send-draft' for a in plan['actions']), 1)
+        self.assertFalse(any(a['action'] in triage.REMOVALS for a in plan['actions']))
+        number = triage.read_numbers(self.store)['items'][0]
+        number.pop('presentation', None)
+        listing = dict(self.listing, messages=[dict(self.listing['messages'][0], id=str(i)) for i in range(6)])
+        numbers = dict(next=7, items=[dict(number, number=i+1, id=str(i), members=[dict(account='cedar', id=str(i))]) for i in range(6)])
+        with self.assertRaisesRegex(ValueError, 'At most 5'):
+            triage.reply_plan(self.store, listing, [], self.config, previous, triage.parse_reply(', '.join(str(i+1)+' forward marble' for i in range(6))), numbers=numbers)
+        plan = triage.reply_plan(self.store, listing, [], self.config, previous, triage.parse_reply(', '.join(str(i+1)+' forward marble' for i in range(5))), numbers=numbers)
+        self.assertEqual(sum(a['action'] == 'send-draft' for a in plan['actions']), 5)
+        mixed = dict(previous, _drafts=[dict(account='cedar', id=str(i), draft_id='draft-'+str(i), rule='example', created='2026-11-11T00:00:00+00:00', digest='0'*64) for i in range(3)])
+        with self.assertRaisesRegex(ValueError, 'At most 5'):
+            triage.reply_plan(self.store, listing, [], self.config, mixed, triage.parse_reply(', '.join(str(i+1)+(' send' if i < 3 else ' forward marble') for i in range(6))), numbers=numbers)
+
+
+        crowded = dict(self.listing, messages=[dict(self.listing['messages'][0], id=str(i)) for i in range(10)])
+        numbers = dict(next=11, items=[dict(number, number=i+1, id=str(i), members=[dict(account='cedar', id=str(i))]) for i in range(10)])
+        plan = triage.reply_plan(self.store, crowded, [], self.config, previous, triage.parse_reply('1 forward marble, ' + ', '.join(str(i+1)+' trash' for i in range(1,10))), numbers=numbers)
+        self.assertEqual(sum(a['action'] == 'send-draft' for a in plan['actions']), 1)
+
+    def test_r184_failed_retirement_write_sends_nothing(self):
+        from unittest.mock import patch
+        for forward in (False, True):
+            with self.subTest(forward=forward):
+                self.setUp()
+                self.forward_fixture() if forward else self.send_fixture()
+                self.reply('1 forward marble' if forward else '1 send')
+                machine = execute.Execution(self.store, self.token, self.path)
+                original = execute.atomic
+                def write(path, value):
+                    if path.name == 'numbers.json':
+                        raise OSError('fictional write failure')
+                    return original(path, value)
+                with patch.object(execute, 'atomic', side_effect=write):
+                    with self.assertRaisesRegex(ValueError, 'nothing sent'):
+                        machine.step()
+                self.assertFalse((self.store/'calls.jsonl').exists())
+                self.assertIn(1, [i['number'] for i in triage.read_numbers(self.store)['items']])
+
+    def test_r184_send_requires_approval_source(self):
+        self.send_fixture()
+        plan = self.reply('1 send')
+        plan.pop('reply_source')
+        execute.atomic(self.path, plan)
+        with self.assertRaisesRegex(ValueError, 'approval source'):
+            execute.Execution(self.store, self.token, self.path).step()
+        self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_r184_missing_send_tool_refuses_whole_reply(self):
+        self.send_fixture()
+        (self.store/'tool-paths.json').unlink()
+        plan = self.reply('1 send, 2 trash')
+        self.assertEqual(plan['actions'], [])
+        self.assertIn('send tool', self.output)
+
+    def test_r184_owner_wording_and_send_guidance(self):
+        self.send_fixture()
+        action = dict(action='send-draft', account='cedar', id='0')
+        self.assertEqual(triage.action_label(action, self.listing), 'sent')
+        self.assertEqual(triage.action_label(action, self.listing, planned=True), 'would send')
+        self.assertIn('enviar', triage.action_label(action, self.listing, language='es', planned=True))
+        self.reply('1 send')
+        self.assertNotIn('send-draft', self.output)
+        self.reply('99 trash')
+        self.assertIn('forward HANDLE', self.output)
+        self.assertIn('send', self.output)
+
+    def test_r184_ordinary_forward_named_rule_keeps_limit(self):
+        listing = dict(accounts=dict(cedar=1000), messages=[dict(self.listing['messages'][0], id=str(i)) for i in range(11)])
+        rule = dict(id='numbered-forward', accounts=['cedar'], subject='Question', action='archive')
+        plan = triage.build_plan(listing, [rule], [], self.config, dict(cedar=3))
+        self.assertTrue(any(t['kind'] == 'rule' and t['count'] == 11 for t in plan['approval_thresholds']))
+
+    def test_r198_mixed_send_threshold_refuses_whole_reply(self):
+        for forward in (False, True):
+            for language in ('en', 'es'):
+                for mode in ('all', 'new_plus_count'):
+                    self.setUp()
+                    self.forward_fixture() if forward else self.send_fixture()
+                    config = self.store/'config.toml'
+                    config.write_text('language="' + language + '"\nrelist_inbox="' + mode + '"\ninbox_limit=2\n' + config.read_text())
+                    before = (self.store/'state.json').read_bytes()
+                    plan = self.reply('2 trash, 1 forward marble' if forward else '2 trash, 1 send')
+                    self.assertEqual(plan['actions'], [])
+                    self.assertIn('separat' if language == 'en' else 'separado', self.output)
+                    self.assertEqual((self.store/'state.json').read_bytes(), before)
+                    self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_r184_large_inbox_allows_send_and_forward(self):
+        for forward in (False, True):
+            with self.subTest(forward=forward):
+                self.setUp()
+                self.forward_fixture() if forward else self.send_fixture()
+                (self.store/'config.toml').write_text('inbox_limit=1\n' + (self.store/'config.toml').read_text())
+                if not forward:
+                    with (self.store/'rules.toml').open('a') as out:
+                        out.write('after_send="archive"\n')
+                plan = self.reply('1 forward marble' if forward else '1 send')
+                self.assertEqual([a['action'] for a in plan['actions']], ['create-draft', 'send-draft'] if forward else ['send-draft'])
+                self.assertNotEqual(plan.get('approval_state'), 'awaiting approval')
+                if not forward:
+                    self.assertIn('file by hand', json.dumps(plan))
+
+    def test_r182_forward_failed_or_unknown_send_never_retries(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                self.setUp()
+                payload = self.forward_fixture()
+                self.reply('1 forward marble')
+                machine = execute.Execution(self.store, self.token, self.path)
+                machine.step()
+                response = self.store/'response.json'
+                execute.atomic(response, [dict(ok=True, value=dict(id='forward-example'))])
+                machine.batch_result(response)
+                execute.atomic(response, [dict(ok=True, value=payload)])
+                machine.batch_result(response)
+                machine.step()
+                execute.atomic(response, [dict(ok=True, value=payload)])
+                self.assertTrue(machine.batch_result(response)['calls'][0]['path'].endswith('meMessagesMessageSend'))
+                if failed:
+                    execute.atomic(response, [dict(ok=True, value=dict(error=dict(status=503)))])
+                    machine.batch_result(response)
+                self.assertNotIn('meMessagesMessageSend', json.dumps(machine.step()))
+                machine.final(self.listing)
+                triage.commit_state(self.store, self.token, self.path)
+                self.assertNotIn('digest', execute.read(self.store/'state.json')['_drafts'][0])
+                self.assertIn('hand', triage.render_message(self.store, self.token, self.path, None))
+                self.assertEqual(self.reply('1 forward marble')['actions'], [])
+                calls = [json.loads(line) for line in (self.store/'calls.jsonl').read_text().splitlines()]
+                self.assertEqual(sum(e['verb'] == 'send-draft' and e['outcome'] == 'issued' for e in calls), 1)
+
+    def test_r182_forward_drive_approval_is_durable(self):
+        from mock_provider import MockDrive
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                self.setUp()
+                self.forward_fixture()
+                triage.release(self.store, self.token)
+                with (self.store/'config.toml').open('a') as out:
+                    out.write('[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n[state]\nkind="gdrive"\naccount="state-example"\nfolder="files-example"\n')
+                drive = MockDrive(datetime.now(timezone.utc).isoformat())
+                response = triage.drive_lock(self.store, 'acquire')
+                observation = self.store/'observation.json'
+                while isinstance(response, dict):
+                    execute.atomic(observation, drive.perform(response['call']))
+                    response = triage.drive_lock(self.store, 'acquire', observation=observation)
+                self.token = response
+                drive.files = {name:(self.store/name).read_bytes() for name in triage.STATE_FILES if (self.store/name).is_file() and name not in ('plan.json', 'inbox.json')}
+                response = triage.drive_state(self.store, 'fetch', self.token)
+                execute.atomic(observation, {c['name']:drive.file_call(c)['status'] for c in response['calls']})
+                triage.drive_state(self.store, 'fetch', self.token, observation)
+                execute.atomic(self.store/'inbox.json', self.listing)
+                self.reply('1 forward marble')
+                plan = execute.read(self.path)
+                import contextlib, io
+                from unittest.mock import patch
+                output = io.StringIO()
+                output.reconfigure = lambda **kw: None
+                with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                    triage.main(['reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.store/'rehearsal.json'), '--dry-run'])
+                simulation = execute.simulate(self.store, self.store/'rehearsal.json')
+                self.assertTrue(simulation['dry_run'])
+                machine = execute.Execution(self.store, self.token, self.path)
+                response = machine.step()
+                self.assertTrue(response['state_send_required'])
+                self.assertNotIn('calls', response)
+                self.assertFalse((self.store/'calls.jsonl').exists())
+                response = triage.drive_state(self.store, 'send', self.token)
+                execute.atomic(observation, drive.perform(response['call']))
+                response = triage.drive_state(self.store, 'send', self.token, lock_observation=observation)
+                while 'call' in response:
+                    call = response['call']
+                    execute.atomic(observation, dict(status='failed') if failed and call['name'] == 'numbers.json' else drive.file_call(call))
+                    response = triage.drive_state(self.store, 'send', self.token, observation)
+                if failed:
+                    with self.assertRaises(ValueError):
+                        machine.step()
+                    self.assertFalse((self.store/'calls.jsonl').exists())
+                else:
+                    remote = json.loads(drive.files['numbers.json'])
+                    self.assertNotIn(1, [i['number'] for i in remote['items']])
+                    record = json.loads(drive.files['state.json'])['_drafts'][0]
+                    self.assertEqual(record['id'], '0')
+                    self.assertEqual(record['status'], 'forward-requested')
+                    self.assertIsNone(record['draft_id'])
+                    self.assertTrue(machine.step()['calls'][0]['path'].endswith('CreateForward'))
+                    with self.assertRaisesRegex(ValueError, 'Unknown number'):
+                        triage.reply_plan(self.store, self.listing, [], self.config, execute.read(self.store/'state.json'), triage.parse_reply('1 forward marble'), numbers=remote)
+
+    def test_r184_send_retirement_survives_empty_drive_host(self):
+        from mock_provider import MockDrive
+        for verb in ('send', 'forward marble'):
+            for other in (False, True):
+                for confirmed in (False, True):
+                    with self.subTest(verb=verb, other=other, confirmed=confirmed):
+                        self.setUp()
+                        payload = self.forward_fixture() if verb.startswith('forward') else self.send_fixture()
+                        self.listing['messages'][2]['sender'] = self.listing['messages'][0]['sender']
+                        self.number()
+                        numbers = triage.read_numbers(self.store)['items']
+                        selected_number = next(i['number'] for i in numbers if i['id'] == '1')
+                        group_number = next(i['number'] for i in numbers if i['id'] == '0')
+                        if verb == 'send':
+                            state = execute.read(self.store/'state.json')
+                            state['_drafts'][0]['id'] = '1'
+                            execute.atomic(self.store/'state.json', state)
+                            payload['toRecipients'][0]['emailAddress']['address'] = 'b@example.net'
+                            state['_drafts'][0]['digest'] = triage.draft_digest(payload, 'outlook')
+                            execute.atomic(self.store/'state.json', state)
+                        triage.release(self.store, self.token)
+                        with (self.store/'config.toml').open('a') as out:
+                            out.write('[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n[state]\nkind="gdrive"\naccount="state-example"\nfolder="files-example"\n')
+                        drive = MockDrive(datetime.now(timezone.utc).isoformat())
+                        observation = self.store/'observation.json'
+                        def acquire():
+                            response = triage.drive_lock(self.store, 'acquire')
+                            while isinstance(response, dict):
+                                execute.atomic(observation, drive.perform(response['call']))
+                                response = triage.drive_lock(self.store, 'acquire', observation=observation)
+                            return response
+                        self.token = acquire()
+                        drive.files = {name:(self.store/name).read_bytes() for name in triage.STATE_FILES if (self.store/name).is_file() and name not in ('plan.json', 'inbox.json')}
+                        response = triage.drive_state(self.store, 'fetch', self.token)
+                        execute.atomic(observation, {c['name']:drive.file_call(c)['status'] for c in response['calls']})
+                        triage.drive_state(self.store, 'fetch', self.token, observation)
+                        execute.atomic(self.store/'inbox.json', self.listing)
+                        text = (str(group_number) + ' trash, ' if other else '') + str(selected_number) + ' ' + verb
+                        self.reply(text)
+                        machine = execute.Execution(self.store, self.token, self.path)
+                        response = machine.step()
+                        self.assertTrue(response.get('state_send_required'), response)
+                        self.assertNotIn('calls', response)
+                        if verb == 'send' and not other:
+                            # A restored read checkpoint cannot bypass the upload gate.
+                            machine.state['pending'] = machine.plan['actions'][0]
+                            machine.state['send_read'] = execute.time.time() - 1
+                            machine.save()
+                            execute.atomic(observation, [dict(ok=True, value=payload)])
+                            boundary = machine.batch_result(observation)
+                            self.assertTrue(boundary.get('state_send_required'), boundary)
+                            self.assertNotIn('calls', boundary)
+                            machine.state['pending'] = None
+                            machine.state.pop('send_read')
+                            machine.save()
+                        response = triage.drive_state(self.store, 'send', self.token)
+                        execute.atomic(observation, drive.perform(response['call']))
+                        response = triage.drive_state(self.store, 'send', self.token, lock_observation=observation)
+                        while 'call' in response:
+                            execute.atomic(observation, drive.file_call(response['call']))
+                            response = triage.drive_state(self.store, 'send', self.token, observation)
+                        response = machine.step()
+                        if other:
+                            # Exercise both a completed removal and a failed removal.
+                            execute.atomic(observation, [dict(ok=True, value={}) if confirmed else dict(ok=False, error={}) for _ in response['calls']])
+                            machine.batch_result(observation)
+                            response = machine.step()
+                        if verb.startswith('forward'):
+                            execute.atomic(observation, [dict(ok=True, value=dict(id=payload['id']))])
+                            machine.batch_result(observation)
+                            execute.atomic(observation, [dict(ok=True, value=payload)])
+                            machine.batch_result(observation)
+                            response = machine.step()
+                        while response.get('state_send_required'):
+                            upload = triage.drive_state(self.store, 'send', self.token)
+                            execute.atomic(observation, drive.perform(upload['call']))
+                            upload = triage.drive_state(self.store, 'send', self.token, lock_observation=observation)
+                            while 'call' in upload:
+                                execute.atomic(observation, drive.file_call(upload['call']))
+                                upload = triage.drive_state(self.store, 'send', self.token, observation)
+                            response = machine.step()
+                        execute.atomic(observation, [dict(ok=True, value=payload)])
+                        response = machine.batch_result(observation)
+                        self.assertTrue(response['calls'][0]['path'].endswith('MessageSend'))
+                        if confirmed:
+                            execute.atomic(observation, [dict(ok=True, value={})])
+                            machine.batch_result(observation)
+                        # Cut after the send, with either a confirmed or unknown outcome.
+                        # Restore only uploaded files on an empty host, without a final upload.
+                        temp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
+                        self.addCleanup(temp.cleanup)
+                        fresh = Path(temp.name)
+                        for name in ('config.toml', 'guardrails.md', 'rules.toml', 'never-touch.toml'):
+                            (fresh/name).write_bytes((self.store/name).read_bytes())
+                        self.store = fresh
+                        self.path = fresh/'plan.json'
+                        observation = fresh/'observation.json'
+                        # The old host is gone; let its drive lock expire.
+                        drive.item = None
+                        self.token = acquire()
+                        response = triage.drive_state(fresh, 'fetch', self.token)
+                        execute.atomic(observation, {c['name']:drive.file_call(c)['status'] for c in response['calls']})
+                        triage.drive_state(fresh, 'fetch', self.token, observation)
+                        if confirmed and other:
+                            self.listing = dict(self.listing, messages=[m for m in self.listing['messages'] if m['id'] not in ('0', '2')])
+                        execute.atomic(fresh/'inbox.json', self.listing)
+                        replay = self.reply(text)
+                        self.assertEqual(replay['actions'], [])
+                        self.assertIn('Unknown number', self.output)
+
+    def test_r186_new_number_cannot_repeat_issued_send(self):
+        for same_host in (False, True):
+            self._r186_same_host = same_host
+            self.r186_drive_cut()
+
+    def r186_drive_cut(self):
+        from mock_provider import MockDrive
+        for verb in ('send', 'forward marble'):
+            for other in (False, True):
+                for confirmed in (False, True):
+                    with self.subTest(verb=verb, other=other, confirmed=confirmed):
+                        self.setUp()
+                        payload = self.forward_fixture() if verb.startswith('forward') else self.send_fixture()
+                        self.listing['messages'][2]['sender'] = self.listing['messages'][0]['sender']
+                        self.number()
+                        numbers = triage.read_numbers(self.store)['items']
+                        selected_number = next(i['number'] for i in numbers if i['id'] == '1')
+                        group_number = next(i['number'] for i in numbers if i['id'] == '0')
+                        if verb == 'send':
+                            state = execute.read(self.store/'state.json')
+                            state['_drafts'][0]['id'] = '1'
+                            execute.atomic(self.store/'state.json', state)
+                            payload['toRecipients'][0]['emailAddress']['address'] = 'b@example.net'
+                            state['_drafts'][0]['digest'] = triage.draft_digest(payload, 'outlook')
+                            execute.atomic(self.store/'state.json', state)
+                        triage.release(self.store, self.token)
+                        with (self.store/'config.toml').open('a') as out:
+                            out.write('[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n[state]\nkind="gdrive"\naccount="state-example"\nfolder="files-example"\n')
+                        drive = MockDrive(datetime.now(timezone.utc).isoformat())
+                        observation = self.store/'observation.json'
+                        def acquire():
+                            response = triage.drive_lock(self.store, 'acquire')
+                            while isinstance(response, dict):
+                                execute.atomic(observation, drive.perform(response['call']))
+                                response = triage.drive_lock(self.store, 'acquire', observation=observation)
+                            return response
+                        self.token = acquire()
+                        drive.files = {name:(self.store/name).read_bytes() for name in triage.STATE_FILES if (self.store/name).is_file() and name not in ('plan.json', 'inbox.json')}
+                        response = triage.drive_state(self.store, 'fetch', self.token)
+                        execute.atomic(observation, {c['name']:drive.file_call(c)['status'] for c in response['calls']})
+                        triage.drive_state(self.store, 'fetch', self.token, observation)
+                        execute.atomic(self.store/'inbox.json', self.listing)
+                        text = (str(group_number) + ' trash, ' if other else '') + str(selected_number) + ' ' + verb
+                        self.reply(text)
+                        machine = execute.Execution(self.store, self.token, self.path)
+                        response = machine.step()
+                        self.assertTrue(response.get('state_send_required'), response)
+                        self.assertNotIn('calls', response)
+                        if verb == 'send' and not other:
+                            # A restored read checkpoint cannot bypass the upload gate.
+                            machine.state['pending'] = machine.plan['actions'][0]
+                            machine.state['send_read'] = execute.time.time() - 1
+                            machine.save()
+                            execute.atomic(observation, [dict(ok=True, value=payload)])
+                            boundary = machine.batch_result(observation)
+                            self.assertTrue(boundary.get('state_send_required'), boundary)
+                            self.assertNotIn('calls', boundary)
+                            machine.state['pending'] = None
+                            machine.state.pop('send_read')
+                            machine.save()
+                        response = triage.drive_state(self.store, 'send', self.token)
+                        execute.atomic(observation, drive.perform(response['call']))
+                        response = triage.drive_state(self.store, 'send', self.token, lock_observation=observation)
+                        while 'call' in response:
+                            execute.atomic(observation, drive.file_call(response['call']))
+                            response = triage.drive_state(self.store, 'send', self.token, observation)
+                        response = machine.step()
+                        if other:
+                            # Exercise both a completed removal and a failed removal.
+                            execute.atomic(observation, [dict(ok=True, value={}) if confirmed else dict(ok=False, error={}) for _ in response['calls']])
+                            machine.batch_result(observation)
+                            response = machine.step()
+                        if verb.startswith('forward'):
+                            execute.atomic(observation, [dict(ok=True, value=dict(id=payload['id']))])
+                            machine.batch_result(observation)
+                            execute.atomic(observation, [dict(ok=True, value=payload)])
+                            machine.batch_result(observation)
+                            response = machine.step()
+                        while response.get('state_send_required'):
+                            upload = triage.drive_state(self.store, 'send', self.token)
+                            execute.atomic(observation, drive.perform(upload['call']))
+                            upload = triage.drive_state(self.store, 'send', self.token, lock_observation=observation)
+                            while 'call' in upload:
+                                execute.atomic(observation, drive.file_call(upload['call']))
+                                upload = triage.drive_state(self.store, 'send', self.token, observation)
+                            response = machine.step()
+                        execute.atomic(observation, [dict(ok=True, value=payload)])
+                        response = machine.batch_result(observation)
+                        self.assertTrue(response['calls'][0]['path'].endswith('MessageSend'))
+                        if confirmed:
+                            execute.atomic(observation, [dict(ok=True, value={})])
+                            machine.batch_result(observation)
+                        # Cut after the send, with either a confirmed or unknown outcome.
+                        # Restore only uploaded files on an empty host, without a final upload.
+                        temp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
+                        self.addCleanup(temp.cleanup)
+                        fresh = self.store if self._r186_same_host else Path(temp.name)
+                        for name in ('config.toml', 'guardrails.md', 'rules.toml', 'never-touch.toml'):
+                            (fresh/name).write_bytes((self.store/name).read_bytes())
+                        self.store = fresh
+                        self.path = fresh/'plan.json'
+                        observation = fresh/'observation.json'
+                        # The old host is gone; let its drive lock expire.
+                        if self._r186_same_host:
+                            release = triage.drive_lock(self.store, 'release', token=self.token)
+                            while isinstance(release, dict) and 'call' in release:
+                                execute.atomic(observation, drive.perform(release['call']))
+                                release = triage.drive_lock(self.store, 'release', token=self.token, observation=observation)
+                        drive.item = None
+                        self.token = acquire()
+                        response = triage.drive_state(fresh, 'fetch', self.token)
+                        execute.atomic(observation, {c['name']:drive.file_call(c)['status'] for c in response['calls']})
+                        triage.drive_state(fresh, 'fetch', self.token, observation)
+                        if confirmed and other:
+                            self.listing = dict(self.listing, messages=[m for m in self.listing['messages'] if m['id'] not in ('0', '2')])
+                        execute.atomic(fresh/'inbox.json', self.listing)
+                        previous = triage.recover_drafts(fresh, execute.read(fresh/'state.json'), self.token)
+                        plan = triage.build_plan(self.listing, [], [], self.config, previous)
+                        triage.number_decisions(fresh, plan, self.listing)
+                        new = next(i['number'] for i in triage.read_numbers(fresh)['items'] if i['id'] == '1')
+                        for retry in ('send', 'forward marble'):
+                            replay = self.reply(str(new) + ' ' + retry)
+                            self.assertEqual(replay['actions'], [])
+                            self.assertIn('result is unknown', self.output)
+                            self.assertIn('check Sent and Drafts by hand', self.output)
+
+    def test_r186_local_new_number_after_send_boundaries(self):
+        for verb in ('send', 'forward marble'):
+            for confirmed in (False, True):
+                with self.subTest(verb=verb, confirmed=confirmed):
+                    self.setUp()
+                    payload = self.forward_fixture() if verb.startswith('forward') else self.send_fixture()
+                    self.reply('1 ' + verb)
+                    machine = execute.Execution(self.store, self.token, self.path)
+                    response = machine.step()
+                    observation = self.store/'observation.json'
+                    if verb.startswith('forward'):
+                        execute.atomic(observation, [dict(ok=True, value=dict(id=payload['id']))])
+                        machine.batch_result(observation)
+                        execute.atomic(observation, [dict(ok=True, value=payload)])
+                        machine.batch_result(observation)
+                        response = machine.step()
+                    execute.atomic(observation, [dict(ok=True, value=payload)])
+                    response = machine.batch_result(observation)
+                    self.assertTrue(response['calls'][0]['path'].endswith('MessageSend'))
+                    if confirmed:
+                        execute.atomic(observation, [dict(ok=True, value={})])
+                        machine.batch_result(observation)
+                    triage.release(self.store, self.token)
+                    self.token = triage.acquire(self.store)
+                    previous = triage.recover_drafts(self.store, execute.read(self.store/'state.json'), self.token)
+                    self.assertIn('issued', previous['_drafts'][0])
+                    self.assertNotIn('digest', previous['_drafts'][0])
+                    self.number()
+                    new = next(i['number'] for i in triage.read_numbers(self.store)['items'] if i['id'] == '0')
+                    for retry in ('send', 'forward marble'):
+                        self.assertEqual(self.reply(str(new) + ' ' + retry)['actions'], [])
+                        self.assertIn('result is unknown', self.output)
+
+    def test_r186_issued_record_never_becomes_hand_send(self):
+        self.send_fixture()
+        previous = execute.read(self.store/'state.json')
+        previous['_drafts'][0].pop('digest')
+        previous['_drafts'][0]['issued'] = '2026-11-11T01:00:00+00:00'
+        rules = triage.parse_rules((self.store/'rules.toml').read_text())
+        rules[0]['after_send'] = 'archive'
+        listing = dict(self.listing, messages=[dict(m, conversation_id='conversation-example') for m in self.listing['messages']])
+        self.assertEqual(triage.hand_sent_calls(listing, rules, self.config, previous), ([], []))
+
+    def test_r186_invalid_issued_time_refuses_cleanly(self):
+        self.send_fixture()
+        self.reply('1 send')
+        previous = execute.read(self.store/'state.json')
+        previous['_drafts'][0].pop('digest')
+        previous['_drafts'][0]['issued'] = 7
+        execute.atomic(self.store/'state.json', previous)
+        with self.assertRaisesRegex(ValueError, 'state.json._drafts.issued'):
+            execute.Execution(self.store, self.token, self.path).step()
+
+    def test_r188_finished_drafts_survive_sixty_runs_without_log(self):
+        import contextlib, io
+        from unittest.mock import patch
+        import random
+        scenarios = [(closing, language) for closing in ('send', 'forward', 'deleted', 'hand-sent', 'hand-sent-kept', 'unknown') for language in ('en', 'es')]
+        random.Random(1933).shuffle(scenarios)
+        for closing, language in scenarios:
+            with self.subTest(closing=closing):
+                self.setUp()
+                payload = self.forward_fixture() if closing == 'forward' else self.send_fixture()
+                rules_path = self.store/'rules.toml'
+                rules_path.write_text(rules_path.read_text().replace('subject="Question"', 'subject="Question 0"'))
+                config_path = self.store/'config.toml'
+                config_path.write_text('language="' + language + '"\n' + config_path.read_text())
+                observation = self.store/'observation.json'
+                def plan(flags=()):
+                    output = io.StringIO()
+                    output.reconfigure = lambda **kw: None
+                    with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                        triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)] + list(flags))
+                    return output.getvalue()
+                if closing != 'forward':
+                    execute.append_log(self.store, 'creation-run', dict(account='cedar', id='0', action='create-draft'), 'issued')
+                if closing in ('send', 'forward', 'unknown'):
+                    self.reply('1 ' + ('forward marble' if closing == 'forward' else 'send'))
+                    machine = execute.Execution(self.store, self.token, self.path)
+                    machine.step()
+                    if closing == 'forward':
+                        execute.atomic(observation, [dict(ok=True, value=dict(id=payload['id']))])
+                        machine.batch_result(observation)
+                        execute.atomic(observation, [dict(ok=True, value=payload)])
+                        machine.batch_result(observation)
+                        machine.step()
+                    execute.atomic(observation, [dict(ok=True, value=payload)])
+                    machine.batch_result(observation)
+                    execute.atomic(observation, [dict(ok=True, value={})] if closing != 'unknown' else [dict(ok=False, error={})])
+                    machine.batch_result(observation)
+                    machine.final(self.listing)
+                else:
+                    with (self.store/'rules.toml').open('a') as out:
+                        out.write('after_send="archive"\n')
+                    self.listing['messages'][0]['conversation_id'] = 'conversation-example'
+                    execute.atomic(self.store/'inbox.json', self.listing)
+                    self.assertEqual(len(json.loads(plan())['calls']), 2)
+                    sent = [dict(id='sent-example', sentDateTime='2026-11-12T00:00:00Z')] if closing.startswith('hand-sent') else []
+                    execute.atomic(observation, [dict(ok=False, error=dict(status=404)), dict(ok=True, value=dict(value=sent))])
+                    plan(['--draft-check-results', str(observation)])
+                    self.assertNotIn('Draft waiting', json.dumps(execute.read(self.path)['remaining']))
+                    machine = execute.Execution(self.store, self.token, self.path)
+                    response = machine.step()
+                    if closing.startswith('hand-sent'):
+                        execute.atomic(observation, [dict(ok=True, value={}) if closing != 'hand-sent-kept' else dict(ok=False, error={}) for _ in response['calls']])
+                        machine.batch_result(observation)
+                        if closing != 'hand-sent-kept':
+                            self.listing = dict(self.listing, messages=self.listing['messages'][1:])
+                        machine.final(self.listing)
+                triage.commit_state(self.store, self.token, self.path)
+                self.assert_r193_agreement(triage.render_message(self.store, self.token, self.path, None))
+                if closing != 'hand-sent':
+                    self.assertEqual(len(execute.read(self.store/'state.json')['_drafts']), 1)
+                    self.assertIn('status', execute.read(self.store/'state.json')['_drafts'][0])
+                for run in range(60):
+                    (self.store/'calls.jsonl').write_text('')
+                    triage.release(self.store, self.token)
+                    self.token = triage.acquire(self.store)
+                    execute.atomic(self.store/'inbox.json', self.listing)
+                    plan()
+                    saved = execute.read(self.path)
+                    self.assertFalse(any(a['action'] == 'create-draft' and a['id'] == '0' for a in saved['actions']))
+                    if closing != 'unknown':
+                        self.assertNotIn('Draft waiting', json.dumps(saved['remaining']))
+                    self.assertNotIn('draft may exist', json.dumps(saved))
+                    machine = execute.Execution(self.store, self.token, self.path)
+                    response = machine.step()
+                    self.assertTrue(response.get('done'), response)
+                    triage.commit_state(self.store, self.token, self.path)
+                    message = triage.render_message(self.store, self.token, self.path, None)
+                    self.assert_r193_agreement(message)
+                    if closing != 'unknown':
+                        self.assertNotIn('Draft waiting', message)
+                    self.assertNotIn('draft may exist', message)
+                if closing not in ('unknown', 'hand-sent'):
+                    triage.release(self.store, self.token)
+                    self.token = triage.acquire(self.store)
+                    number = next(i['number'] for i in triage.read_numbers(self.store)['items'] if i['id'] == '0')
+                    reply = self.reply(str(number) + ' leave')
+                    self.assertNotIn('Draft waiting', json.dumps(reply['remaining']))
+                    self.assertTrue(execute.Execution(self.store, self.token, self.path).step().get('done'))
+                    triage.commit_state(self.store, self.token, self.path)
+                    self.assertNotIn('Draft waiting', triage.render_message(self.store, self.token, self.path, None))
+
+    def test_r182_forward_rule_name_never_approves_send(self):
+        import contextlib, io
+        from unittest.mock import patch
+        self.forward_fixture()
+        (self.store/'guardrails.md').write_text('Fixture guardrails')
+        rules = (self.store/'rules.toml').read_text().replace('id="example"', 'id="numbered-forward"')
+        (self.store/'rules.toml').write_text(rules)
+        output = io.StringIO()
+        output.reconfigure = lambda **kw: None
+        with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+            triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path), '--dry-run'])
+        self.assertFalse(any(a['action'] == 'send-draft' for a in execute.read(self.path)['actions']))
+        self.assertNotIn('send-draft', json.dumps(execute.simulate(self.store, self.path)))
+
+    def test_r182_forward_guard_forgery(self):
+        self.forward_fixture()
+        plan = self.reply('1 forward marble')
+        saved = execute.read(self.store/'reply.json')
+        saved['parts'] = triage.parse_reply('1 leave')
+        execute.atomic(self.store/'reply.json', saved)
+        execute.atomic(self.path, plan)
+        machine = execute.Execution(self.store, self.token, self.path)
+        with self.assertRaises(ValueError):
+            machine.step()
+        self.assertFalse((self.store/'calls.jsonl').exists())
+
+    def test_r182_sent_plan_and_rehearsal(self):
+        import contextlib, io
+        from unittest.mock import patch
+        self.send_fixture()
+        (self.store/'guardrails.md').write_text('Fixture guardrails')
+        with (self.store/'rules.toml').open('a') as f:
+            f.write('after_send="archive"\n')
+        listing = json.loads(json.dumps(self.listing))
+        listing['messages'][0]['conversation_id'] = 'conversation-example'
+        listing['messages'] = listing['messages'][:1]
+        execute.atomic(self.store/'inbox.json', listing)
+        response = self.store/'response.json'
+        output = io.StringIO()
+        output.reconfigure = lambda **kw: None
+        args = ['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)]
+        def plan(flags=()):
+            with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                triage.main(args + list(flags))
+        plan()
+        self.assertEqual(len(json.loads(output.getvalue())['calls']), 2)
+        execute.atomic(response, [dict(ok=False, error=dict(status=404)), dict(ok=True, value=dict(value=[dict(id='sent-private-example', sentDateTime='2026-11-12T00:00:00Z')]))])
+        values = json.loads(response.read_text())
+        before = {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
+        plan(['--dry-run'])
+        execute.atomic(response, values)
+        plan(['--dry-run', '--draft-check-results', str(response)])
+        rehearsal = execute.simulate(self.store, self.path)
+        self.assertTrue(rehearsal['dry_run'])
+        self.assertNotIn('sent-private-example', json.dumps(rehearsal))
+        for name, data in before.items():
+            if name not in (self.path.name, response.name):
+                self.assertEqual((self.store/name).read_bytes(), data, name)
+        plan(['--draft-check-results', str(response)])
+        result = execute.read(self.path)
+        self.assertEqual([a['action'] for a in result['actions']], ['archive'])
+        self.assertEqual(result['actions'][0]['reason'], 'Owner sent the draft')
+        machine = execute.Execution(self.store, self.token, self.path)
+        machine.step()
+        execute.atomic(response, [dict(ok=True, value={})])
+        machine.batch_result(response)
+        final = dict(listing, messages=listing['messages'][1:])
+        machine.final(final)
+        triage.commit_state(self.store, self.token, self.path)
+        self.assertEqual(execute.read(self.store/'state.json')['_drafts'], [])
+        for path in self.store.iterdir():
+            if path.is_file():
+                self.assertNotIn('sent-private-example', path.read_text(), path.name)
+
+    def test_r182_sent_protection_and_caps(self):
+        self.send_fixture()
+        rules = triage.parse_rules((self.store/'rules.toml').read_text() + 'after_send="archive"\n')
+        previous = execute.read(self.store/'state.json')
+        summary = dict(closed=[['cedar', '0']], filed=[['cedar', '0']])
+        for holds in ([dict(sender='a@example.net')], [dict(judgment='Protect example', accounts=['cedar'])]):
+            plan = triage.build_plan(self.listing, rules, holds, self.config, previous, hand_sent=summary,
+                                     judgments=dict(binding=triage.judgments_needed(self.listing, rules, holds, None, hand_sent=summary)['binding'], answers=[]))
+            self.assertFalse(any(a['id'] == '0' for a in plan['actions']))
+        plan = triage.build_plan(self.listing, rules, [], self.config | dict(inbox_limit=1), previous, hand_sent=summary)
+        self.assertEqual(plan['approval_state'], 'awaiting approval')
+        self.assertEqual(plan['actions'][0]['action'], 'archive')
+
+    def test_r182_disabled_rule_cannot_start_hand_send_filing(self):
+        self.send_fixture()
+        rules = triage.parse_rules((self.store/'rules.toml').read_text() + 'after_send="archive"\nenabled=false\n')
+        previous = execute.read(self.store/'state.json')
+        listing = json.loads(json.dumps(self.listing))
+        listing['messages'][0]['conversation_id'] = 'conversation-example'
+        self.assertEqual(triage.hand_sent_calls(listing, rules, self.config, previous), ([], []))
+        with self.assertRaisesRegex(ValueError, 'after_send rule'):
+            triage.build_plan(listing, rules, [], self.config, previous, hand_sent=dict(closed=[['cedar','0']], filed=[['cedar','0']]))
+
+    def test_r182_hand_send_ignores_unrelated_action_judgments(self):
+        self.send_fixture()
+        rules = triage.parse_rules((self.store/'rules.toml').read_text() + 'after_send="archive"\n[[rules]]\nid="judged"\naccounts=["cedar"]\njudgment="Discard examples"\naction="trash"\nexclusions=[]\n')
+        summary = dict(closed=[['cedar', '0']], filed=[['cedar', '0']])
+        needed = triage.judgments_needed(self.listing, rules, [], self.token, hand_sent=summary)
+        document = dict(binding=needed['binding'], answers=[])
+        plan = triage.build_plan(self.listing, rules, [], self.config, execute.read(self.store/'state.json'), hand_sent=summary, judgments=document, run_token=self.token)
+        self.assertEqual([(a['id'], a['action']) for a in plan['actions']], [('0', 'archive')])
+        self.assertFalse(any(p['pair'][0] == 'rule' and p['pair'][3] == '0' for p in needed['pairs']))
+
+    def test_r184_uncheckable_after_send_keeps_other_actions(self):
+        import contextlib, io
+        from unittest.mock import patch
+        for missing in ('provider', 'conversation', 'draft_id'):
+            with self.subTest(missing=missing):
+                self.setUp()
+                self.send_fixture()
+                if missing == 'provider':
+                    (self.store/'config.toml').write_text('[accounts.cedar]\n')
+                rules = self.store/'rules.toml'
+                rules.write_text(rules.read_text().replace('subject="Question"', 'subject="Question 0"'))
+                with (self.store/'rules.toml').open('a') as out:
+                    out.write('after_send="archive"\n[[rules]]\nid="healthy"\naccounts=["cedar"]\nsubject="Question 1"\naction="archive"\n')
+                if missing == 'draft_id':
+                    state = execute.read(self.store/'state.json')
+                    state['_drafts'][0]['draft_id'] = None
+                    state['_drafts'][0].pop('digest')
+                    execute.atomic(self.store/'state.json', state)
+                    self.listing['messages'][0]['conversation_id'] = 'conversation-example'
+                    execute.atomic(self.store/'inbox.json', self.listing)
+                output = io.StringIO()
+                output.reconfigure = lambda **kw: None
+                with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                    triage.main(['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)])
+                plan = execute.read(self.path)
+                self.assertIn(('1', 'archive'), [(a['id'], a['action']) for a in plan['actions']])
+                self.assertNotIn(('0', 'archive'), [(a['id'], a['action']) for a in plan['actions']])
+                self.assertIn('after_send reading', triage.render_report(plan, self.listing, store=self.store))
+                if missing == 'provider':
+                    with self.assertRaisesRegex(ValueError, 'after_send.*provider'):
+                        with patch.dict(os.environ, PIGEON_HOME=str(self.store)):
+                            triage.main(['validate'])
+
+    def test_r182_sent_failure_skips_only_its_account(self):
+        import contextlib, io
+        from unittest.mock import patch
+        for healthy in (False, True):
+            with self.subTest(healthy=healthy):
+                self.setUp()
+                self.send_fixture()
+                (self.store/'guardrails.md').write_text('Fixture guardrails')
+                with (self.store/'rules.toml').open('a') as out:
+                    out.write('after_send="archive"\n')
+                if healthy:
+                    with (self.store/'config.toml').open('a') as out:
+                        out.write('[accounts.marble]\n')
+                    with (self.store/'rules.toml').open('a') as out:
+                        out.write('[[rules]]\nid="healthy"\naccounts=["marble"]\nsender="other@example.org"\naction="archive"\n')
+                    self.listing['accounts']['marble'] = 1
+                    self.listing['messages'].append(dict(account='marble', id='healthy', folder='Inbox', sender='other@example.org', subject='Example'))
+                self.listing['messages'][0]['conversation_id'] = 'conversation-example'
+                execute.atomic(self.store/'inbox.json', self.listing)
+                output = io.StringIO()
+                output.reconfigure = lambda **kw: None
+                args = ['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)]
+                with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+                    triage.main(args)
+                    response = self.store/'response.json'
+                    execute.atomic(response, [dict(ok=False, error=dict(status=503)), dict(ok=False, error=dict(status=503))])
+                    triage.main(args + ['--draft-check-results', str(response)])
+                plan = execute.read(self.path)
+                self.assertEqual(plan['skip_reasons']['cedar'], 'provider error (503)')
+                self.assertEqual([(a['account'], a['action']) for a in plan['actions']], [('marble', 'archive')] if healthy else [])
+                machine = execute.Execution(self.store, self.token, self.path)
+                if healthy:
+                    self.assertEqual(machine.step()['account'], 'marble')
+                else:
+                    machine.step()
+                    triage.commit_state(self.store, self.token, self.path)
+                    self.assertEqual(len(execute.read(self.store/'state.json')['_drafts']), 1)
+
+    def test_r182_sent_reason(self):
+        text = triage.action_label(dict(action='archive', reason='Owner sent the draft'), self.listing)
+        self.assertIn('Owner sent the draft', text)
+        self.assertNotIn('unsubscribe', text)
+
+    def test_r182_waiting_filing_keeps_record(self):
+        import contextlib, io
+        from unittest.mock import patch
+        self.send_fixture()
+        (self.store/'guardrails.md').write_text('Fixture guardrails')
+        config = (self.store/'config.toml').read_text()
+        (self.store/'config.toml').write_text('inbox_limit=1\n' + config)
+        with (self.store/'rules.toml').open('a') as out:
+            out.write('after_send="archive"\n')
+        self.listing['messages'][0]['conversation_id'] = 'conversation-example'
+        execute.atomic(self.store/'inbox.json', self.listing)
+        output = io.StringIO()
+        output.reconfigure = lambda **kw: None
+        args = ['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)]
+        with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+            triage.main(args)
+            response = self.store/'response.json'
+            execute.atomic(response, [dict(ok=False, error=dict(status=404)), dict(ok=True, value=dict(value=[dict(id='sent-example', sentDateTime='2026-11-12T00:00:00Z')]))])
+            triage.main(args + ['--draft-check-results', str(response)])
+        self.assertEqual(execute.read(self.path)['approval_state'], 'awaiting approval')
+        execute.Execution(self.store, self.token, self.path).step()
+        triage.commit_state(self.store, self.token, self.path)
+        self.assertEqual(len(execute.read(self.store/'state.json')['_drafts']), 1)
+
+    def test_r182_malformed_sent_summary_refuses_cleanly(self):
+        self.send_fixture()
+        rules = triage.parse_rules((self.store/'rules.toml').read_text() + 'after_send="archive"\n')
+        previous = execute.read(self.store/'state.json')
+        for summary in (dict(closed=[[[], '0']], filed=[]), dict(closed=[], filed=[], failed=[])):
+            with self.subTest(summary=summary), self.assertRaises(ValueError):
+                triage.build_plan(self.listing, rules, [], self.config, previous, hand_sent=summary)
+
+    def test_r182_malformed_sent_request_refuses_cleanly(self):
+        import contextlib, io
+        from unittest.mock import patch
+        self.send_fixture()
+        (self.store/'guardrails.md').write_text('Fixture guardrails')
+        with (self.store/'rules.toml').open('a') as out:
+            out.write('after_send="archive"\n')
+        self.listing['messages'][0]['conversation_id'] = 'conversation-example'
+        execute.atomic(self.store/'inbox.json', self.listing)
+        output = io.StringIO()
+        output.reconfigure = lambda **kw: None
+        args = ['plan', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--plan-out', str(self.path)]
+        with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+            triage.main(args)
+            exchange = execute.read(self.store/'listing-exchange.json')
+            exchange['draft_check']['requested'] = 'bad'
+            execute.atomic(self.store/'listing-exchange.json', exchange)
+            response = self.store/'response.json'
+            execute.atomic(response, [dict(ok=False, error=dict(status=404)), dict(ok=True, value={})])
+            with self.assertRaisesRegex(ValueError, 'draft_check'):
+                triage.main(args + ['--draft-check-results', str(response)])
+
+    def test_r182_gmail_sent_scope(self):
+        self.send_fixture()
+        self.config['accounts']['cedar']['provider'] = 'gmail'
+        rules = triage.parse_rules((self.store/'rules.toml').read_text() + 'after_send="archive"\n')
+        listing = json.loads(json.dumps(self.listing))
+        listing['messages'][0]['conversation_id'] = 'conversation-example'
+        calls, records = triage.hand_sent_calls(listing, rules, self.config, execute.read(self.store/'state.json'))
+        self.assertTrue(calls[1]['path'].endswith('gmail.users.threads.get'))
+        self.assertEqual(calls[1]['input']['input']['query'], dict(format='metadata', fields='id,messages(id,internalDate,labelIds)'))
+        sent = dict(ok=True, value=dict(id='wrong-conversation', messages=[dict(id='sent-example', internalDate=str(int(datetime.fromisoformat('2026-11-12T00:00:00+00:00').timestamp()*1000)), labelIds=['SENT'])]))
+        absent = dict(ok=False, error=dict(status=404))
+        filing, closed, failed = triage.hand_sent_results(records, [absent, sent], rules, self.config)
+        self.assertFalse(filing)
+        self.assertFalse(closed)
+        self.assertIn('cedar', failed)
+        sent['value']['id'] = 'conversation-example'
+        filing, closed, failed = triage.hand_sent_results(records, [absent, sent], rules, self.config)
+        self.assertTrue(filing)
+        self.assertEqual(closed, [['cedar', '0']])
+        self.assertFalse(failed)
+
+    def test_r182_sent_reading_minimal(self):
+        self.send_fixture()
+        rules = triage.parse_rules((self.store/'rules.toml').read_text() + 'after_send="archive"\n')
+        previous = execute.read(self.store/'state.json')
+        listing = json.loads(json.dumps(self.listing))
+        listing['messages'][0]['conversation_id'] = 'conversation-example'
+        calls, records = triage.hand_sent_calls(listing, rules, self.config, previous)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]['input']['input']['query']['$select'], ['id', 'sentDateTime'])
+        self.assertIn("conversationId eq 'conversation-example'", calls[1]['input']['input']['query']['$filter'])
+        self.assertEqual(triage.hand_sent_calls(listing, [], self.config, previous), ([], []))
+        self.assertEqual(records, previous['_drafts'])
+
+    def test_r182_sent_filing(self):
+        self.send_fixture()
+        rule = triage.parse_rules((self.store/'rules.toml').read_text() + 'after_send="archive"\n')[0]
+        record = execute.read(self.store/'state.json')['_drafts'][0]
+        absent = dict(ok=False, error=dict(status=404))
+        sent = dict(ok=True, value=dict(value=[dict(id='sent-example', sentDateTime='2026-11-12T00:00:00Z')]))
+        actions, closed, failed = triage.hand_sent_results([record], [absent, sent], [rule], self.config)
+        self.assertEqual(actions[('cedar', '0')]['action'], 'archive')
+        self.assertEqual(closed, [['cedar', '0']])
+        self.assertFalse(failed)
+        for draft, messages in [(dict(ok=True, value=dict(id='draft-example', isDraft=True)), sent),
+                                (absent, dict(ok=True, value=dict(value=[]))),
+                                (absent, dict(ok=True, value=dict(value=[dict(id='old', sentDateTime='2026-11-10T00:00:00Z')]))),
+                                (absent, dict(ok=False, error=dict(status=503))),
+                                (absent, dict(ok=True, value=dict(value=[dict(id='hostile', sentDateTime='bad')])) )]:
+            with self.subTest(draft=draft, messages=messages):
+                filing, _, _ = triage.hand_sent_results([record], [draft, messages], [rule], self.config)
+                self.assertFalse(filing)
+
+    def test_r181_after_send(self):
+        payload = self.send_fixture()
+        with (self.store/'rules.toml').open('a') as f:
+            f.write('after_send="archive"\n')
+        plan = self.reply('1 send')
+        self.assertEqual([a['action'] for a in plan['actions']], ['send-draft', 'archive'])
+        machine = execute.Execution(self.store, self.token, self.path)
+        machine.step()
+        response = self.store/'response.json'
+        execute.atomic(response, [dict(ok=True, value=payload)])
+        machine.batch_result(response)
+        execute.atomic(response, [dict(ok=False, error={})])
+        machine.batch_result(response)
+        response = machine.step()
+        self.assertNotIn('calls', response)
+        self.assertEqual(machine.state['results'][1]['status'], 'unexecuted')
+
+    def test_r181_after_send_validation(self):
+        for action, value in [('draft', 'move'), ('archive', 'trash')]:
+            with self.subTest(action=action, value=value), self.assertRaises(ValueError):
+                triage.parse_rules('[[rules]]\nid="example"\nsender="a@example.net"\naction="'+action+'"\nafter_send="'+value+'"\ndraft="reply"\ndraft_text="Words"\n')
+
+    def test_r181_after_send_confirmed(self):
+        payload = self.send_fixture()
+        with (self.store/'rules.toml').open('a') as f:
+            f.write('after_send="trash"\n')
+        plan = self.reply('1 send')
+        machine = execute.Execution(self.store, self.token, self.path)
+        machine.step()
+        response = self.store/'response.json'
+        execute.atomic(response, [dict(ok=True, value=payload)])
+        machine.batch_result(response)
+        execute.atomic(response, [dict(ok=True, value={})])
+        machine.batch_result(response)
+        calls = machine.step()['calls']
+        self.assertEqual([c['action'] for c in calls], ['trash'])
+        self.assertEqual(machine.state['results'][0]['status'], 'executed')
+
+    def test_r181_send_rehearsal(self):
+        import contextlib, io
+        from unittest.mock import patch
+        self.send_fixture()
+        (self.store/'reply.txt').write_text('1 send')
+        before = {p.name:p.read_bytes() for p in self.store.iterdir() if p.is_file()}
+        output = io.StringIO()
+        output.reconfigure = lambda **kw: None
+        with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+            triage.main(['reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path), '--dry-run'])
+        plan = execute.read(self.path)
+        self.assertEqual([a['action'] for a in plan['actions']], ['send-draft'])
+        result = execute.simulate(self.store, self.path)
+        self.assertNotIn('tools.cedar', json.dumps(result))
+        self.assertNotIn('drafts.get', json.dumps(result))
+        self.assertIn('a@example.net', output.getvalue())
+        for name, data in before.items():
+            if name != self.path.name:
+                self.assertEqual((self.store/name).read_bytes(), data, name)
+
+    def test_r181_after_send_protection_and_caps(self):
+        self.send_fixture()
+        with (self.store/'rules.toml').open('a') as f:
+            f.write('after_send="archive"\n')
+        previous = execute.read(self.store/'state.json')
+        parts = triage.parse_reply('1 send')
+        with self.assertRaisesRegex(ValueError, 'protected'):
+            triage.reply_plan(self.store, self.listing, [dict(sender='a@example.net')], self.config, previous, parts)
+        plan = triage.reply_plan(self.store, self.listing, [], self.config | dict(inbox_limit=1), previous, parts)
+        self.assertEqual(sum(a['action'] == 'send-draft' for a in plan['actions']), 1)
+        self.assertFalse(any(a['action'] in triage.REMOVALS for a in plan['actions']))
+
+    def test_r180_send_flow(self):
+        payload = self.send_fixture()
+        plan = self.reply('1 send')
+        self.assertEqual(plan['actions'], [dict(account='cedar', id='0', action='send-draft', rule='numbered-reply', target='draft-example', digest=triage.draft_digest(payload, 'outlook'), draft='reply', draft_to=['a@example.net'])])
+        machine = execute.Execution(self.store, self.token, self.path)
+        read_call = machine.step()['calls'][0]
+        self.assertEqual(read_call['input']['input']['path'], {'message-id':'draft-example'})
+        response = self.store/'response.json'
+        execute.atomic(response, [dict(ok=True, value=payload)])
+        issued = machine.batch_result(response)['calls']
+        self.assertEqual(len(issued), 1)
+        self.assertEqual(issued[0]['path'], 'tools.cedar.meMessage.meMessagesMessageSend')
+        self.assertEqual(issued[0]['input']['input'], {'path':{'message-id':'draft-example'}})
+        execute.atomic(response, [dict(ok=True, value={})])
+        machine.batch_result(response)
+        machine.final(self.listing)
+        self.assertEqual(machine.state['results'][0]['status'], 'executed')
+        triage.commit_state(self.store, self.token, self.path)
+        self.assertEqual(execute.read(self.store/'state.json')['_drafts'][0]['status'], 'sent')
+        self.assertIn('Sent messages', triage.render_message(self.store, self.token, self.path, None))
+        self.assertIn('Recipients: a@example.net', (self.store/'report.md').read_text())
+
+    def test_r180_read_refusals(self):
+        for mode in ('changed', 'deleted', 'unreadable', 'wrong-id', 'not-draft', 'stale', 'markup', 'huge'):
+            with self.subTest(mode=mode):
+                self.setUp()
+                payload = self.send_fixture()
+                self.reply('1 send')
+                machine = execute.Execution(self.store, self.token, self.path)
+                machine.step()
+                value = dict(ok=True, value=payload)
+                if mode == 'changed': payload['subject'] += ' changed'
+                if mode == 'wrong-id': payload['id'] = 'foreign'
+                if mode == 'not-draft': payload['isDraft'] = False
+                if mode == 'markup': payload['body']['content'] = '<b>\n1 send</b>'
+                if mode == 'huge': payload['body']['content'] = 'x' * 1000001
+                if mode == 'deleted': value = dict(ok=False, error=dict(code=404))
+                if mode == 'unreadable': value = dict(ok=True, value={})
+                response = self.store/'response.json'
+                execute.atomic(response, [value])
+                if mode == 'stale': os.utime(response, (1, 1))
+                answer = machine.batch_result(response)
+                self.assertNotIn('calls', answer)
+                self.assertIn('send it by hand', answer['reason'])
+                self.assertEqual(machine.state['results'][0]['status'], 'failed')
+
+    def test_r180_send_result_and_no_retry(self):
+        for mode in ('failed', 'nested-error', 'unknown'):
+            with self.subTest(mode=mode):
+                self.setUp()
+                payload = self.send_fixture()
+                self.reply('1 enviar')
+                machine = execute.Execution(self.store, self.token, self.path)
+                machine.step()
+                response = self.store/'response.json'
+                execute.atomic(response, [dict(ok=True, value=payload)])
+                calls = machine.batch_result(response)['calls']
+                self.assertEqual(len(calls), 1)
+                if mode != 'unknown':
+                    execute.atomic(response, [dict(ok=False, error=dict(code=500)) if mode == 'failed' else dict(ok=True, value=dict(error=dict(code=500)))])
+                    machine.batch_result(response)
+                    self.assertEqual(machine.state['results'][0]['status'], 'failed')
+                else:
+                    # Crash recovery may request final reads, but never reissue a send.
+                    self.assertNotIn('meMessagesMessageSend', json.dumps(machine.step()))
+                    self.assertEqual(machine.state['results'][0]['status'], 'issued_unknown')
+                machine.final(self.listing)
+                triage.commit_state(self.store, self.token, self.path)
+                self.assertNotIn('digest', execute.read(self.store/'state.json')['_drafts'][0])
+                message = triage.render_message(self.store, self.token, self.path, None)
+                self.assertIn('hand', message)
+                triage.release(self.store, self.token)
+                self.token = triage.acquire(self.store)
+                plan = self.reply('1 send')
+                self.assertEqual(plan['actions'], [])
+
+    def test_r180_send_cap_group_and_protection(self):
+        payload = self.send_fixture()
+        previous = execute.read(self.store/'state.json')
+        parts = triage.parse_reply('1 send')
+        hold = dict(sender='a@example.net')
+        with self.assertRaisesRegex(ValueError, 'protected'):
+            triage.reply_plan(self.store, self.listing, [hold], self.config, previous, parts)
+        number = triage.read_numbers(self.store)['items'][0]
+        number.pop('presentation', None)
+        number['members'].append(dict(account='cedar', id='1'))
+        execute.atomic(self.store/'numbers.json', dict(next=4, items=[number]))
+        with self.assertRaisesRegex(ValueError, 'send it by hand'):
+            triage.reply_plan(self.store, self.listing, [], self.config, previous, parts)
+        self.listing['messages'] = [dict(self.listing['messages'][0], id=str(i)) for i in range(6)]
+        previous['_drafts'] = [dict(previous['_drafts'][0], id=str(i), draft_id='draft-'+str(i)) for i in range(6)]
+        number['members'] = [dict(account='cedar', id=str(i)) for i in range(6)]
+        execute.atomic(self.store/'numbers.json', dict(next=4, items=[number]))
+        with self.assertRaisesRegex(ValueError, 'At most 5'):
+            triage.reply_plan(self.store, self.listing, [], self.config, previous, parts)
+
+    def test_r180_send_judgments(self):
+        self.send_fixture()
+        previous = execute.read(self.store/'state.json')
+        parts = triage.parse_reply('1 send')
+        holds = [dict(sender='a@example.net', judgment='Protect bills')]
+        needed = triage.reply_plan(self.store, self.listing, holds, self.config, previous, parts, run_token=self.token)['judgments_needed']
+        for answer in (True, False, None):
+            document = dict(binding=needed['binding'], answers=[] if answer is None else [dict(pair=needed['pairs'][0]['pair'], answer=answer, reason='Fixture')])
+            plan = triage.reply_plan(self.store, self.listing, holds, self.config, previous, parts, judgments=document, run_token=self.token)
+            self.assertEqual(len(plan['actions']), 1 if answer is False else 0)
+
+    def test_r180_forged_send_plan_refused(self):
+        self.send_fixture()
+        plan = self.reply('1 leave')
+        plan['actions'] = [dict(account='cedar', id='0', action='send-draft', rule='numbered-reply', target='draft-example', draft='reply', draft_to=['a@example.net'])]
+        execute.atomic(self.path, plan)
+        with self.assertRaisesRegex(ValueError, 'expected actions'):
+            execute.Execution(self.store, self.token, self.path).step()
+
+    def test_r180_gmail_forward(self):
+        import base64
+        self.send_fixture()
+        (self.store/'config.toml').write_text('allow_send=true\n[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
+        (self.store/'rules.toml').write_text('[[rules]]\nid="example"\naccounts=["cedar"]\nsubject="Question"\naction="draft"\ndraft="forward"\ndraft_text="Owner words"\ndraft_to=["destination@example.org"]\n')
+        execute.atomic(self.store/'tool-paths.json', {'cedar': {'send-draft':'tools.cedar.gmail.users.drafts.send'}})
+        payload = dict(id='draft-example', message=dict(payload=dict(headers=[dict(name='To',value='destination@example.org'),dict(name='Subject',value='Forward')], mimeType='text/plain', body=dict(data=base64.urlsafe_b64encode(b'Owner words').decode()))))
+        previous = execute.read(self.store/'state.json')
+        previous['_drafts'][0]['digest'] = triage.draft_digest(payload, 'gmail')
+        execute.atomic(self.store/'state.json', previous)
+        self.reply('1 send')
+        machine = execute.Execution(self.store, self.token, self.path)
+        self.assertEqual(machine.step()['calls'][0]['input']['input']['path'], dict(userId='me', id='draft-example'))
+        response = self.store/'response.json'
+        execute.atomic(response, [dict(ok=True, value=payload)])
+        issued = machine.batch_result(response)['calls'][0]
+        self.assertEqual(issued['input']['input'], dict(path=dict(userId='me'), body=dict(id='draft-example')))
+        self.assertEqual(issued['path'], 'tools.cedar.gmail.users.drafts.send')
+
+    def test_r180_digest_bound_and_interrupted_send(self):
+        payload = self.send_fixture()
+        self.reply('1 send')
+        previous = execute.read(self.store/'state.json')
+        previous['_drafts'][0]['digest'] = 'f'*64
+        execute.atomic(self.store/'state.json', previous)
+        with self.assertRaisesRegex(ValueError, 'expected actions'):
+            execute.Execution(self.store, self.token, self.path).step()
+        previous['_drafts'][0]['digest'] = triage.draft_digest(payload, 'outlook')
+        execute.atomic(self.store/'state.json', previous)
+        machine = execute.Execution(self.store, self.token, self.path)
+        machine.step()
+        response = self.store/'response.json'
+        execute.atomic(response, [dict(ok=True, value=payload)])
+        self.assertEqual(len(machine.batch_result(response)['calls']), 1)
+        triage.release(self.store, self.token)
+        self.token = triage.acquire(self.store)
+        self.assertEqual(self.reply('1 send')['actions'], [])
+
+    def test_r180_send_never_approval(self):
+        self.send_fixture()
+        plan = triage.reply_plan(self.store, self.listing, [], self.config | {'inbox_limit':1}, execute.read(self.store/'state.json'), triage.parse_reply('1 send'))
+        self.assertEqual([a['action'] for a in plan['actions']], ['send-draft'])
+        self.assertNotEqual(plan.get('approval_state'), 'awaiting approval')
+
+    def test_r180_send_refusals(self):
+        parts = triage.parse_reply('1 enviar')
+        self.assertEqual(parts[0]['verb'], 'send-draft')
+        with self.assertRaisesRegex(ValueError, 'allow_send'):
+            triage.reply_plan(self.store, self.listing, [], self.config, {}, parts)
+        self.config['allow_send'] = True
+        with self.assertRaisesRegex(ValueError, 'send it by hand'):
+            triage.reply_plan(self.store, self.listing, [], self.config, {}, parts)
+
+        self.send_fixture()
+        previous = execute.read(self.store/'state.json')
+        record = previous['_drafts'][0]
+        for records in ([], [{k:v for k,v in record.items() if k != 'digest'}], [{k:(None if k == 'draft_id' else v) for k,v in record.items() if k != 'digest'}]):
+            with self.assertRaisesRegex(ValueError, 'send it by hand'):
+                triage.reply_plan(self.store, self.listing, [], self.config, dict(cedar=3, _drafts=records), parts)
+
     def test_h_printed_reply_examples_are_accepted(self):
         for folders in ([], [dict(id='a', name='Reading')], [dict(id='a', name='bad;path')], [dict(id='a', name='bad\u202epath')],
                         [dict(id='a', name='Billing'), dict(id='b', name='billing')]):
@@ -5619,7 +7609,7 @@ class ReplyTests(unittest.TestCase):
         self.assertNotIn('\\',self.output)
 
     def test_parser_refuses_before_resolution(self):
-        for text in ['1 send','1 unsubscribe','1 move to ../Billing','1'*400+' trash','1\ttrash','1 trash\t','0 trash, 0 archive', '1 trash,' , '1 trash'+' '*2000]:
+        for text in ['1 send-draft','1 unsubscribe','1 move to ../Billing','1'*400+' trash','1\ttrash','1 trash\t','0 trash, 0 archive', '1 trash,' , '1 trash'+' '*2000]:
             with self.subTest(text=text[:30]), self.assertRaises(ValueError): triage.parse_reply(text)
 
     def test_never_touch_non_action(self):
@@ -5694,6 +7684,87 @@ class DraftTests(unittest.TestCase):
         self.plan['first_run'] = True
         save_plan(self.store, self.token, self.path, self.plan)
         return execute.Execution(self.store, self.token, self.path)
+
+    def test_r184_digest_covers_identity_and_attachments(self):
+        import copy
+        values = {
+            'outlook': dict(subject='Example', body=dict(contentType='text', content='Words'), toRecipients=[dict(emailAddress=dict(address='other@example.org'))], ccRecipients=[], bccRecipients=[]),
+            'gmail': dict(message=dict(payload=dict(headers=[dict(name='To', value='other@example.org'), dict(name='Subject', value='Example')], mimeType='text/plain', body=dict(data='V29yZHM='))))}
+        for provider, value in values.items():
+            first = triage.draft_digest(value, provider)
+            for field in ('from', 'replyTo'):
+                changed = copy.deepcopy(value)
+                if provider == 'gmail':
+                    changed['message']['payload']['headers'].append(dict(name='From' if field == 'from' else 'Reply-To', value='changed@example.net'))
+                else:
+                    changed[field] = dict(emailAddress=dict(address='changed@example.net')) if field == 'from' else [dict(emailAddress=dict(address='changed@example.net'))]
+                self.assertNotEqual(first, triage.draft_digest(changed, provider))
+            attached = copy.deepcopy(value)
+            if provider == 'gmail':
+                attached['message']['payload']['parts'] = [dict(filename='example.txt', mimeType='text/plain', body=dict(attachmentId='attachment-example', size=3))]
+            else:
+                attached['attachments'] = [dict(name='example.txt', contentType='text/plain', size=3)]
+            with self.assertRaisesRegex(ValueError, 'attachment'):
+                triage.draft_digest(attached, provider)
+
+    def test_r179_gmail_digest_normalisation(self):
+        import base64
+        value = dict(message=dict(payload=dict(headers=[dict(name='To', value='Other <OTHER@example.net>'), dict(name='Subject', value='Subject')], mimeType='text/plain', body=dict(data=base64.urlsafe_b64encode(b'One\r\nTwo').decode()))))
+        first = triage.draft_digest(value, 'gmail')
+        value['message']['payload']['body']['data'] = base64.urlsafe_b64encode(b'One\nTwo').decode()
+        value['message']['payload']['headers'][0]['value'] = 'other@example.net'
+        self.assertEqual(first, triage.draft_digest(value, 'gmail'))
+        value['message']['payload']['headers'][1]['value'] = 'Changed'
+        self.assertNotEqual(first, triage.draft_digest(value, 'gmail'))
+
+    def test_r184_sending_off_preserves_draft_calls_and_records(self):
+        import random
+        for seed in range(12):
+            with self.subTest(seed=seed):
+                self.setUp()
+                rng = random.Random(seed)
+                provider = rng.choice(('gmail', 'outlook'))
+                self.config['accounts']['cedar']['provider'] = provider
+                setting = rng.choice(('', 'allow_send=false\n'))
+                (self.store/'config.toml').write_text(setting + '[accounts.cedar]\nprovider="' + provider + '"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
+                machine = self.prepare()
+                machine.step()
+                path = self.store/'gateway.json'
+                execute.atomic(path, [dict(ok=True, value=dict(id='draft-example'))])
+                self.assertEqual(machine.batch_result(path), dict(status='reported'))
+                self.assertNotIn('draft_reads', machine.state)
+                machine.final(self.listing)
+                triage.commit_state(self.store, self.token, self.path)
+                record = execute.read(self.store/'state.json')['_drafts'][0]
+                self.assertEqual(set(record), {'account', 'id', 'draft_id', 'rule', 'created'})
+                self.assertEqual({k:v for k,v in record.items() if k != 'created'}, dict(account='cedar', id='original', draft_id='draft-example', rule='draft-rule'))
+
+    def test_r179_draft_digest_readback(self):
+        self.config['allow_send'] = True
+        self.config['accounts']['cedar']['provider'] = 'outlook'
+        (self.store/'config.toml').write_text('allow_send=true\n[accounts.cedar]\nprovider="outlook"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n')
+        machine = self.prepare()
+        machine.step()
+        path = self.store/'gateway.json'
+        execute.atomic(path, [dict(ok=True, value={'id':'draft-example'})])
+        reads = machine.batch_result(path)
+        self.assertEqual(reads['calls'][0]['input']['input']['path'], {'message-id':'draft-example'})
+        payload = dict(id='draft-example', toRecipients=[dict(emailAddress=dict(address='other@example.net'))], ccRecipients=[], bccRecipients=[], subject='Re: Original', body=dict(contentType='text', content='Owner words'))
+        execute.atomic(path, [dict(ok=True, value=payload)])
+        machine.batch_result(path)
+        machine.final(self.listing)
+        triage.commit_state(self.store, self.token, self.path)
+        record = execute.read(self.store/'state.json')['_drafts'][0]
+        self.assertEqual(record['digest'], triage.draft_digest(payload, 'outlook'))
+        self.assertNotIn('Owner words', json.dumps(record))
+        triage.validate_drafts([record], self.config)
+        for bad in (None, 1, '', 'A'*64, 'f'*63, 'f'*65):
+            with self.assertRaisesRegex(ValueError, 'digest'):
+                triage.validate_drafts([record | {'digest':bad}], self.config)
+        legacy = {k:v for k,v in record.items() if k != 'digest'}
+        triage.validate_drafts([legacy], self.config)
+        plan = triage.build_plan(self.listing, [self.rule], [], self.config, {'_drafts':[legacy]})
+        self.assertIn('send it by hand', plan['remaining'][0]['reason'])
 
     def test_cli_handled_draft_uses_words_both_languages(self):
         self.prepare()
@@ -5858,9 +7929,10 @@ class DraftTests(unittest.TestCase):
         self.assertFalse(plan['reasons'])
 
     def test_no_send(self):
-        self.assertEqual(execute.CALL_KINDS, {'trash','archive','move','spam','unsubscribe','create-folder','create-draft'})
-        for verb in ('send','submit','deliver','dispatch','reply','forward','email','mail'):
-            with self.subTest(verb=verb), self.assertRaisesRegex(ValueError,'The owner sends drafts by hand from the mailbox.'):
+        self.assertEqual(execute.CALL_KINDS, {'trash','archive','move','spam','unsubscribe','create-folder','create-draft','send-draft'})
+        for verb in ('submit','deliver','dispatch','reply','forward','email','mail'):
+            reason = 'Expected forward HANDLE' if verb == 'forward' else 'The owner sends drafts by hand from the mailbox.'
+            with self.subTest(verb=verb), self.assertRaisesRegex(ValueError, reason):
                 triage.parse_reply('1 '+verb)
 
     def test_pending_commit_numbered_reply_and_record_retirement(self):
@@ -5889,7 +7961,16 @@ class DraftTests(unittest.TestCase):
         machine.step(execute.AssistantProvider(dict(outcome='ok',inbox_ids=[])))
         machine.step()
         triage.commit_state(self.store,self.token,self.path)
-        self.assertEqual(execute.read(self.store/'state.json')['_drafts'],[])
+        self.assertEqual(len(execute.read(self.store/'state.json')['_drafts']), 1)
+        triage.release(self.store, self.token)
+        self.token = triage.acquire(self.store)
+        self.listing = dict(self.listing, messages=[])
+        execute.atomic(self.store/'inbox.json', self.listing)
+        plan = triage.build_plan(self.listing, [self.rule], [], self.config, execute.read(self.store/'state.json'))
+        save_plan(self.store, self.token, self.path, plan)
+        execute.Execution(self.store, self.token, self.path).step()
+        triage.commit_state(self.store, self.token, self.path)
+        self.assertEqual(execute.read(self.store/'state.json')['_drafts'], [])
 
 
 class MessageFormatTests(unittest.TestCase):

@@ -1,6 +1,8 @@
 # Routine run
 
-Replace /absolute/private-store with PIGEON_HOME and TOKEN with the lock token. Read config.toml and guardrails.md.
+pigeon never sends anything without the owner's approval. Sending is off by default. With allow_send=true, "N send" ("N enviar") sends an unchanged draft it created from a draft rule. "N forward HANDLE" ("N reenviar HANDLE") forwards one message to another configured account's address, with no added text, through the mailbox forward-draft operation. Both read the draft back before sending; at most five sends per reply. Rules, proceed and judgments can never send. It never composes mail or takes draft text or forward recipients from mail; replies use the mailbox reply operation. It never deletes permanently; the calendar stays read-only.
+
+Read config.toml and guardrails.md. Replace paths/TOKEN.
 
 Stop on any refusal; follow [Run exits](../AGENTS.md#run-exits). Never retry uncertain calls.
 
@@ -78,7 +80,7 @@ Pass calls unchanged once. Without path/input use [action recipes](hosted-setup.
 PIGEON_HOME=/absolute/private-store python3 scripts/execute.py result --token TOKEN --plan /absolute/private-store/plan.json --results /absolute/private-store/gateway-results.json
 ```
 
-Report each batch before next (at most 50 calls/account). Create drafts once, with a returned id; never send.
+Report each batch before next (at most 50 calls/account). Create drafts once, with a returned id; send only an issued owner-approved draft.
 
 For create-folder, return results, read verify’s folders, then confirm ID/full path:
 
@@ -206,7 +208,7 @@ Replace ACCOUNT/kind/tool with account/operation/discovered path. Continue only 
 
 ## Numbered reply
 
-For numbered replies, acquire, fetch, validate and list afresh; omit quiet-check, position reads and --scheduled. Keep positions unchanged. Save the user's text verbatim in reply.txt. Accept number plus trash, archive, spam, move to an existing folder path, leave, yes or no; separate with commas, semicolons or line breaks. Never create reply folders. A group or shared number acts on every saved member in each account; gone group members are skipped.
+For numbered replies, acquire, fetch, validate and list afresh; omit quiet-check, position reads and --scheduled. Keep positions unchanged. Save the user's text verbatim in reply.txt. Verbs: trash, archive, spam, move to <existing folder>, leave, yes, no; with allow_send=true also send/enviar and forward HANDLE/reenviar HANDLE. Separate parts with commas, semicolons or line breaks. Shared numbers act on every saved member; send refuses missing members. Carry draft reads and single send calls once; An issued send or forward blocks repetition across hosts, even under a new number; check Sent and Drafts by hand.
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py reply --token TOKEN --inbox /absolute/private-store/inbox.json --reply /absolute/private-store/reply.txt --plan-out /absolute/private-store/plan.json --report-out /absolute/private-store/report.md`
 
@@ -230,4 +232,8 @@ Read history position/Inbox arrivals or ten newest ordered IDs; use error/expire
 
 ## Reference
 
-First installation, config, drive, Gateway recipes: [Hosted setup](hosted-setup.md). Rules/drafts/calendar/Unsubscribe: [Advanced setup](setup.md); for tables use [Converter](setup.md#convert-a-rules-table).
+First installation/Gateway recipes: [Hosted setup](hosted-setup.md). Unsubscribe: [Advanced setup](setup.md); [Converter](setup.md#convert-a-rules-table).
+
+If plan returns draft-check calls, carry the array unchanged, save results, and repeat plan with `--draft-check-results FILE`. Remove the response afterward. This checks recorded after_send drafts and their conversations in Sent. Dry runs save responses under .dry-run.
+
+If next returns state_send_required, run its printed send-state command through the state-upload loop, then next again. No mail write runs before approval is saved.

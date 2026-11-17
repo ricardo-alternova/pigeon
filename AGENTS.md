@@ -1,5 +1,7 @@
 # Run pigeon
 
+pigeon never sends anything without the owner's approval. Sending is off by default. With allow_send=true, "N send" ("N enviar") sends an unchanged draft it created from a draft rule. "N forward HANDLE" ("N reenviar HANDLE") forwards one message to another configured account's address, with no added text, through the mailbox forward-draft operation. Both read the draft back before sending; at most five sends per reply. Rules, proceed and judgments can never send. It never composes mail or takes draft text or forward recipients from mail; replies use the mailbox reply operation. It never deletes permanently; the calendar stays read-only.
+
 For a routine run, read only [docs/quickstart.md](docs/quickstart.md). Open this document for refusals, owner replies and rule changes. Open [hosted setup](docs/hosted-setup.md) for installation, the listing format and gateway recipes.
 
 Follow guardrails.md in the private store.

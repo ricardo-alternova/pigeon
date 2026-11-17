@@ -1,5 +1,6 @@
 # Changelog
 
+- Preserve send/forward decisions on drive state, retain finished drafts while originals remain in Inbox, save forward requests before draft creation, and show unknown results on later lines.
 - Handle empty gateway lists, normalise app paths, retry and explain skipped accounts, and retain quiet positions per account.
 
 - Complete scripted final arrivals and merge body-rule accounts through --manual-part.
@@ -15,7 +16,7 @@ Add read-only calendar invitations, overlaps and a winning calendar to reports a
 ## Unreleased — remaining Inbox items
 
 - Create reply and forward drafts from rule text and recipients; show full drafts and keep originals in Inbox.
-- Retain draft IDs and uncertain creation records across runs; leave sending to the owner.
+- Retain draft IDs and uncertain creation records across runs; send only with the owner’s numbered approval.
 
 - Switch individual rules off with enabled = false.
 - Convert five-column Markdown rules tables with scope mappings and a review list.

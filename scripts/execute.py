@@ -81,7 +81,7 @@ class Execution:
         triage.require_plan_token(self.plan, token)
         if self.plan.get('dry_run'):
             raise ValueError('dry-run plan: execution is refused; no call issued')
-        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'judgments', 'judgment_token'}, str(self.plan_path))
+        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'judgments', 'judgment_token', 'hand_sent'}, str(self.plan_path))
         for key in ('actions', 'decisions', 'reasons'):
             if not isinstance(self.plan.get(key), list):
                 raise ValueError(str(self.plan_path) + '.' + key + ': expected an array')
@@ -90,7 +90,7 @@ class Execution:
         triage.known_keys(self.plan.get('counts'), set(self.plan.get('counts', {})), str(self.plan_path) + '.counts')
         creates = set()
         for action in self.plan['actions']:
-            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'reason', 'judgment'}, str(self.plan_path) + '.actions')
+            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'digest', 'reason', 'judgment'}, str(self.plan_path) + '.actions')
             if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action', 'rule')):
                 raise ValueError(str(self.plan_path) + '.actions: expected account, id, action and rule strings')
             if 'target_path' in action:
@@ -115,7 +115,7 @@ class Execution:
 
     def validate_checkpoint(self):
         label = str(self.path)
-        triage.known_keys(self.state, {'signature', 'pending', 'results', 'failures', 'outside_change', 'single_reads', 'final_listing', 'batches', 'folder_outcome'}, label)
+        triage.known_keys(self.state, {'signature', 'pending', 'results', 'failures', 'outside_change', 'single_reads', 'final_listing', 'batches', 'folder_outcome', 'draft_reads', 'send_read'}, label)
         if self.state.get('signature') != self.signature:
             raise ValueError(label + '.signature: expected unchanged plan during execution')
         if 'single_reads' in self.state and self.state['single_reads'] is not True:
@@ -154,6 +154,13 @@ class Execution:
                     or any(type(v) is not bool for v in outcomes)):
                 raise ValueError(label + '.batches: expected positional boolean outcomes')
             end = start + len(calls)
+        reads = self.state.get('draft_reads', [])
+        if not isinstance(reads, list) or len(reads) != len(set(reads)) or any(type(i) is not int or i < 0 or i >= len(self.state['results']) or self.state['results'][i]['action'] != 'create-draft' or 'draft_id' not in self.state['results'][i] for i in reads):
+            raise ValueError(label + '.draft_reads: expected created draft result indices')
+        if 'send_read' in self.state and (type(self.state['send_read']) not in (int, float) or not 0 < self.state['send_read'] <= time.time() or not self.state.get('pending') or self.state['pending']['action'] != 'send-draft'):
+            raise ValueError(label + '.send_read: expected pending draft read')
+        if any(any(c['action'] == 'send-draft' for c in b['calls']) and len(b['calls']) != 1 for b in batches):
+            raise ValueError(label + '.batches: send must be alone')
         failures = self.state.get('failures')
         triage.known_keys(failures, triage.PLAN_VERBS, label + '.failures')
         for verb, count in failures.items():
@@ -165,13 +172,15 @@ class Execution:
         statuses = {'executed', 'failed', 'skipped', 'unexecuted', 'unsubscribe_not_executable', 'unsubscribe_not_attempted', 'issued_unknown', 'unconfirmed'}
         for i, entry in enumerate(results):
             source = label + '.results.' + str(i)
-            triage.known_keys(entry, {'account', 'id', 'action', 'status', 'folder_id', 'reason', 'draft_id', 'created'}, source)
+            triage.known_keys(entry, {'account', 'id', 'action', 'status', 'folder_id', 'reason', 'draft_id', 'created', 'digest'}, source)
             if 'reason' in entry and entry['reason'] != OUTSIDE_CHANGE and not triage.re.fullmatch(r'(?:provider|pigeon) error \([A-Za-z0-9 _-]{1,40}\)', entry['reason']):
                 raise ValueError(source + '.reason: expected fixed outside-change reason')
             call = self.plan['actions'][i]
             if (any(entry.get(k) != call[k] for k in ('account', 'id', 'action'))
                     or not isinstance(entry.get('status'), str) or entry['status'] not in statuses):
                 raise ValueError(source + ': expected matching planned action and status ' + ', '.join(sorted(statuses)))
+            if 'digest' in entry and (call['action'] != 'create-draft' or not isinstance(entry['digest'], str) or not triage.re.fullmatch(r'[0-9a-f]{64}', entry['digest'])):
+                raise ValueError(source + '.digest: expected SHA-256 for draft')
             if call['action'] == 'create-draft':
                 if entry['status'] == 'executed' and not triage.message_id(entry.get('draft_id')):
                     raise ValueError(source + '.draft_id: expected valid message id')
@@ -185,7 +194,7 @@ class Execution:
             raise ValueError(label + '.pending: expected null or the next planned action')
         pending = self.state['pending']
         if pending is not None:
-            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to', 'reason', 'judgment'}, label + '.pending')
+            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to', 'digest', 'reason', 'judgment'}, label + '.pending')
             if len(results) == len(self.plan['actions']) or pending != self.plan['actions'][len(results)]:
                 raise ValueError(label + '.pending: expected the next planned action unchanged')
 
@@ -197,17 +206,31 @@ class Execution:
         holds = triage.parse_rules(triage.load_inputs([self.store / 'never-touch.toml'])[0], protection=True)
         previous = read(self.store / 'state.json') if (self.store / 'state.json').exists() else {}
         previous = triage.recover_drafts(self.store, previous, self.token)
+        triage.validate_drafts(previous.get('_drafts', []), config)
         if '_drafts' in previous:
+            started = triage.read_lock(self.store).get('started', triage.read_lock(self.store)['created'])
+            previous['_drafts'] = [dict(d) for d in previous['_drafts']]
+            for d in previous['_drafts']:
+                if d.get('issued') and started <= triage.datetime.fromisoformat(d['issued']).timestamp() <= time.time():
+                    action = next((a for a in self.plan['actions'] if a['action'] == 'send-draft' and (a['account'], a['id']) == (d['account'], d['id'])), None)
+                    if action and action['rule'] != 'numbered-forward':
+                        d.pop('issued')
+                        d['digest'] = action['digest']
+                    elif action and d.get('status') == 'forward-requested':
+                        # This run owns the durable request, before its creation call.
+                        d['_own_forward'] = True
             own = {(r['account'], r['id'], r.get('created')) for r in self.state['results'] if r['action'] == 'create-draft'}
             if self.state['pending'] is not None and self.state['pending']['action'] == 'create-draft':
                 pending = self.state['pending']
                 own.add((pending['account'], pending['id'], triage.datetime.fromtimestamp(triage.read_lock(self.store).get('started', triage.read_lock(self.store)['created']), triage.timezone.utc).isoformat()))
-            previous['_drafts'] = [d for d in previous['_drafts'] if (d['account'], d['id'], d['created']) not in own]
+            previous['_drafts'] = [d for d in previous['_drafts'] if not d.pop('_own_forward', False) and (d['account'], d['id'], d['created']) not in own]
         first_run = self.plan.get('first_run', False)
         if type(first_run) is not bool:
             raise ValueError(str(self.plan_path) + '.first_run: expected boolean')
         stops = ['Missing state; prior run records exist'] if not (self.store / 'state.json').exists() and not first_run else []
         if 'reply' in self.plan:
+            if any(a['action'] == 'send-draft' for a in self.plan['actions']) and not self.plan.get('reply_source'):
+                raise ValueError('Send approval source missing; plan the reply again')
             if 'reply_source' in self.plan:
                 triage.known_keys(self.plan['reply_source'], {'numbers', 'parts'}, 'reply_source')
                 if set(self.plan['reply_source']) != {'numbers', 'parts'}:
@@ -228,7 +251,7 @@ class Execution:
         elif self.plan['reasons'] and self.plan['reasons'][0].startswith('Reply refused:'):
             expected = triage.build_plan(listing, [], holds, config, previous, self.plan['reasons'])
         else:
-            expected = triage.build_plan(listing, rules, holds, config, previous, stops, judgments=self.plan.get('judgments'), run_token=self.plan.get('judgment_token'))
+            expected = triage.build_plan(listing, rules, holds, config, previous, stops, judgments=self.plan.get('judgments'), run_token=self.plan.get('judgment_token'), hand_sent=self.plan.get('hand_sent'), store=self.store)
         if self.plan.get('approval_state') == 'approved':
             triage.check_question_judgments(self.store, self.plan)
             if expected['reasons'] != self.plan.get('approved_thresholds'):
@@ -255,6 +278,65 @@ class Execution:
         if self.plan['actions'] != expected['actions'] or self.plan['counts'] != expected['counts']:
             raise ValueError(str(self.plan_path) + '.actions: expected actions and counts from current private inputs and Inbox listing')
 
+    def require_send_retirement(self):
+        try:
+            digest = self.consume_forward_numbers()
+            previous = read(self.store / 'state.json')
+            drafts = previous.setdefault('_drafts', [])
+            stamp = triage.datetime.now(triage.timezone.utc).isoformat()
+            changed = False
+            for call in self.plan['actions']:
+                if call['action'] != 'send-draft':
+                    continue
+                record = next((d for d in drafts if (d['account'], d['id']) == (call['account'], call['id'])), None)
+                if record is None and call['rule'] == 'numbered-forward':
+                    record = dict(account=call['account'], id=call['id'], draft_id=None, rule='numbered-forward',
+                                  created=triage.datetime.fromtimestamp(triage.read_lock(self.store).get('started', triage.read_lock(self.store)['created']), triage.timezone.utc).isoformat(),
+                                  status='forward-requested')
+                    drafts.append(record)
+                    changed = True
+                if record is not None and 'issued' not in record:
+                    record['issued'] = stamp
+                    record.pop('digest', None)
+                    changed = True
+            if changed:
+                atomic(self.store / 'state.json', previous)
+        except OSError:
+            raise ValueError('Send approval could not be saved; nothing sent; plan again') from None
+        config = triage.state_config(self.store)
+        if triage.state_setting(config)['kind'] != 'local':
+            exchange = read(self.store / 'state-exchange.json')
+            if exchange.get('failed'):
+                raise ValueError('Send approval upload failed; nothing sent; plan again')
+            if exchange.get('phase') != 'ready' or exchange.get('hashes', {}).get('numbers.json') != digest or exchange.get('hashes', {}).get('state.json') != hashlib.sha256(triage.state_bytes(self.store / 'state.json')).hexdigest():
+                self.save()
+                return dict(state_send_required=True, next=['python3', str(Path(__file__).with_name('triage.py')), 'send-state', '--token', self.token])
+        return None
+
+    def consume_forward_numbers(self):
+        numbers = triage.read_numbers(self.store)
+        consumed = {e['number'] for e in self.plan['reply'] if e['verb'] in {'forward', 'send-draft'}}
+        retained = [i for i in numbers['items'] if i['number'] not in consumed]
+        if len(retained) != len(numbers['items']):
+            atomic(self.store / 'numbers.json', dict(numbers, items=retained))
+        return hashlib.sha256(triage.state_bytes(self.store / 'numbers.json')).hexdigest()
+
+    def send_record(self, call):
+        if call['rule'] == 'numbered-forward':
+            index = self.plan['actions'].index(call)
+            if index == 0 or index > len(self.state['results']):
+                return None
+            creation = self.plan['actions'][index - 1]
+            result = self.state['results'][index - 1]
+            if (creation['action'] != 'create-draft' or creation['rule'] != 'numbered-forward'
+                    or (creation['account'], creation['id']) != (call['account'], call['id'])
+                    or result['status'] != 'executed' or 'digest' not in result):
+                return None
+            return result
+        previous = read(self.store / 'state.json')
+        started = triage.read_lock(self.store).get('started', triage.read_lock(self.store)['created'])
+        return next((dict(d, digest=call['digest']) for d in previous.get('_drafts', []) if (d['account'], d['id'], d['draft_id']) == (call['account'], call['id'], call['target']) and (d.get('digest') == call['digest'] or (d.get('issued') and started <= triage.datetime.fromisoformat(d['issued']).timestamp() <= time.time()))), None)
+
     def stop_reason(self):
         change = self.state.get('outside_change')
         if not change: return None
@@ -271,6 +353,7 @@ class Execution:
         return OUTSIDE_CHANGE + ': ' + '; '.join(f'{a} ({len(ids)} message{"s" if len(ids) != 1 else ""} left the Inbox)' for a, ids in departures.items())
 
     def current_listing(self, listing):
+        listing = triage.after_send_listing(listing, self.plan.get('hand_sent', {}).get('failed', {}))
         if 'final_listing' in self.state:
             final = self.state['final_listing']
             failed = final.get('skipped', {})
@@ -357,6 +440,8 @@ class Execution:
         with triage.lock_gate(self.store):
             triage.require_lock(self.store, self.token)
             self.validate()
+            if self.state.get('draft_reads'):
+                raise ValueError('draft reading: report requested results first')
             if self.state['pending'] is not None or len(self.state['results']) != len(self.plan['actions']):
                 raise ValueError('final: finish every action before the final reading')
             if 'final_listing' in self.state:
@@ -374,7 +459,7 @@ class Execution:
                         result.update(status='unconfirmed', reason=listing['skipped'][call['account']])
                         self.log(call, result['status'])
                         continue
-                    if call['action'] == 'create-draft':
+                    if call['action'] in {'create-draft', 'send-draft'}:
                         continue
                     actual = {m['id'] for m in listing['messages'] if m['account'] == call['account']}
                     ok = None if batch['outcomes'] is None else batch['outcomes'][offset]
@@ -382,7 +467,7 @@ class Execution:
                                         else 'unconfirmed' if ok is True else 'issued_unknown' if ok is None else 'failed')
                     self.log(call, result['status'])
             for result in self.state['results']:
-                if result['account'] in listing.get('skipped', {}) and result['action'] != 'create-folder':
+                if result['account'] in listing.get('skipped', {}) and result['action'] not in {'create-folder', 'send-draft'}:
                     result.update(status='unconfirmed', reason=listing['skipped'][result['account']])
             for account in self.plan['counts']:
                 if account in listing.get('skipped', {}): continue
@@ -402,6 +487,70 @@ class Execution:
             self.state = read(self.path)
             self.validate_checkpoint()
             self.validate()
+            if self.state.get('send_read'):
+                required = self.require_send_retirement()
+                if required:
+                    return required
+                call = self.state['pending']
+                value = triage.gateway_results(path, 1)[0]
+                config = triage.state_config(self.store)
+                record = self.send_record(call)
+                try:
+                    payload = value['value']
+                    valid = (Path(path).stat().st_mtime >= self.state['send_read'] and not triage.provider_failed(value) and record is not None and payload.get('id') == record['draft_id']
+                             and triage.draft_digest(payload, config['accounts'][call['account']]['provider'], allow_attachments=call['rule'] == 'numbered-forward') == record['digest'])
+                except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
+                    valid = False
+                if valid:
+                    fields = config['accounts'][call['account']]
+                    try:
+                        if fields['provider'] == 'gmail':
+                            headers = payload['message']['payload']['headers']
+                            recipients = {a.casefold() for _, a in triage.getaddresses([h['value'] for h in headers if h['name'].casefold() in {'to','cc','bcc'}])}
+                        else:
+                            recipients = {e['emailAddress']['address'].casefold() for k in ('toRecipients','ccRecipients','bccRecipients') for e in payload[k]}
+                        valid = recipients == {a.casefold() for a in call['draft_to']} and (fields['provider'] == 'gmail' or payload.get('isDraft') is True)
+                    except (KeyError, TypeError, AttributeError):
+                        valid = False
+                self.state.pop('send_read')
+                self.state['pending'] = None
+                if not valid:
+                    self.record(call, 'failed')
+                    self.save()
+                    return {'status': 'failed', 'reason': 'Draft changed, deleted or unreadable; send it by hand'}
+                log = self.store / 'calls.jsonl'
+                entries = [triage.parse_json(line, log) for line in triage.read_text(log).splitlines()] if log.exists() else []
+                if any(e['run'] == self.token and e['verb'] == 'send-draft' and e['outcome'] == 'issued' and (e['account'], e['id']) == (call['account'], call['id']) for e in entries):
+                    self.record(call, 'issued_unknown')
+                    self.save()
+                    return {'status': 'issued_unknown', 'reason': 'Send already attempted; check by hand; never retry'}
+                issued = dict(call) | triage.gateway_account(config, call['account']) | triage.saved_tool(self.store, call['account'], 'send-draft')
+                if 'tool' not in issued:
+                    raise ValueError('send-draft: save the existing-draft send tool first; send it by hand')
+                fields = config['accounts'][call['account']]
+                inner = {'path': {'userId': 'me'}, 'body': {'id': record['draft_id']}} if fields['provider'] == 'gmail' else {'path': {'message-id': record['draft_id']}}
+                issued.update(path=issued['tool'], input=dict(accountId=fields['executor_account'], input=inner))
+                self.state.setdefault('batches', []).append(dict(start=len(self.state['results']), calls=[call], outcomes=None))
+                self.record(call, 'issued_unknown')
+                self.state['single_reads'] = True
+                self.log(issued, 'issued')
+                self.save()
+                return {'account': call['account'], 'calls': [issued]}
+            if self.state.get('draft_reads'):
+                values = triage.gateway_results(path, len(self.state['draft_reads']))
+                config = triage.state_config(self.store)
+                for index, value in zip(self.state.pop('draft_reads'), values):
+                    result = self.state['results'][index]
+                    if not triage.provider_failed(value):
+                        try:
+                            payload = value['value']
+                            if payload.get('id') != result['draft_id']:
+                                raise ValueError('draft reading: different id')
+                            result['digest'] = triage.draft_digest(payload, config['accounts'][result['account']]['provider'], allow_attachments=self.plan['actions'][index]['rule'] == 'numbered-forward')
+                        except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
+                            pass  # Created draft remains recorded, but cannot be sent.
+                self.save()
+                return {'status': 'reported'}
             pending = self.state['pending']
             if pending is not None and pending['action'] == 'create-folder':
                 if 'folder_outcome' in self.state:
@@ -433,6 +582,8 @@ class Execution:
                 verb = call['action']
                 self.state['failures'][verb] = 0 if not triage.provider_failed(value) else self.state['failures'].get(verb, 0) + 1
                 result = self.state['results'][batch['start'] + offset]
+                if not triage.provider_failed(value) and verb == 'send-draft':
+                    result['status'] = 'executed'
                 if not triage.provider_failed(value) and verb == 'create-draft':
                     payload = value.get('value')
                     draft_id = payload.get('id') if isinstance(payload, dict) else None
@@ -442,8 +593,25 @@ class Execution:
                     result = self.state['results'][batch['start'] + offset]
                     result.update(status='failed', reason=triage.provider_error(value))
                 self.log(call, 'reported_ok' if not triage.provider_failed(value) else 'failed')
+            reads = []
+            indices = []
+            config = triage.state_config(self.store)
+            for offset, call in enumerate(batch['calls']):
+                index = batch['start'] + offset
+                result = self.state['results'][index]
+                if not config.get('allow_send', False) or call['action'] != 'create-draft' or 'draft_id' not in result:
+                    continue
+                fields = config['accounts'][call['account']]
+                gmail = fields['provider'] == 'gmail'
+                tail = 'gmail.users.drafts.get' if gmail else 'meMessage.meGetMessages'
+                inner = {'path': {'userId':'me', 'id':result['draft_id']} if gmail else {'message-id':result['draft_id']}}
+                inner['query'] = {'format':'full'} if gmail else {'$select':['id','toRecipients','ccRecipients','bccRecipients','subject','body','from','replyTo','hasAttachments'], '$expand': 'attachments($select=name,contentType,size)'}
+                reads.append(dict(path=triage.tool_path(fields['executor_app'], tail), input=dict(accountId=fields['executor_account'], input=inner)))
+                indices.append(index)
+            if indices:
+                self.state['draft_reads'] = indices
             self.save()
-            return {'status': 'reported'}
+            return {'account': batch['calls'][0]['account'], 'calls': reads} if reads else {'status':'reported'}
 
     def gateway_action(self, issued, config):
         fields = config['accounts'][issued['account']]
@@ -471,7 +639,10 @@ class Execution:
             tool = 'gmail.users.drafts.create' if gmail else 'meMessage.meMessagesMessageCreate' + ('Reply' if issued['draft'] == 'reply' else 'Forward')
             if not gmail: inner['path'] = {'message-id':issued['id']}
             # Retain the issued owner-written text and recipient fields.
-            inner.update({k:issued[k] for k in ('draft_text','draft_to') if k in issued})
+            if issued.get('rule') == 'numbered-forward' and self.plan.get('reply_source'):
+                inner['body'] = dict(message=dict(toRecipients=[dict(emailAddress=dict(address=a)) for a in issued['draft_to']]))
+            else:
+                inner.update({k:issued[k] for k in ('draft_text','draft_to') if k in issued})
         elif gmail:
             inner['path']['id'] = issued['id']
             tool = 'gmail.users.messages.trash' if verb == 'trash' else 'gmail.users.messages.modify'
@@ -547,6 +718,8 @@ class Execution:
                 self.log(pending, status)
                 self.save()
                 return {'status': status}
+            if provider is not None and pending is not None and pending['action'] == 'send-draft':
+                raise ValueError('send-draft: return gateway results, never an observation')
             if provider is not None:
                 if pending is not None and pending['action'] == 'unsubscribe':
                     raise ValueError('unsubscribe: expected local command, never a gateway observation')
@@ -642,8 +815,41 @@ class Execution:
                 return {'status': status}
             if pending is not None:
                 raise ValueError(str(self.path) + '.pending: expected result before another next')
+            if self.state.get('draft_reads'):
+                raise ValueError('draft reading: report requested results first')
             while len(self.state['results']) < len(self.plan['actions']):
                 call = self.plan['actions'][len(self.state['results'])]
+                if self.plan.get('reply_source') and any(a['action'] == 'send-draft' for a in self.plan['actions']):
+                    # Consume the owner's number before the first mail write, including across host restarts.
+                    required = self.require_send_retirement()
+                    if required:
+                        return required
+                sent = next((r for a, r in zip(self.plan['actions'], self.state['results'])
+                             if a['action'] == 'send-draft' and (a['account'], a['id']) == (call['account'], call['id'])), None)
+                if call['action'] in triage.REMOVALS and sent is not None and sent['status'] != 'executed':
+                    self.record(call, 'unexecuted')
+                    self.log(call, 'unexecuted')
+                    self.save()
+                    continue
+                if call['action'] == 'send-draft':
+                    record = self.send_record(call)
+                    if record is None:
+                        self.record(call, 'failed')
+                        self.log(call, 'unexecuted')
+                        self.save()
+                        continue
+                    config = triage.state_config(self.store)
+                    fields = config['accounts'][call['account']]
+                    if not triage.saved_tool(self.store, call['account'], 'send-draft'):
+                        raise ValueError('send-draft: save the existing-draft send tool first; send it by hand')
+                    gmail = fields['provider'] == 'gmail'
+                    tail = 'gmail.users.drafts.get' if gmail else 'meMessage.meGetMessages'
+                    inner = {'path': {'userId': 'me', 'id': record['draft_id']} if gmail else {'message-id': record['draft_id']},
+                             'query': {'format': 'full'} if gmail else {'$select': ['id','isDraft','toRecipients','ccRecipients','bccRecipients','subject','body','from','replyTo','hasAttachments'], '$expand': 'attachments($select=name,contentType,size)'}}
+                    self.state['pending'] = call
+                    self.state['send_read'] = time.time()
+                    self.save()
+                    return {'account': call['account'], 'calls': [dict(path=triage.tool_path(fields['executor_app'], tail), input=dict(accountId=fields['executor_account'], input=inner))]}
                 if call['action'] == 'move' and 'target_path' in call:
                     creation = next((e for a, e in zip(self.plan['actions'], self.state['results'])
                                     if a['action'] == 'create-folder' and a['account'] == call['account'] and a['target_path'] == call['target_path']), None)
@@ -663,7 +869,7 @@ class Execution:
                 if config['accounts'][call['account']].get('provider') and call['action'] in triage.REMOVALS | {'create-draft'}:
                     calls = []
                     for candidate in self.plan['actions'][len(self.state['results']):]:
-                        if (len(calls) == 50 or candidate['account'] != call['account']
+                        if (calls and candidate.get('rule') == 'numbered-forward' or len(calls) == 50 or candidate['account'] != call['account']
                                 or candidate['action'] not in triage.REMOVALS | {'create-draft'}
                                 or self.state['failures'].get(candidate['action'], 0) >= 2):
                             break
@@ -873,6 +1079,26 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
         stages = []
         position = 0
         while True:
+            index = len(machine.state['results'])
+            if index < len(machine.plan['actions']) and machine.plan['actions'][index]['action'] == 'create-draft' and machine.plan['actions'][index]['rule'] == 'numbered-forward' and machine.plan.get('reply_source'):
+                machine.require_send_retirement()
+                if (scratch / 'state-exchange.json').exists():
+                    exchange = read(scratch / 'state-exchange.json')
+                    for name in ('numbers.json', 'state.json'):
+                        exchange.setdefault('hashes', {})[name] = hashlib.sha256(triage.state_bytes(scratch / name)).hexdigest()
+                    atomic(scratch / 'state-exchange.json', exchange)
+            if index < len(machine.plan['actions']) and machine.plan['actions'][index]['action'] == 'send-draft':
+                # The disposable rehearsal confirms a synthetic send without reading a draft or building a provider call.
+                call = machine.plan['actions'][index]
+                position += 1
+                status = 'failed' if position == fail else 'executed'
+                if call['rule'] == 'numbered-forward' and machine.state['results'][index - 1]['status'] != 'executed':
+                    status = 'failed'
+                machine.record(call, status)
+                machine.save()
+                stages.append(dict(simulated_calls=[dict(action='send-draft', position=position, path=SIMULATED_PATH)],
+                                   simulated_results=[dict(action='send-draft', position=position, outcome='failed' if status == 'failed' else 'confirmed')]))
+                continue
             response = machine.step()
             if response.get('done') or 'final_reads' in response:
                 break
@@ -897,6 +1123,10 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
                 result_path = scratch / 'simulation-results.json'
                 atomic(result_path, values)
                 stages.append(dict(result=simulation_status(machine.batch_result(result_path))))
+                if machine.state.get('draft_reads'):
+                    # Rehearsals never need a sendable draft or a real read.
+                    atomic(result_path, [dict(ok=False, error={}) for _ in machine.state['draft_reads']])
+                    stages.append(dict(result=simulation_status(machine.batch_result(result_path))))
                 pending = machine.state['pending']
                 if pending is not None and pending['action'] == 'create-folder' and values[0]['ok']:
                     ident = values[0]['value']['id']

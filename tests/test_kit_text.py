@@ -18,6 +18,24 @@ def setup_text():
 
 
 class KitTextTests(unittest.TestCase):
+    def test_r184_send_documents_match_behavior(self):
+        setup = (ROOT/'docs/setup.md').read_text()
+        hosted = (ROOT/'docs/hosted-setup.md').read_text()
+        quick = (ROOT/'docs/quickstart.md').read_text()
+        self.assertNotIn('After sending by hand, file the original with a numbered reply.', setup)
+        self.assertIn('owner sent anything later in that conversation', setup)
+        self.assertIn('nothing is deleted permanently', setup)
+        self.assertIn('report, send-draft, sent-read', setup)
+        self.assertIn('uploaded before the call', setup)
+        self.assertIn('check Sent and Drafts by hand', setup)
+        self.assertIn('across hosts, even under a new number', quick)
+        self.assertIn('| allow_send |', hosted)
+        self.assertIn('tool-save --token TOKEN --account HANDLE --kind send-draft --tool PATH', hosted)
+        self.assertIn('upload state with send-state', hosted)
+        verbs = quick.split('## Numbered reply')[1].split('## Dry run')[0]
+        self.assertIn('forward HANDLE/reenviar HANDLE', verbs)
+        self.assertNotIn('leave sending to the owner', (ROOT/'CHANGELOG.md').read_text())
+
     def test_r174_predicate_documentation(self):
         quick = (ROOT/'docs/quickstart.md').read_text().split('## Numbered reply\n')[1].split('## Dry run')[0]
         self.assertIn('Handle judgments_needed as in Plan and execute before continuing.', quick)
@@ -133,7 +151,7 @@ class KitTextTests(unittest.TestCase):
 
     def test_routine_quickstart_size_and_entry_points(self):
         path = ROOT / 'docs/quickstart.md'
-        self.assertLessEqual(len(path.read_bytes()), 15200)
+        self.assertLessEqual(len(path.read_bytes()), 16400)
         self.assertLessEqual(len(re.findall(r'\]\(setup\.md(?:#|\))', path.read_text())), 3)
         for name in ('README.md', 'AGENTS.md', '.agents/skills/email-triage/SKILL.md'):
             self.assertIn('docs/quickstart.md', (ROOT / name).read_text())
@@ -146,8 +164,8 @@ class KitTextTests(unittest.TestCase):
             self.assertIn(term, text)
 
     def test_reference_size_caps(self):
-        self.assertLessEqual((ROOT / 'docs/setup.md').stat().st_size, 42000)
-        self.assertLessEqual((ROOT / 'docs/hosted-setup.md').stat().st_size, 16300)
+        self.assertLessEqual((ROOT / 'docs/setup.md').stat().st_size, 49000)
+        self.assertLessEqual((ROOT / 'docs/hosted-setup.md').stat().st_size, 18200)
         self.assertLess((ROOT / 'AGENTS.md').stat().st_size, 8000)
 
     def test_common_exceptions_are_self_contained(self):
@@ -229,6 +247,19 @@ class KitTextTests(unittest.TestCase):
             self.assertIn('triage.py message --token TOKEN', text)
             self.assertIn('Post its output unchanged.', text)
         self.assertNotIn('Needs you items appear here once', (ROOT / 'scripts/triage.py').read_text())
+
+    def test_r181_approved_send_promise(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import triage
+        promise = "pigeon never sends anything without the owner's approval."
+        for name in ('README.md', 'AGENTS.md', 'docs/quickstart.md', 'docs/setup.md', 'docs/hosted-setup.md', 'config/guardrails.example.md', '.agents/skills/email-triage/SKILL.md'):
+            self.assertIn(promise, (ROOT/name).read_text(), name)
+            self.assertIn('N forward HANDLE', (ROOT/name).read_text(), name)
+            self.assertIn('N reenviar HANDLE', (ROOT/name).read_text(), name)
+        for path in [ROOT/'README.md', ROOT/'AGENTS.md', ROOT/'CLAUDE.md', ROOT/'CHANGELOG.md', * (ROOT/'docs').glob('*.md'), * (ROOT/'config').glob('*'), * (ROOT/'scripts').glob('*.py'), ROOT/'.agents/skills/email-triage/SKILL.md']:
+            self.assertNotRegex(path.read_text(), r'(?i)(?:pigeon|kit) (?:never sends[.;]|never sends anything[.;]|cannot send[.;])', str(path))
+        for verb in ('send', 'enviar', 'trash', 'archive', 'spam', 'leave', 'yes', 'no', 'move to Filed', 'forward marble', 'reenviar marble'):
+            self.assertEqual(len(triage.parse_reply('1 '+verb)), 1)
 
     def test_si6_no_send_setting(self):
         config = tomllib.loads((ROOT / 'config/config.example.toml').read_text())
@@ -714,12 +745,12 @@ class ConverterDocumentationTests(unittest.TestCase):
 class DraftDocumentationTests(unittest.TestCase):
     def test_draft_contract(self):
         setup = setup_text()
-        for value in ('| draft |', '| draft_text |', '| draft_to |', 'check Drafts by hand', 'Send drafts by hand from the mailbox.', 'search', 'describe', '_drafts'):
+        for value in ('| draft |', '| draft_text |', '| draft_to |', 'check Drafts by hand', 'Without a provider, send drafts by hand from the mailbox.', 'search', 'describe', '_drafts'):
             self.assertIn(value, setup)
-        self.assertIn('Create and show issued drafts. Never send them.', (ROOT/'config/guardrails.example.md').read_text())
+        self.assertIn('Create and show issued drafts. Never send without the owner’s approval.', (ROOT/'config/guardrails.example.md').read_text())
         quick = (ROOT/'docs/quickstart.md').read_text()
         self.assertIn('create-draft', quick)
-        self.assertLessEqual(len(quick.encode()),15200)
+        self.assertLessEqual(len(quick.encode()),16400)
 
 
 class ScriptedListingTextTests(unittest.TestCase):
@@ -727,4 +758,4 @@ class ScriptedListingTextTests(unittest.TestCase):
         text = (Path(__file__).resolve().parents[1] / 'docs/quickstart.md').read_text()
         self.assertIn('triage.py listing --token TOKEN', text)
         self.assertIn('triage.py listing --token TOKEN --results', text)
-        self.assertLessEqual(len(text.encode()), 15200)
+        self.assertLessEqual(len(text.encode()), 16400)
