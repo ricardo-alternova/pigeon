@@ -136,6 +136,20 @@ class Guards(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('deny-term', result.stdout)
 
+    def test_pre_push_exempts_retired_paths(self):
+        self.git('commit', '-qm', 'Initial')
+        base = self.git('rev-parse', 'HEAD').strip()
+        self.write('docs/migrate-rules.md', 'Retired guide')
+        self.git('add', '-f', 'docs/migrate-rules.md')
+        self.git('-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'Add retired guide')
+        self.git('rm', '-q', 'docs/migrate-rules.md')
+        self.git('commit', '-qm', 'Remove retired guide')
+        head = self.git('rev-parse', 'HEAD').strip()
+        result = subprocess.run(['sh', 'hooks/pre-push'], cwd=self.repo, env=self.env,
+                                input='refs/heads/main ' + head + ' refs/heads/main ' + base + '\n',
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_fixture_domains_are_allowed_only_in_the_invented_inbox_and_report(self):
         sender = 'info@' + 'mail.example.net'
         self.assertIn('address', checker.rules(sender))

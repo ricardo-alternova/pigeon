@@ -96,8 +96,6 @@ class KitTextTests(unittest.TestCase):
         for path in documents:
             text = path.read_text()
             for target in re.findall(r'\[[^\]]*\]\(([^)]+)\)', text):
-                if path.name == 'AGENTS.md' and target == 'docs/migrate-rules.md':
-                    continue  # The agent instructions are scheduled for Task 15.
                 if '://' in target or target.startswith('mailto:'): continue
                 name, _, anchor = target.partition('#')
                 destination = (path.parent / name).resolve() if name else path
@@ -298,8 +296,6 @@ class KitTextTests(unittest.TestCase):
         for name in DOCS:
             path = ROOT / name
             for target in re.findall(r'\[[^\]]*\]\(([^)]+)\)', path.read_text()):
-                if name == 'AGENTS.md' and target == 'docs/migrate-rules.md':
-                    continue  # The agent instructions are scheduled for Task 15.
                 if re.match(r'[a-zA-Z]+:', target):
                     continue
                 filename, _, anchor = target.partition('#')
@@ -535,7 +531,7 @@ class SetupValidationTests(unittest.TestCase):
             for term in ('config.toml', 'language', 'inbox_limit', 'rules.md', 'UTF-8', 'guardrails.md'):
                 self.assertIn(term, result.stderr)
 
-    def test_setup_creates_only_examples_and_refuses_overwrite(self):
+    def test_setup_creates_missing_examples_and_keeps_existing_files(self):
         import tempfile, os
         with tempfile.TemporaryDirectory() as folder:
             store = Path(folder) / 'new'
@@ -550,8 +546,15 @@ class SetupValidationTests(unittest.TestCase):
                 self.assertTrue(Path(target.split('#')[0]).is_file(), target)
             before = {p.name: p.read_bytes() for p in store.iterdir()}
             self.assertEqual(set(before), {'config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md'})
-            self.assertNotEqual(subprocess.run(command, env=env, capture_output=True).returncode, 0)
+            self.assertEqual(subprocess.run(command, env=env, capture_output=True).returncode, 0)
             self.assertEqual(before, {p.name: p.read_bytes() for p in store.iterdir()})
+            (store / 'rules.md').unlink()
+            (store / 'rules.toml').write_text('[[rules]]\n')
+            self.assertEqual(subprocess.run(command, env=env, capture_output=True).returncode, 0)
+            after = {p.name: p.read_bytes() for p in store.iterdir()}
+            self.assertEqual(after.pop('rules.md'), (ROOT / 'rules/rules.example.md').read_bytes())
+            self.assertEqual(after.pop('rules.toml'), b'[[rules]]\n')
+            self.assertEqual(after, {k: v for k, v in before.items() if k != 'rules.md'})
 
     def test_gateway_account_validation_and_reads(self):
         sys.path.insert(0, str(ROOT / 'scripts'))

@@ -128,7 +128,7 @@ def main():
             name = raw.decode('utf-8', errors='strict')
             label = '[redacted-path]' if rules(name, terms, allowed=allowed) else name
             scan(label, raw)
-            if name not in ALLOWLIST and not (revision and not args.push and name in RETIRED_PATHS):
+            if name not in ALLOWLIST and not (revision and name in RETIRED_PATHS):
                 print(f'{label}:1: path-allowlist')
                 failed = True
                 continue

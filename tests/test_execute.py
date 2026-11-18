@@ -149,7 +149,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(self.plan_cli().returncode, 0)
         self.machine().step()
         triage.commit_state(self.store, self.token, self.path)
-        self.assertEqual(normalized(triage.render_message(self.store, self.token, self.path, None).encode()), normalized(b'\xf0\x9f\x93\xac Triage \xc2\xb7 Monday, 2026-11-16, 05:35 UTC \xc2\xb7 1 needs you \xc2\xb7 0 handled\n\nStill in Inbox (by account)\n\ncedar: 4\n1. a@example.net (4) \xc2\xb7 latest: move\nReply with a number and action, for example: 1 trash, 1 archive, 1 spam, 1 move to Reading, 1 leave, 1 yes, 1 no\n'))
+        self.assertEqual(normalized(triage.render_message(self.store, self.token, self.path, None).encode()), normalized(b'\xf0\x9f\x93\xac Triage \xc2\xb7 Monday, 2026-11-16, 05:35 UTC \xc2\xb7 1 needs you \xc2\xb7 0 handled\nrules: table at line 1\n\nStill in Inbox (by account)\n\ncedar: 4\n1. a@example.net (4) \xc2\xb7 latest: move\nReply with a number and action, for example: 1 trash, 1 archive, 1 spam, 1 move to Reading, 1 leave, 1 yes, 1 no\n'))
 
 
     def test_no_judgment_reply_keeps_initial_validation(self):
@@ -3061,6 +3061,16 @@ class ExecuteTests(unittest.TestCase):
         for text in (message, (self.store / 'report.md').read_text()):
             self.assertNotIn('cedar: 0', text)
             self.assertIn('marble: empty', text)
+
+    def test_batched_calls_strip_the_row_note(self):
+        self.batch_fixture()
+        (self.store / 'rules.md').write_text(rules_table('| t | subject: trash | trash, except orders | cedar | fixture |'))
+        self.plan = triage.build_plan(self.listing, self.read_rules(), [], triage.state_config(self.store))
+        self.plan['first_run'] = True
+        save_plan(self.store, self.token, self.path, self.plan)
+        batch = self.machine().step()
+        self.assertTrue(batch['calls'])
+        self.assertTrue(all('note' not in c for c in batch['calls']))
 
     def test_provider_account_without_gateway_ids_keeps_recipe_calls(self):
         self.batch_fixture()

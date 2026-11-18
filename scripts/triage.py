@@ -30,10 +30,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 VERBS = frozenset({'trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'})
 PLAN_VERBS = (VERBS - {'draft', 'report'}) | {'create-folder', 'create-draft', 'send-draft'}
 DRAFT_LIMIT = 10
-RULE_LIMIT_CAP = 50
 BRAKE_FLOOR = 10
 BODY_LIMIT = 2000
-QUESTION_LIMIT = 500
 STALE_SECONDS = 45 * 60
 TAKEOVER_MARGIN = 10 * 60
 REFRESH_MARGIN = 5 * 60
@@ -427,6 +425,7 @@ STATE_FILES = ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json'
                'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md',
                'rules.md', 'never-touch.toml', 'tool-paths.json', 'plan.json', 'inbox.json', 'state.json')
 STATE_LIMIT = 4 * 1024 * 1024
+LEGACY_RULES = 'rules.toml is no longer read; the rules belong in rules.md as a table'
 
 
 def state_setting(config):
@@ -662,7 +661,10 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
             trim_logs(store)
             data.update(phase='ready', hashes=fetched_hashes)
             save()
-            return {'done': True}
+            result = {'done': True}
+            if observed.get('rules.md') == 'absent' and (store / 'rules.toml').exists():
+                result['rules'] = LEGACY_RULES
+            return result
         if observation is None:
             contents = {n: state_bytes(store / n) for n in STATE_FILES if (store / n).exists()}
             plan_path = store / 'plan.json'
@@ -940,7 +942,7 @@ ACTION_WORDS = {'trash': 'trash', 'archive': 'archive', 'spam': 'spam',
                 'move': 'move', 'mover': 'move', 'unsubscribe': 'unsubscribe', 'baja': 'unsubscribe'}
 DOMAIN_TOKEN = r'(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?'
 CODE_SPAN = r'(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)'
-FILE_REFERENCE = re.compile(r"\]\(<?([^<>\n)]+)>?\)|`([^`]+\.(?:md|txt|csv))`|(?<![\w/@.])([\w./-]+\.(?:md|txt|csv))\b", re.I)
+FILE_REFERENCE = re.compile(r"\]\(<?(?!\w+://)([^<>\n)]+)>?\)|`([^`]+\.(?:md|txt|csv))`|(?<![\w/@.])([\w./-]+\.(?:md|txt|csv))\b", re.I)
 
 
 def row_patterns(cell):
@@ -966,9 +968,13 @@ def row_patterns(cell):
             tokens.append(('sender', token))
         elif re.fullmatch(DOMAIN_TOKEN, domain) and ('.' in domain or token.startswith('*.')):
             tokens.append(('domain', token.removeprefix('@')))
+        elif re.fullmatch(r'[^`]+\.(?:md|txt|csv)', word, re.I):
+            continue
         elif not spans:
             note = text[part.start():].strip()
             break
+        else:
+            raise ValueError('unrecognised backticked token')
     if spans:
         note = re.sub(CODE_SPAN, '', text).strip(' ,;-—')
     return tokens, subject, ' '.join(filter(None, [note, warning + exception])).strip()
@@ -1016,22 +1022,40 @@ def row_steps(cell):
 
 
 def read_rules(text, path, accounts, diagnostics=None):
-    rules, seen, skipped, warnings = [], set(), [], []
+    rules, seen, skipped, warnings, tables = [], set(), [], [], []
     directory = Path(path).resolve().parent
-    state = ''
+    state, header_line, fence = '', 0, ''
     for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        marker = re.match(r'(`{3,}|~{3,})', stripped)
+        if marker:
+            if fence:
+                if marker[1][0] == fence:
+                    fence = ''
+            else:
+                fence = marker[1][0]
+            state = ''
+            continue
+        if fence:
+            continue
         cells = table_cells(line)
+        if state == 'header':
+            if cells is not None and len(cells) == 5 and all(re.fullmatch(r':?-{3,}:?', c) for c in cells):
+                state = 'rows'
+            else:
+                warnings.append(f'rules: header at line {header_line} has no separator')
+                state = ''
+            continue
         if cells is None:
             state = ''
             continue
         header = tuple(re.match(r'\w*', unicodedata.normalize('NFC', c).casefold())[0] for c in cells)
         if header == RULE_HEADER:
-            state = 'header'
+            state, header_line = 'header', number
+            tables.append(number)
             continue
-        if state == 'header':
-            state = 'rows' if len(cells) == 5 and all(re.fullmatch(r':?-{3,}:?', c) for c in cells) else ''
-            continue
-        if state != 'rows':
+        if state != 'rows' or not stripped.startswith('|'):
+            state = ''
             continue
         ident, pattern, action, scope, source = (cells + [''] * 5)[:5]
         name = ident or f'line {number}'
@@ -1053,24 +1077,33 @@ def read_rules(text, path, accounts, diagnostics=None):
             known = [handle for handle in handles if handle in accounts]
             if not known:
                 raise ValueError('no configured account in scope')
+            reference_text = re.sub(r'(?<!\]\()https?://\S+', '', pattern + ' ' + action, flags=re.I)
+            refs = (a or b or c for a, b, c in FILE_REFERENCE.findall(reference_text))
+            non_files = {value for _, value in tokens} | {step['target'].casefold() for step in steps if 'target' in step}
+            files = []
+            for ref in dict.fromkeys(refs):
+                if ref.casefold() in non_files:
+                    continue
+                if Path(ref).is_absolute() or '..' in Path(ref).parts:
+                    raise ValueError('file reference outside the rules folder')
+                resolved = (directory / ref).resolve()
+                if not resolved.is_relative_to(directory):
+                    raise ValueError('file reference outside the rules folder')
+                files.append(dict(path=str(resolved), ref=ref))
         except ValueError as error:
             skipped.append(f'Rule {chat_text(name)} (line {number}) not used: {error}')
             continue
         if len(known) < len(handles):
             warnings.append(f'Rule {chat_text(name)} (line {number}): unknown account ignored: ' +
                             ', '.join(chat_text(handle) for handle in handles if handle not in accounts))
-        reference_text = re.sub(r'(?<!\]\()https?://\S+', '', pattern + ' ' + action, flags=re.I)
-        refs = (a or b or c for a, b, c in FILE_REFERENCE.findall(reference_text))
-        non_files = {value for _, value in tokens} | {step['target'].casefold() for step in steps if 'target' in step}
-        files = list(dict.fromkeys(directory / ref for ref in refs if ref.casefold() not in non_files))
         base = dict(id=name, line=number, accounts=known, steps=steps, source=source,
-                    note=' '.join(filter(None, [note, action_note])), files=[str(file) for file in files])
+                    note=' '.join(filter(None, [note, action_note])), files=files)
         if subject is not None:
             base['subject'] = subject
         rules.extend(base | ({kind: value} if kind else {}) for kind, value in (tokens or [(None, None)]))
     if diagnostics is not None:
         diagnostics.extend([f'rules: {len({r["line"] for r in rules})} rows read, {len(skipped)} not used',
-                            *skipped, *warnings])
+                            *[f'rules: table at line {n}' for n in tables], *skipped, *warnings])
     return rules
 
 
@@ -1895,9 +1928,9 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
             selected = filing.get((message['account'], message['id'])) or (select_rule(message, candidates) if selections is None else next(iter(candidates), None))
             for rule in [selected] if selected is not None else []:
                 if 'steps' in rule:
-                    missing = next((file for file in rule['files'] if not Path(file).is_file()), None)
+                    missing = next((file for file in rule['files'] if not Path(file['path']).is_file()), None)
                     if missing is not None:
-                        reason = f'Needs {missing}, which is not available'
+                        reason = f"Needs {missing['ref']}, which is not available"
                         break
                     agent = [step['agent'] for step in rule['steps'] if 'agent' in step]
                     if agent:
@@ -1905,7 +1938,6 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                         break
                     steps = rule['steps']
                     key = (rule['id'], message['account'])
-                    hits[key] = hits.get(key, 0) + 1
                     if len(steps) == 2:
                         url = message.get('unsubscribe_url', '')
                         if not safe_unsubscribe_host(url) or message.get('spam') or message.get('phishing'):
@@ -1913,6 +1945,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                             break
                         actions.append(dict(account=message['account'], id=message['id'], rule=rule['id'],
                                             action='unsubscribe', url=url))
+                    hits[key] = hits.get(key, 0) + 1
                     rule = rule | dict(action=steps[-1]['verb'], target=steps[-1].get('target'))
                 if rule.get('keep_latest'):
                     date = received_date(message)
@@ -3724,31 +3757,28 @@ def rule_cases(store, config, rules, holds):
         validate_inputs(dict(accounts={case['account']:1},messages=[message]),config,{})
         sender = normalize_sender(message['sender'])
         message['sender'] = sender
-        case_rules, case_holds, missing = rules, holds, False
+        case_rules, case_holds = rules, holds
         if any('judgment' in r for r in rules + holds):
             fixture = dict(accounts={case['account']: 1}, messages=[message])
             needed = judgments_needed(fixture, rules, holds, 'case')
             document = dict(binding=needed['binding'], answers=case.get('judgments', []))
             answers = judgment_answers(needed, document)
-            missing = any(p['pair'][0] == 'rule' and tuple(p['pair']) not in answers for p in needed['pairs'])
-            case_rules = [r for i, r in enumerate(rules) if 'judgment' not in r or answers.get(('rule', i, message['account'], 'case'), {}).get('answer', False)]
+            case_rules = [{k: v for k, v in r.items() if k != 'judgment'} for i, r in enumerate(rules) if 'judgment' not in r or answers.get(('rule', i, message['account'], 'case'), {}).get('answer', False)]
             asked = {tuple(p['pair']) for p in needed['pairs']}
-            case_holds = [r for i, r in enumerate(holds) if 'judgment' not in r or (('never-touch', i, message['account'], 'case') in asked and answers.get(('never-touch', i, message['account'], 'case'), {}).get('answer', True))]
+            case_holds = [{k: v for k, v in r.items() if k != 'judgment'} for i, r in enumerate(holds) if 'judgment' not in r or (('never-touch', i, message['account'], 'case') in asked and answers.get(('never-touch', i, message['account'], 'case'), {}).get('answer', True))]
         elif 'judgments' in case:
             judgment_answers(dict(binding='case', pairs=[]), dict(binding='case', answers=case['judgments']))
         found, rule_id = 'none', None
         if sender is not None:
-            if any(matches(message, h, protection=True) for h in case_holds):
+            plan = build_plan(dict(accounts={case['account']: 1}, messages=[message]), case_rules, case_holds, config)
+            actions = [a for a in plan['actions'] if (a['account'], a['id']) == (case['account'], 'case')]
+            if actions:
+                found, rule_id = actions[-1]['action'], actions[0]['rule']
+            elif plan['decisions'] and plan['decisions'][0]['reason'] == 'Protected by never-touch':
                 found = 'never-touch'
             else:
-                rule = None if missing else select_rule(message, case_rules)
-                if rule is not None and not rule.get('keep_latest'):
-                    rule_id = rule['id']
-                    if 'steps' in rule:
-                        if not any('agent' in step for step in rule['steps']) and all(Path(file).is_file() for file in rule['files']):
-                            found = rule['steps'][0]['verb']
-                    else:
-                        found = rule['action']
+                rule = select_rule(message, case_rules)
+                rule_id = rule['id'] if rule is not None else None
         if found != case['expect'] or ('expect_rule' in case and case['expect_rule'] != rule_id):
             expected_rule = case.get('expect_rule')
             failures.append(safe_text(name) + ': expected ' + case['expect'] + (' rule ' + safe_text(expected_rule) if expected_rule else '') + ', found ' + found + (' rule ' + safe_text(rule_id) if rule_id else ''))
@@ -4561,18 +4591,17 @@ def _main(argv=None, *, now=None):
                     'guardrails.md': 'config/guardrails.example.md',
                     'rules.md': 'rules/rules.example.md',
                     'never-touch.toml': 'rules/never-touch.example.toml'}
-        for name in examples:
-            if (store / name).exists() or (store / name).is_symlink():
-                raise ValueError(str(store / name) + ': expected no existing setup file')
         root = Path(__file__).resolve().parents[1]
         contents = {name: read_text(root / source) for name, source in examples.items()}
         contents['guardrails.md'] = re.sub(r'\]\(\.\./([^)]*)\)', lambda m: '](' + str(root) + '/' + m[1] + ')', contents['guardrails.md'])
         store.mkdir(parents=True, exist_ok=True, mode=0o700)
         store.chmod(0o700)
-        for name, content in contents.items():
+        for name in examples:
+            if (store / name).exists() or (store / name).is_symlink():
+                continue
             with (store / name).open('x', encoding='utf-8') as out:
                 os.chmod(out.name, 0o600)
-                out.write(content)
+                out.write(contents[name])
         print(str(store) + ': next run python3 scripts/triage.py validate')
         return
     store = private_store()
@@ -4599,6 +4628,8 @@ def _main(argv=None, *, now=None):
     elif args.command == 'validate':
         diagnostics = []
         config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md')], diagnostics)
+        if (store / 'rules.toml').exists():
+            diagnostics.append(LEGACY_RULES)
         print('\n'.join(diagnostics))
         for rule in rules:
             if 'after_send' in rule and any(not config['accounts'][a].get('provider') for a in rule['accounts']):
@@ -4706,6 +4737,8 @@ def _main(argv=None, *, now=None):
         if getattr(args, 'draft_check_results', None):
             protected.add(Path(args.draft_check_results).resolve())
         protected.add(store / 'judgments-needed.json')
+        if (store / 'rules.toml').exists():
+            protected.add(store / 'rules.toml')
         protected = {p.resolve() for p in protected}
         protected |= {p.resolve() for p in store.glob('execution-*.json')}
         for name in (args.plan_out, args.report_out):
@@ -4732,6 +4765,8 @@ def _main(argv=None, *, now=None):
                             raise ValueError('dry run: real approval plan at --plan-out; use a separate rehearsal file')
                 diagnostics = []
                 config, rules, holds = load_safety(sources, diagnostics)
+                if (store / 'rules.toml').exists():
+                    diagnostics.append(LEGACY_RULES)
                 try:
                     listing = json.loads(load_inputs([args.inbox])[0])
                 except ValueError as error:
@@ -4841,8 +4876,7 @@ def _main(argv=None, *, now=None):
                             raise
                         refusal = str(error)
                         result = build_plan(listing, [], holds, config, previous, ['Reply refused: ' + ' '.join(refusal.split())])
-                if args.command == 'plan':
-                    result['rule_diagnostics'] = diagnostics
+                result['rule_diagnostics'] = diagnostics
                 if args.command == 'plan' and config.get('calendars'):
                     data = parse_json(load_inputs([args.calendar])[0], args.calendar) if args.calendar else {}
                     result['calendar_section'] = calendar_section(data, config, now or datetime.now(timezone.utc))

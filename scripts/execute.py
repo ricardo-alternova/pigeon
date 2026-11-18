@@ -882,7 +882,7 @@ class Execution:
                             if ready is None or ready['status'] != 'executed':
                                 break
                         calls.append(candidate)
-                    issued = [dict(c) | triage.gateway_account(config, c['account'])
+                    issued = [{key: value for key, value in c.items() if key != 'note'} | triage.gateway_account(config, c['account'])
                               | triage.saved_tool(self.store, c['account'], c['action']) for c in calls]
                     for original, routed in zip(calls, issued):
                         if original['action'] == 'move' and 'target_path' in original:

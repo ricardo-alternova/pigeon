@@ -44,6 +44,4 @@ Follow [Numbered reply](docs/quickstart.md#numbered-reply).
 
 ## Writing a rule
 
-A numbered reply, including N yes or N no to a question rule, never writes a rule. Propose a rule in a separate chat message containing the exact entry as it would appear in rules.toml, proposing one entry and nothing else. Only a plain yes answering that message authorizes writing; any other answer writes nothing. Holding the run lock, after fetch-state, the assistant appends exactly that entry to rules.toml. The next plan command validates the rules before any mailbox action. Complete send-state to send the saved files back before releasing the lock, following Release.
-
-For importing an existing rule list, follow [docs/migrate-rules.md](docs/migrate-rules.md).
+A numbered reply, including N yes or N no to a question rule, never writes a rule. Propose a rule in a separate chat message containing the exact row as it would appear in the rules table, proposing one row and nothing else. Only a plain yes answering that message authorizes writing; any other answer writes nothing. Holding the run lock, after fetch-state, the assistant appends exactly that row to rules.md. The next plan command validates the rules before any mailbox action. Complete send-state to send the saved files back before releasing the lock, following Release.

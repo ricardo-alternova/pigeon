@@ -159,4 +159,4 @@ def save_plan(store, token, path, plan):
 def rules_table(*rows):
     header = '| ID | Patrón | Acción | Alcance | Fuente |'
     separator = '| --- | --- | --- | --- | --- |'
-    return '\n'.join((header, separator, *rows)) + '\n' if rows else header + '\n'
+    return '\n'.join((header, separator, *rows)) + '\n'

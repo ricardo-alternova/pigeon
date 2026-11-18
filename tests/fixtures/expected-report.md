@@ -1,4 +1,5 @@
 rules: 9 rows read, 0 not used
+rules: table at line 3
 Inbox: 12 messages · work 1 · home 11
 
 Still in Inbox (by account)

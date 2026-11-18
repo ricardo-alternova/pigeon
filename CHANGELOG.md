@@ -18,9 +18,6 @@ Add read-only calendar invitations, overlaps and a winning calendar to reports a
 - Create reply and forward drafts from rule text and recipients; show full drafts and keep originals in Inbox.
 - Retain draft IDs and uncertain creation records across runs; send only with the owner’s numbered approval.
 
-- Switch individual rules off with enabled = false.
-- Convert five-column Markdown rules tables with scope mappings and a review list.
-
 - Batch drive acquisition and finish exchanges with conditional lock exclusion.
 - Accept post-action message membership and require a final Inbox reading before commit.
 - Refresh held locks and flag execution responses near expiry.

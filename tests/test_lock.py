@@ -2300,6 +2300,14 @@ class DriveStateTests(unittest.TestCase):
         self.assertEqual(len(self.exchange('fetch')['calls']), len(triage.STATE_FILES))
         self.assertEqual(list(incoming.iterdir()), [])
 
+    def test_fetch_reports_legacy_rules_toml(self):
+        self.configured()
+        (self.store / 'rules.md').unlink()
+        (self.store / 'rules.toml').write_text('[[rules]]\n')
+        issued = self.exchange('fetch')
+        observed = {call['name']: self.drive.file_call(call)['status'] for call in issued['calls']}
+        self.assertEqual(self.exchange('fetch', observed), {'done': True, 'rules': triage.LEGACY_RULES})
+
     def test_all_log_tails_fetch_and_send(self):
         self.configured()
         records = {
