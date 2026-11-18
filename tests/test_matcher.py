@@ -148,35 +148,6 @@ class MatcherTests(unittest.TestCase):
             actual = self.plan()
             self.assertEqual([json.dumps(actual), triage.render_report(actual, self.listing), triage.render_remaining(actual, self.listing)], expected)
 
-    def test_subdomain_boundary_and_specificity(self):
-        self.batch(1, verb='archive')
-        self.rules = [dict(id='base', accounts=['cedar'], domain='example.org', action='archive'),
-                      dict(id='sub', accounts=['cedar'], domain='*.example.org', action='spam'),
-                      dict(id='exact', accounts=['cedar'], sender='a@' + 'b.mail.example.org', action='report')]
-        for sender, expected in [('a@example.org', 'base'), ('a@' + 'MAIL.EXAMPLE.ORG', 'sub'),
-                                 ('a@' + 'b.mail.example.org', None), ('b@' + 'b.mail.example.org', 'sub'),
-                                 ('a@' + 'notexample.org', None), ('a@' + 'example.org.evil.test', None)]:
-            self.listing['messages'][0]['sender'] = sender
-            with self.subTest(sender=sender):
-                plan = self.plan()
-                self.assertEqual([x['rule'] for x in plan['actions']], [] if expected is None else [expected])
-        self.listing['messages'][0]['sender'] = 'b@' + 'b.mail.example.org'
-        self.holds = [dict(domain='EXAMPLE.ORG')]
-        self.assertEqual(self.plan()['actions'], [])
-        self.assertEqual(self.plan()['decisions'][0]['reason'], 'Protected by never-touch')
-
-    def test_published_examples_keep_plan(self):
-        from unittest.mock import patch
-        current = self.plan()
-        original = triage.matches
-        def exact_domain(message, rule, protection=False):
-            if not protection and 'domain' in rule and message['sender'].rsplit('@', 1)[-1].casefold() != rule['domain'].casefold().rstrip('.'):
-                return False
-            return original(message, rule, protection)
-        with patch.object(triage, 'matches', exact_domain):
-            self.assertEqual(current, self.plan())
-        self.assertEqual([a['id'] for a in current['actions']], ['m1', 'm4'])
-
     def test_unsubscribe_fallback_actions_and_safety(self):
         self.batch(1, verb='unsubscribe')
         message = self.listing['messages'][0]
@@ -1755,7 +1726,7 @@ class AuditSelectionTests(unittest.TestCase):
             message = dict(account='cedar', sender=sender, subject='')
             rule = dict(accounts=['cedar'], domain='example.org')
             self.assertFalse(triage.matches(message, rule))
-            self.assertTrue(triage.matches(message, rule, protection=True))
+            self.assertFalse(triage.matches(message, rule, protection=True))
 
     def test_validate_specificity_reproduction(self):
         rules = [dict(id='vendor-archive', accounts=['marble'], domain='example.org', action='archive'),

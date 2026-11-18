@@ -38,11 +38,11 @@ Put the UTF-8 Markdown table in `rules.md` in your private store. Setup copies a
 - **Alcance** is `todas` or a comma- or space-separated list of account handles. A blank Alcance is not `todas`; the row is not used. Validate reports unknown handles and rows it could not use.
 - **Fuente** is informational. If Patrón or Acción refers to a file, the planner checks for it inside the rules folder before planning actions. If the file is missing, the message stays in Inbox and the report says why.
 
-A table domain is exact: `example.org` does not match `mail.example.org`; write `*.example.org` for subdomains. Never-touch is different: its domains include subdomains.
+In rules and never-touch, `example.org` matches that domain exactly. `*.example.org` matches its subdomains only. Write both to cover the domain and its subdomains.
 
 A never-touch address or domain always wins. A never-touch category only asks: answer false to protect the message, and a true answer lets the row act. Otherwise exact senders outrank domains and domain wildcards, which outrank subject-only rows. Earlier rows break ties.
 
-Never-touch is `never-touch.toml`, a TOML file with `[[rules]]` entries with optional accounts, sender, domain, subject, has_attachment and judgment. Require sender, domain, subject or judgment. Domains include subdomains. Sender matching ignores +tags. Subjects are case-insensitive Python regular expressions that must not match empty text. A judgment entry is a category asked in the question for matched mail, not a match of its own. An empty never-touch file is refused unless it explicitly sets `allow_empty = true`.
+Never-touch is `never-touch.toml`, a TOML file with `[[rules]]` entries with optional accounts, sender, domain, subject, has_attachment and judgment. Require sender, domain, subject or judgment. A domain entry is `example.org` or `*.example.org`. Sender matching ignores +tags. Subjects are case-insensitive Python regular expressions that must not match empty text. A judgment entry is a category asked in the question for matched mail, not a match of its own. An empty never-touch file is refused unless it explicitly sets `allow_empty = true`.
 
 ## Questions for matched mail
 

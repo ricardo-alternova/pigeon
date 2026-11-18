@@ -816,7 +816,7 @@ RULE_KINDS = {'never-touch.toml': {'accounts': {'type': 'array',
                                  'allowed_values': None,
                                  'limits': {'min_length': 1},
                                  'actions': ['protect'],
-                                 'meaning': 'Sender domain and its subdomains.'},
+                                 'meaning': 'Sender domain exactly. Use *.example.com for its subdomains only.'},
                       'subject': {'type': 'string',
                                   'allowed_values': None,
                                   'limits': {'min_length': 1},
@@ -860,6 +860,8 @@ def validate_holds(holds):
             if 'judgment' in hold and not hold['judgment'].strip():
                 raise ValueError('judgment: expected a non-blank category')
             validate_predicate(hold, category='judgment' in hold)
+            if 'domain' in hold and not domain_pattern(hold['domain']):
+                raise ValueError('domain: expected example.com or *.example.com')
         except ValueError as error:
             raise ValueError(('never-touch entry ' + str(i)) + ': ' + str(error)) from error
 
@@ -892,7 +894,8 @@ def parse_holds(text):
     if not isinstance(entries, list) or (not entries and data.get('allow_empty') is not True):
         raise ValueError('rules: expected an array of tables' if not isinstance(entries, list) else 'Never-touch requires entries or allow_empty = true')
     validate_holds(entries)
-    return entries
+    return [dict(entry, domain=domain_pattern(entry['domain'])) if 'domain' in entry else entry
+            for entry in entries]
 
 
 def table_cells(line):
@@ -941,6 +944,15 @@ CODE_SPAN = r'(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)'
 FILE_REFERENCE = re.compile(r"\]\(<?(?!\w+://)([^<>\n)]+)>?\)|`([^`]+\.(?:md|txt|csv))`|(?<![\w/@.])([\w./-]+\.(?:md|txt|csv))\b", re.I)
 
 
+def domain_pattern(text):
+    """Read an exact domain or a wildcard for its subdomains."""
+    token = text.casefold().removeprefix('@')
+    domain = token.removeprefix('*.')
+    if re.fullmatch(DOMAIN_TOKEN, domain) and ('.' in domain or token.startswith('*.')):
+        return token
+    return None
+
+
 def row_patterns(cell):
     text, warning, exception = cell.partition('⚠')
     spans = list(re.finditer(CODE_SPAN, text))
@@ -957,13 +969,12 @@ def row_patterns(cell):
                 break
             continue
         token = word.casefold().rstrip(';:')
-        domain = token.removeprefix('*.').removeprefix('@')
         if token in {'y', 'o', 'and', 'or', '/', ',', '+'}:
             continue
         if re.fullmatch(r'[^\s@<>;,`*]+@' + DOMAIN_TOKEN, token) and '.' in token.rsplit('@', 1)[1]:
             tokens.append(('sender', token))
-        elif re.fullmatch(DOMAIN_TOKEN, domain) and ('.' in domain or token.startswith('*.')):
-            tokens.append(('domain', token.removeprefix('@')))
+        elif domain := domain_pattern(token):
+            tokens.append(('domain', domain))
         elif re.fullmatch(r'[^`]+\.(?:md|txt|csv)', word, re.I):
             continue
         elif not spans:
@@ -1160,16 +1171,9 @@ def matches(message, rule, protection=False):
         return False
     if 'domain' in rule:
         domain = sender.rsplit('@', 1)[-1]
-        wanted = rule['domain'].casefold().rstrip('.')
-        if not protection and any(not label for label in domain.split('.')):
-            return False
-        if protection:
-            if domain != wanted and not domain.endswith('.' + wanted):
-                return False
-        elif wanted.startswith('*.'):
-            if not domain.endswith(wanted[1:]):
-                return False
-        elif domain != wanted:
+        wanted = rule['domain'].casefold()
+        domain_matches = domain.endswith(wanted[1:]) if wanted.startswith('*.') else domain == wanted
+        if not domain_matches or '' in domain.split('.'):
             return False
     if 'subject' in rule:
         if protection:
@@ -4644,6 +4648,10 @@ def _main(argv=None, *, now=None):
         if (store / 'rules.toml').exists():
             diagnostics.append(LEGACY_RULES)
         print('\n'.join(diagnostics))
+        for hold in holds:
+            domain = hold.get('domain')
+            if domain and not domain.startswith('*.'):
+                print(f'never-touch {domain} matches {domain} only; write *.{domain} for its subdomains')
         for rule in rules:
             if 'after_send' in rule and any(not config['accounts'][a].get('provider') for a in rule['accounts']):
                 raise ValueError('after_send: configured provider required for every rule account')
