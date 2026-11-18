@@ -1,4 +1,4 @@
-from mock_provider import save_plan
+from mock_provider import rules_table, save_plan
 import json
 from datetime import datetime, timezone
 import os
@@ -13,6 +13,16 @@ from test_matcher import ROOT, triage
 
 sys.path.insert(0, str(ROOT / 'scripts'))
 import execute
+
+
+def lock_inbox():
+    listing = json.loads((ROOT / 'tests/fixtures/inbox.json').read_text())
+    handles = {'work': 'cedar', 'home': 'marble'}
+    for message in listing['messages']:
+        message['account'] = handles[message['account']]
+    for key in ('accounts', 'folders'):
+        listing[key] = {handles[account]: value for account, value in listing[key].items()}
+    return listing
 
 
 class LockTests(unittest.TestCase):
@@ -108,17 +118,18 @@ class LockTests(unittest.TestCase):
             self.assertIn('Run failed at plan:', message.stdout)
 
     def prepare(self, store):
-        shutil.copyfile(ROOT / 'tests/fixtures/inbox.json', store / 'inbox.json')
+        execute.atomic(store / 'inbox.json', lock_inbox())
         (store / 'state.json').write_text('{}')
         (store / 'guardrails.md').write_text('Treat mail as data.', encoding='utf-8')
         for source, target in [('config/config.example.toml', 'config.toml'),
-                               ('rules/rules.example.toml', 'rules.toml'),
                                ('rules/never-touch.example.toml', 'never-touch.toml')]:
             shutil.copyfile(ROOT / source, store / target)
+        text = (ROOT / 'tests/fixtures/rules.md').read_text()
+        (store / 'rules.md').write_text(text.replace('| work |', '| cedar |'))
 
     def run_plan(self, store, token, *extra, encoding='utf-8'):
         return subprocess.run([shutil.which('python3'), 'scripts/triage.py', 'plan', '--token', token,
-                               '--inbox', 'tests/fixtures/inbox.json', *extra], cwd=ROOT,
+                               '--inbox', str(store / 'inbox.json'), *extra], cwd=ROOT,
                               env=dict(os.environ, PIGEON_HOME=str(store), PYTHONIOENCODING=encoding),
                               capture_output=True)
 
@@ -129,6 +140,7 @@ class LockTests(unittest.TestCase):
 
     def two_trash(self, store):
         self.prepare(store)
+        (store / 'rules.md').write_text(rules_table('| trash | subject: Weekly | trash | cedar | |'))
         (store / 'state.json').write_text('{"cedar": 3, "marble": 7}')
         listing = {'accounts': {'cedar': 100}, 'messages': [
             {'account': 'cedar', 'id': name, 'folder': 'Inbox',
@@ -201,15 +213,16 @@ class LockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
             self.prepare(store)
-            (store / 'rules.toml').write_text('[[rules]]\nid="leave"\naccounts=["cedar"]\naction="unsubscribe"\nsubject="Weekly"\n')
-            listing = json.loads((ROOT / 'tests/fixtures/inbox.json').read_text())
-            listing['messages'][0]['unsubscribe_url'] = 'https://example.net/leave'
+            (store / 'rules.md').write_text(rules_table('| leave | subject: Weekly | unsubscribe | cedar | fixture |'))
+            listing = lock_inbox()
+            message = next(m for m in listing['messages'] if m['account'] == 'cedar')
+            message.update(subject='Weekly', unsubscribe_url='https://example.net/leave')
             (store / 'inbox.json').write_text(json.dumps(listing))
             token = triage.acquire(store)
             result = self.run_plan(store, token, '--inbox', str(store / 'inbox.json'), '--plan-out', str(store / 'plan.json'))
             self.assertEqual(result.returncode, 0, result.stderr)
             path = store / 'results.json'
-            entry = dict(account='cedar', id='m1', action='unsubscribe', status='executed')
+            entry = dict(account='cedar', id=message['id'], action='unsubscribe', status='executed')
             import execute
             from unittest.mock import patch
             machine = execute.Execution(store, token, store / 'plan.json')
@@ -217,7 +230,8 @@ class LockTests(unittest.TestCase):
             with patch.object(execute.unsubscribe, 'request', return_value='executed'):
                 machine.step(local=True)
             self.assertEqual(self.run_commit(store, token, '--results', str(path)).returncode, 0)
-            self.assertEqual(json.loads((store / 'state.json').read_text())['cedar'], 3)
+            self.assertEqual(json.loads((store / 'state.json').read_text())['cedar'],
+                             sum(m['account'] == 'cedar' for m in listing['messages']))
             entry['decrement'] = True
             path.write_text(json.dumps({'results': [entry]}))
             result = self.run_commit(store, token, '--results', str(path))
@@ -460,7 +474,7 @@ class LockTests(unittest.TestCase):
             token = triage.acquire(store)
             with patch.dict(os.environ, PIGEON_HOME=tmp), patch('builtins.print', side_effect=BrokenPipeError):
                 with self.assertRaises(BrokenPipeError):
-                    triage.main(['plan', '--token', token, '--inbox', str(ROOT / 'tests/fixtures/inbox.json'),
+                    triage.main(['plan', '--token', token, '--inbox', str(store / 'inbox.json'),
                                  '--plan-out', str(store / 'plan.json')])
             self.assertTrue((store / 'state.json').is_file())
             self.assertIsInstance(json.loads((store / 'state.json').read_text()), dict)
@@ -470,7 +484,7 @@ class LockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
             self.prepare(store)
-            for name in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md', 'upload-observation.json', 'state.json', 'run.lock', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'execution-probe.json'):
+            for name in ('config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md', 'upload-observation.json', 'state.json', 'run.lock', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'execution-probe.json'):
                 for flag in ('--plan-out', '--report-out'):
                     token = triage.acquire(store)
                     if not (store / name).exists():
@@ -489,7 +503,7 @@ class LockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
             self.prepare(store)
-            listing = json.loads((ROOT / 'tests/fixtures/inbox.json').read_text())
+            listing = lock_inbox()
             listing['accounts']['slate'] = 5
             (store / 'extra.json').write_text(json.dumps(listing))
             (store / 'inbox.json').write_text(json.dumps(listing))
@@ -502,24 +516,13 @@ class LockTests(unittest.TestCase):
             self.assertEqual(set(json.loads((store / 'state.json').read_text())), {'_next_number', '_run_counter', 'version', 'cedar', 'marble'})
             self.assertEqual(self.run_plan(store, token).returncode, 0)
 
-    def test_invalid_regex_cli_refusal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Path(tmp)
-            self.prepare(store)
-            (store / 'rules.toml').write_text('[[rules]]\nid="bad"\naccounts=["cedar"]\naction="archive"\nsubject="(unclosed"\n')
-            token = triage.acquire(store)
-            result = self.run_plan(store, token)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertTrue(result.stderr.startswith(b'Refused: '))
-            self.assertIn(b"rules.toml: rule 'bad': subject: Invalid subject regex", result.stderr)
-            self.assertNotIn(b'Traceback', result.stderr)
 
     def test_stopped_run_saves_observed_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
             self.prepare(store)
             (store / 'state.json').write_text('{"cedar": 3, "marble": 3}')
-            listing = json.loads((ROOT / 'tests/fixtures/inbox.json').read_text())
+            listing = lock_inbox()
             listing['messages'] = []
             inbox = store / 'inbox.json'
             inbox.write_text(json.dumps(listing))
@@ -539,10 +542,10 @@ class LockTests(unittest.TestCase):
             store = Path(tmp)
             self.prepare(store)
             (store / 'state.json').write_text('{"cedar": 3, "marble": 3}')
-            listing = json.loads((ROOT / 'tests/fixtures/inbox.json').read_text())
+            listing = lock_inbox()
             inbox = store / 'inbox.json'
-            omitted = dict(listing, accounts={'marble': 5}, messages=[m for m in listing['messages'] if m['account'] == 'marble'])
-            empty = dict(listing, accounts={'cedar': 5, 'marble': 5}, messages=omitted['messages'])
+            omitted = dict(listing, accounts={'marble': 100}, folders={'marble': listing['folders']['marble']}, messages=[m for m in listing['messages'] if m['account'] == 'marble'])
+            empty = dict(listing, accounts={'cedar': 100, 'marble': 100}, messages=omitted['messages'])
             for data in (omitted, omitted, empty):
                 inbox.write_text(json.dumps(data))
                 token = triage.acquire(store)
@@ -584,14 +587,8 @@ class PathTypoTests(unittest.TestCase):
 
     def test_refusals_identify_source_and_setting(self):
         cases = [
-            ('rules.toml', lambda s: 'rules = false', 'rules: expected an array of tables'),
             ('config.toml', lambda s: s + '\nlangauge="en"\n', 'config.accounts.marble.langauge'),
             ('config.toml', lambda s: s.replace('inbox_limit = 100', 'inbox_limit = false'), 'config.inbox_limit'),
-            ('rules.toml', lambda s: s.replace('"cedar", "marble"', '"ceder"'), "rule 'digest': account 'ceder'"),
-            ('rules.toml', lambda s: s.replace('subject = "Weekly"', 'subject = 42'), "rule 'digest': subject: expected a non-empty string"),
-            ('rules.toml', lambda s: s.replace('has_attachment = true', 'has_attachment = "yes"'), "rule 'receipts': has_attachment"),
-            ('rules.toml', lambda s: s.replace('id = "receipts"', 'id = "digest"'), "rule 'digest': Duplicate rule id"),
-            ('rules.toml', lambda s: s.replace('exclusions = ["invoice", "question"]', ''), "rule 'digest': Trash rule requires exclusions"),
             ('never-touch.toml', lambda s: s.replace('"cedar", "marble"', '"ceder"'), "entry 1: account 'ceder'"),
             ('never-touch.toml', lambda s: 'allow_empty = "yes"', 'allow_empty: expected boolean'),
             ('state.json', lambda s: '{"cedar": -1}', 'state.json.cedar: expected a non-negative integer count'),
@@ -608,7 +605,7 @@ class PathTypoTests(unittest.TestCase):
                 self.assertIn(str(path) + ':', text)
                 self.assertIn(expected, text)
                 self.assertNotIn('\\_', text)
-                for other in {'config.toml', 'rules.toml', 'never-touch.toml', 'state.json'} - {filename}:
+                for other in {'config.toml', 'rules.md', 'never-touch.toml', 'state.json'} - {filename}:
                     self.assertNotIn(str(store / other) + ':', text)
 
     def test_busy_lock_names_expiry(self):
@@ -908,7 +905,7 @@ class QuietTests(unittest.TestCase):
         with patch.object(triage, 'datetime', Clock), patch.object(triage.time, 'time', return_value=self.now.timestamp()), patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
             triage.main(['quiet-check', '--token', token, '--scheduled', '--observation', str(self.obs)])
         self.assertEqual(json.loads(output.getvalue())['reason'], 'always-full slot')
-        for name, text in [('rules.toml', 'rules=[]\n'), ('never-touch.toml', 'allow_empty=true\n'), ('guardrails.md', 'fixture policy\n'), ('inbox.json', '{"accounts":{"cedar":100,"marble":100},"messages":[]}')]:
+        for name, text in [('rules.md', rules_table()), ('never-touch.toml', 'allow_empty=true\n'), ('guardrails.md', 'fixture policy\n'), ('inbox.json', '{"accounts":{"cedar":100,"marble":100},"messages":[]}')]:
             (self.store / name).write_text(text)
         output = io.StringIO()
         output.reconfigure = lambda **kwargs: None
@@ -1106,7 +1103,7 @@ class DriveLockTests(unittest.TestCase):
         from unittest.mock import patch
         token = self.acquire()
         path = self.store / 'plan.json'
-        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'rules.md').write_text(rules_table())
         (self.store/'never-touch.toml').write_text('allow_empty=true\n')
         save_plan(self.store, token, path, dict(dry_run=True))
         with patch.object(triage, 'private_store', return_value=self.store), patch.object(triage, 'drive_lock', side_effect=AssertionError('drive call')):
@@ -1133,7 +1130,7 @@ class DriveLockTests(unittest.TestCase):
 
     def test_finish_batches_uploads_then_conditional_release(self):
         token = self.acquire()
-        (self.store / 'rules.toml').write_text('rules=[]\n')
+        (self.store / 'rules.md').write_text(rules_table())
         (self.store / 'never-touch.toml').write_text('allow_empty=true\n')
         listing = execute.read(self.store / 'inbox.json')
         plan = triage.build_plan(listing, [], [], triage.state_config(self.store), {})
@@ -1364,8 +1361,13 @@ class DriveLockTests(unittest.TestCase):
                 triage.main(['plan', '--token', token, '--inbox', str(self.store / 'inbox.json'), '--plan-out', str(self.store / 'plan.json')])
             machine = execute.Execution(self.store, token, self.store / 'plan.json')
             from mock_provider import MockProvider
-            while not machine.step().get('done'):
-                machine.step(MockProvider([]))
+            from unittest.mock import patch
+            while not (call := machine.step()).get('done'):
+                if 'run' in call:
+                    with patch.object(execute.unsubscribe, 'request', return_value='executed'):
+                        machine.step(local=True)
+                else:
+                    machine.step(MockProvider([]))
             read = self.start('commit', token)
             self.assertEqual(read['call']['operation'], 'read')
             self.assertEqual(self.observe(self.drive.perform(read['call']), 'commit', token), 'verified')
@@ -1716,28 +1718,6 @@ class DriveStateTests(unittest.TestCase):
             result = self.exchange('send', observation)
         return names, result
 
-    def test_r174_documented_migration_install_drive(self):
-        self.configured('onedrive')
-        self.fetch()
-        self.send()
-        call = self.start('release', self.token)['call']
-        self.observe(self.drive.perform(call), 'release', self.token)
-        self.token = self.acquire()
-        install = (ROOT/'docs/migrate-rules.md').read_text().split('Between runs,')[1]
-        if 'fetch-state' in install:
-            self.fetch()
-        migrated = '[[rules]]\nid="migrated"\naccounts=["cedar"]\nsubject="Migration"\naction="archive"\n'
-        (self.store/'rules.toml').write_text(migrated)
-        if 'send-state' in install:
-            self.send()
-        call = self.start('release', self.token)['call']
-        self.observe(self.drive.perform(call), 'release', self.token)
-        self.token = self.acquire()
-        self.fetch()
-        listing = dict(accounts={'cedar':100}, messages=[dict(account='cedar', id='migration', sender='news@example.org', subject='Migration', folder='Inbox')])
-        config, rules, holds = triage.load_safety([self.store/n for n in ('config.toml','rules.toml','never-touch.toml','guardrails.md')])
-        plan = triage.build_plan(listing, rules, holds, config)
-        self.assertEqual([a['rule'] for a in plan['actions']], ['migrated'])
 
     def test_r149_malformed_log_counters_drive(self):
         for value in ['x', None, True, -1, 1.5, 10 ** 100]:
@@ -1764,7 +1744,7 @@ class DriveStateTests(unittest.TestCase):
         self.fetch()
         config = (self.store/'config.toml').read_text()
         guardrails = (self.store/'guardrails.md').read_text()
-        (self.store/'rules.toml').write_text('rules=[]\n')
+        (self.store/'rules.md').write_text(rules_table())
         (self.store/'never-touch.toml').write_text('allow_empty=true\n')
         messages = [dict(account='cedar',id='budget',folder='Inbox',sender='boss@example.org',subject='Budget')]
         def command(module, *args):
@@ -1892,7 +1872,7 @@ class DriveStateTests(unittest.TestCase):
                 if drive_lock:
                     config += '\n[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n'
                 (store/'config.toml').write_text(config)
-                (store/'rules.toml').write_text('[[rules]]\nid="r"\naccounts=["cedar"]\nsubject="move"\naction="archive"\n')
+                (store/'rules.md').write_text(rules_table('| r | subject: move | archive | cedar | fixture |'))
                 (store/'never-touch.toml').write_text('allow_empty=true\n')
                 listing = dict(accounts={'cedar':4}, messages=[dict(account='cedar',id=str(i),sender='a@example.net',subject='move',folder='Inbox') for i in range(4)])
                 execute.atomic(store/'inbox.json', listing)
@@ -1980,7 +1960,7 @@ class DriveStateTests(unittest.TestCase):
         self.fetch()
         config = (self.store/'config.toml').read_text()
         (self.store/'config.toml').write_text(config.replace('inbox_limit = 100', 'inbox_limit = 1'))
-        (self.store/'rules.toml').write_text('[[rules]]\nid="r"\naccounts=["cedar"]\nsubject="move"\naction="archive"\n')
+        (self.store/'rules.md').write_text(rules_table('| r | subject: move | archive | cedar | fixture |'))
         (self.store/'never-touch.toml').write_text('allow_empty=true\n')
         listing = dict(accounts={'cedar':4}, messages=[dict(account='cedar',id=str(i),sender='a@example.net',subject='move',folder='Inbox') for i in range(4)])
         execute.atomic(self.store/'inbox.json', listing)
@@ -2006,7 +1986,7 @@ class DriveStateTests(unittest.TestCase):
         command(triage, ['plan','--token',self.token,'--inbox',str(self.store/'inbox.json'),'--plan-out',str(path)])
         if reply_origin:
             (self.store/'config.toml').write_text(config)
-            (self.store/'rules.toml').write_text('rules=[]\n')
+            (self.store/'rules.md').write_text(rules_table())
             listing['messages'] = [dict(listing['messages'][0],id=str(i)) for i in range(12)]
             listing['accounts']['cedar']=12
             execute.atomic(self.store/'inbox.json',listing)
@@ -2228,9 +2208,9 @@ class DriveStateTests(unittest.TestCase):
     def test_finish_drive_state_batch(self):
         token = self.configured()
         self.fetch()
-        (self.store / 'rules.toml').write_text('rules=[]\n')
+        (self.store / 'rules.md').write_text(rules_table())
         (self.store / 'never-touch.toml').write_text('allow_empty=true\n')
-        shutil.copyfile(ROOT / 'tests/fixtures/inbox.json', self.store / 'inbox.json')
+        execute.atomic(self.store / 'inbox.json', lock_inbox())
         listing = execute.read(self.store / 'inbox.json')
         plan = triage.build_plan(listing, [], [], triage.state_config(self.store), {})
         path = self.store / 'plan.json'
@@ -2343,7 +2323,7 @@ class DriveStateTests(unittest.TestCase):
     def test_logs_bounded_at_fetch_boundary(self):
         self.configured()
         line = b'2026-11-11T08:00:00+00:00 skipped: no new mail\n'
-        for name in ('rules.toml', 'never-touch.toml'):
+        for name in ('rules.md', 'never-touch.toml'):
             self.drive.files[name] = (self.store / name).read_bytes()
         self.drive.files['history.log'] = line * 10000
         self.fetch()
@@ -2365,7 +2345,7 @@ class DriveStateTests(unittest.TestCase):
         (self.store / 'state.json').unlink()
         self.assertEqual(self.fetch(), {'done': True})
         self.assertFalse((self.store / 'state.json').exists())
-        self.assertTrue((self.store / 'rules.toml').exists())
+        self.assertTrue((self.store / 'rules.md').exists())
         listing = {'accounts': {'cedar': 100}, 'messages': [dict(account='cedar', id='x', folder='Inbox', sender='helper@example.org', subject='Question')]}
         plan = triage.build_plan(listing, [], [], triage.state_config(self.store))
         triage.number_decisions(self.store, plan, listing)
@@ -2394,7 +2374,7 @@ class DriveStateTests(unittest.TestCase):
         self.configured()
         result = self.exchange('fetch')
         self.assertTrue(all(c['kind'] == 'gdrive' for c in result['calls']))
-        self.assertEqual(tuple(c['name'] for c in result['calls']), ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json', 'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md', 'rules.toml', 'never-touch.toml', 'tool-paths.json', 'plan.json', 'inbox.json', 'state.json'))
+        self.assertEqual(tuple(c['name'] for c in result['calls']), ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json', 'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md', 'rules.md', 'never-touch.toml', 'tool-paths.json', 'plan.json', 'inbox.json', 'state.json'))
 
     def test_state_config_refusals(self):
         for value in (None, [], {}, {'kind': 'typo'}, {'kind': 'local', 'account': 'a'},
@@ -2445,7 +2425,7 @@ class DriveStateTests(unittest.TestCase):
     def test_bad_downloads_all_formats(self):
         self.configured()
         for filename, content in [('state.json', b'{"cedar":-1}'), ('numbers.json', b'{"next":0,"items":[]}'),
-                                  ('rules.toml', b'rules=false'), ('never-touch.toml', b'allow_empty=false'),
+                                  ('never-touch.toml', b'allow_empty=false'),
                                   ('unsubscribe-secret', b'bad'), ('unsubscribe-failures.json', b'{"senders":["bad"]}'),
                                   ('decisions.jsonl', b'{}\n'), ('calls.jsonl', b'{}\n'),
                                   ('history.log', b'wrong\n'), ('run-message.md', b'\x00'),
@@ -2511,7 +2491,7 @@ class DriveStateTests(unittest.TestCase):
 
     def test_skip_only_history_changed(self):
         self.configured()
-        for name in ('rules.toml', 'never-touch.toml', 'state.json'):
+        for name in ('rules.md', 'never-touch.toml', 'state.json'):
             self.drive.files[name] = (self.store / name).read_bytes()
         self.fetch()
         (self.store / 'history.log').write_text('2026-11-11T08:00:00+00:00 skipped: no new mail\n')
@@ -2519,7 +2499,7 @@ class DriveStateTests(unittest.TestCase):
 
     def test_stopped_and_refused_send_only_changed_files(self):
         self.configured()
-        for name in ('rules.toml', 'never-touch.toml', 'state.json'):
+        for name in ('rules.md', 'never-touch.toml', 'state.json'):
             self.drive.files[name] = (self.store / name).read_bytes()
         self.fetch()
         self.assertEqual(self.send()[0], [])
@@ -2564,10 +2544,10 @@ class DriveStateTests(unittest.TestCase):
         self.assertEqual(machine.step(execute.AssistantProvider(dict(outcome='ok', inbox_ids=[])))['status'], 'executed')
         self.assertEqual(machine.step(), {'done': True})
         self.commit()
-        (self.store / 'rules.toml').write_text('rules=[]\n')
+        (self.store / 'rules.md').write_text(rules_table())
         names, _ = self.send()
         self.assertIn('decisions.jsonl', names)
-        self.assertIn('rules.toml', names)
+        self.assertIn('rules.md', names)
         self.assertEqual(json.loads(self.drive.files['decisions.jsonl'])['parts'][0]['outcome'], 'executed')
         self.assertNotIn('config.toml', names)
         self.assertNotIn('guardrails.md', names)
@@ -2591,7 +2571,7 @@ class DriveStateTests(unittest.TestCase):
         self.configured()
         config = triage.state_config(self.store)
         cases = [
-            ('rules.toml', b'[[rules]]\nid="r"\naccounts=["unknown"]\nsender="helper@example.org"\naction="archive"'),
+            ('rules.md', b'\xff'),
             ('decisions.jsonl', json.dumps(dict(run='r', time='2026-11-11T08:00:00', parts=[])).encode()),
             ('decisions.jsonl', json.dumps(dict(run='r', time=self.now.isoformat(), parts=[dict(number=0,account='cedar',id='x',verb='leave',target=None,outcome='answered')])).encode()),
             ('calls.jsonl', json.dumps(dict(sequence=0,time=0,run='r',account='cedar',id='x',verb='trash',outcome='issued')).encode()),
@@ -2704,7 +2684,7 @@ class DriveStateTests(unittest.TestCase):
         config['schedule'] = dict(weekdays=['08:00'], weekends=['08:00'], always_full=[])
         previous = {'cedar': 1, 'marble': 0, '_positions': {'cedar': '100', 'marble': []}}
         self.drive.files['state.json'] = json.dumps(previous).encode()
-        for name in ('rules.toml', 'never-touch.toml'):
+        for name in ('rules.md', 'never-touch.toml'):
             self.drive.files[name] = (self.store / name).read_bytes()
         self.fetch()
         obs = self.store / 'quiet-observation.json'
@@ -2715,7 +2695,7 @@ class DriveStateTests(unittest.TestCase):
     def test_stopped_plan_commits_and_uploads_observed_counts(self):
         import execute
         self.configured()
-        for name in ('rules.toml', 'never-touch.toml'):
+        for name in ('rules.md', 'never-touch.toml'):
             self.drive.files[name] = (self.store / name).read_bytes()
         self.drive.files['state.json'] = b'{"cedar":3}'
         self.fetch()
@@ -2872,7 +2852,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     def test_send_refuses_invalid_local_file_before_upload(self):
         self.configured()
         self.fetch()
-        (self.store / 'rules.toml').write_text('rules=false\n')
+        (self.store / 'rules.md').write_bytes(b'\xff')
         call = self.exchange('send')['call']
         observation = self.store / 'state-lock-observation.json'
         observation.write_text(json.dumps(self.drive.perform(call)))
@@ -2922,8 +2902,7 @@ class ParserRefusalTests(unittest.TestCase):
                 ('numbers.json', '?', lambda p: triage.read_numbers(store)),
                 ('state-observation.json', '?', triage.state_observation),
                 ('lock-observation.json', '?', triage.lock_observation),
-                ('rules.toml', '[', lambda p: triage.parse_rules(p.read_text())),
-                ('never-touch.toml', '[', lambda p: triage.parse_rules(p.read_text(), protection=True)),
+                ('never-touch.toml', '[', lambda p: triage.parse_holds(p.read_text())),
             ]
             for name, bad, read in cases:
                 with self.subTest(name=name):
@@ -2952,12 +2931,11 @@ class ParserRefusalTests(unittest.TestCase):
                     p = store / name
                     p.write_text(json.dumps(value))
                     self.assertEqual(read(p), value)
-            self.assertEqual(triage.parse_rules('rules=[]'), [])
-            self.assertEqual(triage.parse_rules('allow_empty=true', protection=True), [])
+            self.assertEqual(triage.parse_holds('allow_empty=true'), [])
 
     def test_utf8_refusals_and_valid_text(self):
         with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / 'rules.toml'
+            p = Path(tmp) / 'rules.md'
             p.write_bytes(b'\xff')
             for read in (triage.state_bytes, lambda p: triage.load_inputs([p])):
                 with self.subTest(read=read):
@@ -2965,9 +2943,9 @@ class ParserRefusalTests(unittest.TestCase):
                         read(p)
                     self.assertIn(str(p), str(caught.exception))
                     self.assertIn('UTF-8', str(caught.exception))
-            p.write_text('rules=[]\n')
-            self.assertEqual(triage.state_bytes(p), b'rules=[]\n')
-            self.assertEqual(triage.load_inputs([p]), ['rules=[]\n'])
+            p.write_text(rules_table())
+            self.assertEqual(triage.state_bytes(p), rules_table().encode())
+            self.assertEqual(triage.load_inputs([p]), [rules_table()])
 
     def test_history_read_description_matches_saved_position(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3067,7 +3045,6 @@ class ParserRefusalTests(unittest.TestCase):
     def test_saved_rule_file_refusals_name_file(self):
         config = {'accounts': {'cedar': {}}}
         cases = {
-            'rules.toml': ('[[rules]]\nid="bad"\naccounts=["cedar"]\nsender="x@example.org"\naction="trash"\n', 'exclusions'),
             'never-touch.toml': ('[[rules]]\naccounts=["other"]\nsender="x@example.org"\n', 'unconfigured account'),
         }
         with tempfile.TemporaryDirectory() as tmp:

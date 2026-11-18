@@ -36,13 +36,12 @@ tests/fixtures/*
 !.gitignore
 !.agents/skills/email-triage/SKILL.md
 !.claude/skills
-!docs/migrate-rules.md
 !docs/setup.md
 !docs/hosted-setup.md
 !docs/quickstart.md
 !config/config.example.toml
 !config/guardrails.example.md
-!rules/rules.example.toml
+!rules/rules.example.md
 !rules/never-touch.example.toml
 !scripts/triage.py
 !scripts/leak_check.py
@@ -53,8 +52,10 @@ tests/fixtures/*
 !tests/test_matcher.py
 !tests/test_lock.py
 !tests/test_kit_text.py
+!tests/test_rules_table.py
 !tests/e2e.sh
 !tests/fixtures/inbox.json
+!tests/fixtures/rules.md
 !tests/fixtures/expected-report.md
 !scripts/execute.py
 !tests/mock_provider.py

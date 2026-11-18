@@ -8,13 +8,16 @@ import subprocess
 import sys
 
 ALLOWLIST = set('''CHANGELOG.md README.md LICENSE AGENTS.md CLAUDE.md .gitignore
-.agents/skills/email-triage/SKILL.md .claude/skills docs/setup.md docs/hosted-setup.md docs/quickstart.md docs/migrate-rules.md
+.agents/skills/email-triage/SKILL.md .claude/skills docs/setup.md docs/hosted-setup.md docs/quickstart.md
 config/config.example.toml config/guardrails.example.md
-rules/rules.example.toml rules/never-touch.example.toml
+rules/rules.example.md rules/never-touch.example.toml
 scripts/unsubscribe.py tests/test_unsubscribe.py scripts/triage.py scripts/execute.py tests/mock_provider.py tests/test_execute.py scripts/leak_check.py hooks/pre-commit hooks/pre-push
 .github/workflows/check.yml tests/test_leak_check.py tests/test_matcher.py
-tests/test_lock.py tests/test_kit_text.py tests/e2e.sh tests/fixtures/inbox.json
+tests/test_lock.py tests/test_kit_text.py tests/test_rules_table.py tests/e2e.sh tests/fixtures/inbox.json tests/fixtures/rules.md
 tests/fixtures/expected-report.md'''.split())
+FIXTURE_PATHS = {'tests/fixtures/inbox.json', 'tests/fixtures/expected-report.md'}
+FIXTURE_DOMAINS = {'mail.example.net', 'shop.example.org', 'lists.example.com'}
+RETIRED_PATHS = {'docs/migrate-rules.md', 'rules/rules.example.toml'}
 IDENTITY = '72031190+ricardo-alternova' + '@' + 'users.noreply.github.com'
 REMOTES = {'git' + '@' + 'github.com:ricardo-alternova/pigeon.git',
            'https://github.com/ricardo-alternova/pigeon'}
@@ -30,7 +33,7 @@ def git(*args):
     return subprocess.check_output(['git', *args], stderr=subprocess.DEVNULL)
 
 
-def rules(text, terms=(), metadata=False, allowed=()):
+def rules(text, terms=(), metadata=False, allowed=(), *, fixture=False):
     found = {name for name, pattern in PATTERNS.items()
              if re.search(pattern, re.sub(r'https?://[^\s<>"\'`,;?#()\[\]{}|\\]+', '', text) if name == 'home-path' else text, re.I)}
     original = text
@@ -44,7 +47,8 @@ def rules(text, terms=(), metadata=False, allowed=()):
         domain = match[1].lower().rstrip('.')
         if metadata and re.search(r'(?:^|[<\s])' + r'(?:noreply@github\.com|[0-9]+\+[\w-]+@users\.noreply\.github\.com)' + r'$', text[:match.end()]):
             continue
-        if domain not in {'example.com', 'example.org', 'example.net'} and not domain.endswith('.invalid'):
+        if (domain not in {'example.com', 'example.org', 'example.net'}
+                and not domain.endswith('.invalid') and not (fixture and domain in FIXTURE_DOMAINS)):
             found.add('address')
     if re.search(r'(?:git' r'://|ssh' r'://|git' r'@)[^\s\x22\x27<>]+|https?://[^/\s\x22\x27<>]*@|https?://[^\s\x22\x27<>]+\.git(?![\w-])', text):
         found.add('remote-url')
@@ -95,7 +99,7 @@ def main():
             parser.error('deny folder contains zero terms')
     failed = False
 
-    def scan(label, data, metadata=False):
+    def scan(label, data, metadata=False, *, fixture=False):
         nonlocal failed
         try:
             text = data.decode('utf-16' if data.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8')
@@ -106,7 +110,7 @@ def main():
             failed = True
             return
         for number, line in enumerate(text.splitlines(), 1):
-            for rule in sorted(rules(line, terms, metadata, allowed)):
+            for rule in sorted(rules(line, terms, metadata, allowed, fixture=fixture)):
                 print(f'{label}:{number}: {rule}')
                 failed = True
 
@@ -124,7 +128,7 @@ def main():
             name = raw.decode('utf-8', errors='strict')
             label = '[redacted-path]' if rules(name, terms, allowed=allowed) else name
             scan(label, raw)
-            if name not in ALLOWLIST:
+            if name not in ALLOWLIST and not (revision and not args.push and name in RETIRED_PATHS):
                 print(f'{label}:1: path-allowlist')
                 failed = True
                 continue
@@ -154,7 +158,7 @@ def main():
                         or '.agents/skills/email-triage/SKILL.md' not in names):
                     print(f'{label}:1: symlink')
                     failed = True
-            scan(label, data)
+            scan(label, data, fixture=name in FIXTURE_PATHS)
 
     if args.git_config:
         section = b''

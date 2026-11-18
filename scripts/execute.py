@@ -81,7 +81,7 @@ class Execution:
         triage.require_plan_token(self.plan, token)
         if self.plan.get('dry_run'):
             raise ValueError('dry-run plan: execution is refused; no call issued')
-        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'judgments', 'judgment_token', 'hand_sent'}, str(self.plan_path))
+        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'judgments', 'judgment_token', 'hand_sent', 'rule_diagnostics'}, str(self.plan_path))
         for key in ('actions', 'decisions', 'reasons'):
             if not isinstance(self.plan.get(key), list):
                 raise ValueError(str(self.plan_path) + '.' + key + ': expected an array')
@@ -90,7 +90,7 @@ class Execution:
         triage.known_keys(self.plan.get('counts'), set(self.plan.get('counts', {})), str(self.plan_path) + '.counts')
         creates = set()
         for action in self.plan['actions']:
-            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'digest', 'reason', 'judgment'}, str(self.plan_path) + '.actions')
+            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'digest', 'reason', 'judgment', 'note'}, str(self.plan_path) + '.actions')
             if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action', 'rule')):
                 raise ValueError(str(self.plan_path) + '.actions: expected account, id, action and rule strings')
             if 'target_path' in action:
@@ -194,7 +194,7 @@ class Execution:
             raise ValueError(label + '.pending: expected null or the next planned action')
         pending = self.state['pending']
         if pending is not None:
-            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to', 'digest', 'reason', 'judgment'}, label + '.pending')
+            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to', 'digest', 'reason', 'judgment', 'note'}, label + '.pending')
             if len(results) == len(self.plan['actions']) or pending != self.plan['actions'][len(results)]:
                 raise ValueError(label + '.pending: expected the next planned action unchanged')
 
@@ -202,8 +202,8 @@ class Execution:
         listing = read(self.store / 'inbox.json')
         triage.validate_actions(self.plan['actions'], listing)
         config = triage.parse_toml(triage.load_inputs([self.store / 'config.toml'])[0], self.store / 'config.toml')
-        rules = triage.parse_rules(triage.load_inputs([self.store / 'rules.toml'])[0])
-        holds = triage.parse_rules(triage.load_inputs([self.store / 'never-touch.toml'])[0], protection=True)
+        rules = triage.read_rules(triage.load_inputs([self.store / 'rules.md'])[0], self.store / 'rules.md', config['accounts'])
+        holds = triage.parse_holds(triage.load_inputs([self.store / 'never-touch.toml'])[0])
         previous = read(self.store / 'state.json') if (self.store / 'state.json').exists() else {}
         previous = triage.recover_drafts(self.store, previous, self.token)
         triage.validate_drafts(previous.get('_drafts', []), config)
@@ -427,7 +427,7 @@ class Execution:
         final = 'final_listing' in self.state
         items = triage.remaining_items(self.plan, listing, observed, final=final)
         if final:
-            holds = triage.parse_rules(triage.read_text(self.store / 'never-touch.toml'), protection=True)
+            holds = triage.parse_holds(triage.read_text(self.store / 'never-touch.toml'))
             messages = {(m['account'], m['id']): m for m in listing['messages']}
             for item in items:
                 if any(triage.matches(messages[item['account'], item['id']], rule, protection=True) for rule in holds if 'judgment' not in rule):
@@ -824,9 +824,11 @@ class Execution:
                     required = self.require_send_retirement()
                     if required:
                         return required
-                sent = next((r for a, r in zip(self.plan['actions'], self.state['results'])
-                             if a['action'] == 'send-draft' and (a['account'], a['id']) == (call['account'], call['id'])), None)
-                if call['action'] in triage.REMOVALS and sent is not None and sent['status'] != 'executed':
+                failed_prerequisite = any(
+                    a['action'] in {'send-draft', 'unsubscribe'} and r['status'] != 'executed'
+                    and (a['account'], a['id']) == (call['account'], call['id'])
+                    for a, r in zip(self.plan['actions'], self.state['results']))
+                if call['action'] in triage.REMOVALS and failed_prerequisite:
                     self.record(call, 'unexecuted')
                     self.log(call, 'unexecuted')
                     self.save()
@@ -907,7 +909,7 @@ class Execution:
                                     '--token', self.token, '--plan', str(self.plan_path)]}
                 config = triage.parse_toml(triage.read_text(self.store / 'config.toml'), 'config.toml')
                 routing = triage.gateway_account(config, call['account'])
-                issued = dict(call) | routing | triage.saved_tool(self.store, call['account'], call['action'])
+                issued = {key: value for key, value in call.items() if key != 'note'} | routing | triage.saved_tool(self.store, call['account'], call['action'])
                 if call['action'] == 'move' and 'target_path' in call:
                     issued['target'] = creation['folder_id']
                 if call['action'] == 'create-folder' and config['accounts'][call['account']].get('provider'):
@@ -1037,12 +1039,15 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
     temporary = tempfile.TemporaryDirectory(prefix='simulation-', dir=folder)
     scratch = Path(temporary.name)
     try:
-        for name in ('config.toml', 'rules.toml', 'never-touch.toml', 'guardrails.md',
+        for name in ('config.toml', 'never-touch.toml', 'guardrails.md',
                      'state.json', 'inbox.json', 'run.lock', 'state-exchange.json',
                      'quiet-check.json', 'tool-paths.json', 'numbers.json', 'decisions.jsonl',
                      'calls.jsonl', 'unsubscribe-failures.json', 'unsubscribe-secret'):
             if (store / name).is_file():
                 shutil.copyfile(store / name, scratch / name)
+        # Keep referenced paths relative to the original rules table during rehearsal.
+        if (store / 'rules.md').is_file():
+            (scratch / 'rules.md').symlink_to((store / 'rules.md').resolve())
         simulated_token = 'simulation-' + secrets.token_hex(24)
         held = read(scratch / 'run.lock')
         atomic(scratch / 'run.lock', held | dict(token=simulated_token))

@@ -232,7 +232,7 @@ Read history position/Inbox arrivals or ten newest ordered IDs; use error/expire
 
 ## Reference
 
-First installation/Gateway recipes: [Hosted setup](hosted-setup.md). Unsubscribe: [Advanced setup](setup.md); [Converter](setup.md#convert-a-rules-table).
+First installation/Gateway recipes: [Hosted setup](hosted-setup.md). Unsubscribe: [Advanced setup](setup.md); [Markdown rules](setup.md#rules).
 
 If plan returns draft-check calls, carry the array unchanged, save results, and repeat plan with `--draft-check-results FILE`. Remove the response afterward. This checks recorded after_send drafts and their conversations in Sent. Dry runs save responses under .dry-run.
 

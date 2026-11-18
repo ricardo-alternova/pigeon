@@ -10,7 +10,7 @@ Keep the first run attended:
 2. Check [host requirements](#host-requirements) and [storage choice](#storage-choice).
 3. Create the [private store](#private-store). Supply config.toml and guardrails.md from lasting host storage before every run.
 4. Connect the [gateway](#mail-gateway-connection); set [configuration](#configuration), [rules](setup.md#rules), never-touch and guardrails.
-5. For drive storage, set [drive lock](#drive-lock) and [drive state](#drive-state). Get the account handle (drive-example) from gateway search/describe and parent folder ID (folder-example) from metadata, not its name or sharing URL. Provision private parents. Supply local rules.toml and never-touch.toml for an empty drive folder.
+5. For drive storage, set [drive lock](#drive-lock) and [drive state](#drive-state). Get the account handle (drive-example) from gateway search/describe and parent folder ID (folder-example) from metadata, not its name or sharing URL. Provision private parents. Supply local rules.md and never-touch.toml for an empty drive folder.
 6. Run the [quick start](quickstart.md) attended once (no first-run flag) and try a numbered reply; then enable [scheduling](setup.md#scheduling).
 
 ## Storage choice
@@ -86,7 +86,7 @@ After uncertain acquisition wait 45 minutes from script start, then start fresh 
 
 Keep state and lock folders readable/writable only by the owner's own account, never shared or in a shared folder.
 
-After locking, fetch before reading state or mail. Download printed names to state-incoming: numbers.json, unsubscribe-secret, unsubscribe-failures.json, decisions.jsonl, calls.jsonl, history.log, run-message.md, rules.toml, never-touch.toml, tool-paths.json, plan.json, inbox.json, state.json. Open questions carry plan and listing; closing clears both with zero-byte uploads. Keep checkpoints, observations, config.toml and guardrails.md local. Follow [storage guardrails](../config/guardrails.example.md).
+After locking, fetch before reading state or mail. Download printed names to state-incoming: numbers.json, unsubscribe-secret, unsubscribe-failures.json, decisions.jsonl, calls.jsonl, history.log, run-message.md, rules.md, never-touch.toml, tool-paths.json, plan.json, inbox.json, state.json. Open questions carry plan and listing; closing clears both with zero-byte uploads. Keep checkpoints, observations, config.toml and guardrails.md local. Follow [storage guardrails](../config/guardrails.example.md).
 
 Return fetched, absent or failed per issued filename. Confirm absence through the gateway; classify uncertainty as failed; preserve local rules when absent remotely. Refuse an empty drive store when local records exist; correct state.folder or restore local records to that folder.
 
@@ -101,9 +101,6 @@ Use `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py finish-run --
 For every call use `{accountId,input}`. Replace APP in tool paths with accounts.HANDLE.executor_app and accountId with accounts.HANDLE.executor_account from config.toml. Use the[Inbox listing](#inbox-listing) and[quiet observation](quickstart.md#quiet-observations) formats for the saved values.
 
 Prefix table tools with tools.APP.; use tools["APP-SLUG"].rest for other app slugs. Pass action calls as printed.
-
-For conditional recipient/reply fields, extend only affected accounts using
-[Conditional rules](setup.md#conditional-rules); use the manual-part path.
 
 ### Gmail
 

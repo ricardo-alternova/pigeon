@@ -2,7 +2,7 @@
 
 pigeon never sends anything without the owner's approval. Sending is off by default. With allow_send=true, "N send" ("N enviar") sends an unchanged draft it created from a draft rule. "N forward HANDLE" ("N reenviar HANDLE") forwards one message to another configured account's address, with no added text, through the mailbox forward-draft operation. Both read the draft back before sending; at most five sends per reply. Rules, proceed and judgments can never send. It never composes mail or takes draft text or forward recipients from mail; replies use the mailbox reply operation. It never deletes permanently; the calendar stays read-only.
 
-pigeon is an MIT-licensed email triage kit. An AI assistant carries calls through an MCP mail gateway such as [Executor](https://executor.sh). The Python planner matches Inbox messages against private rules; the execution step machine issues actions in batches per account.
+pigeon is an MIT-licensed email triage kit. An AI assistant carries calls through an MCP mail gateway such as [Executor](https://executor.sh). The Python planner matches Inbox messages against a private Markdown rules table; the execution step machine issues actions in batches per account.
 
 ## Quick start
 
@@ -20,6 +20,9 @@ umask 077
 git config core.hooksPath hooks
 export PIGEON_HOME="$PWD/private/demo"
 python3 scripts/triage.py setup
+printf '[accounts.home]\n[accounts.work]\n' > "$PIGEON_HOME/config.toml"
+printf 'allow_empty=true\n' > "$PIGEON_HOME/never-touch.toml"
+cp tests/fixtures/rules.md "$PIGEON_HOME/rules.md"
 python3 scripts/triage.py validate
 token=$(python3 scripts/triage.py lock)
 trap 'python3 scripts/triage.py release --token "$token" 2>/dev/null || true' EXIT

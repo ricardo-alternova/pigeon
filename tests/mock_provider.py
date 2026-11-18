@@ -154,3 +154,9 @@ def save_plan(store, token, path, plan):
         output.unlink(missing_ok=True)
         if missing:
             guardrails.unlink()
+
+
+def rules_table(*rows):
+    header = '| ID | Patrón | Acción | Alcance | Fuente |'
+    separator = '| --- | --- | --- | --- | --- |'
+    return '\n'.join((header, separator, *rows)) + '\n' if rows else header + '\n'

@@ -1,4 +1,4 @@
-from mock_provider import save_plan
+from mock_provider import rules_table, save_plan
 import http.client
 import http.server
 import ipaddress
@@ -122,35 +122,18 @@ class FlowTests(unittest.TestCase):
         self.store = Path(self.temp.name)
         self.token = triage.acquire(self.store)
         (self.store / 'config.toml').write_text('[accounts.cedar]\n')
-        (self.store / 'rules.toml').write_text('[[rules]]\nid="leave"\naccounts=["cedar"]\nsubject="Weekly"\naction="unsubscribe"\nafter_unsubscribe="trash"\n')
+        (self.store / 'rules.md').write_text(rules_table('| leave | subject: Weekly | unsubscribe + trash | cedar | |'))
         (self.store / 'never-touch.toml').write_text('allow_empty=true\n')
         self.message = dict(account='cedar', id='m1', folder='Inbox', sender='a@example.net', subject='Weekly', unsubscribe_url='https://example.net/', unsubscribe_one_click=True)
 
     def machine(self):
         listing = dict(accounts={'cedar': 100}, messages=[self.message])
         execute.atomic(self.store / 'inbox.json', listing)
-        plan = triage.build_plan(listing, triage.parse_rules((self.store / 'rules.toml').read_text()), [], {'accounts': {'cedar': {}}})
+        path = self.store / 'rules.md'
+        plan = triage.build_plan(listing, triage.read_rules(path.read_text(), path, ['cedar']), [], {'accounts': {'cedar': {}}})
         plan['first_run'] = True
         save_plan(self.store, self.token, self.store / 'plan.json', plan)
         return execute.Execution(self.store, self.token, self.store / 'plan.json')
-
-    def test_fallback_executes_as_ordinary_removal(self):
-        with (self.store / 'rules.toml').open('a') as out:
-            out.write('unsubscribe_fallback="archive"\n')
-        self.message.pop('unsubscribe_url')
-        machine = self.machine()
-        self.assertEqual(machine.plan['actions'][0]['action'], 'archive')
-        self.assertEqual(machine.step()['action'], 'archive')
-
-    def test_fallback_never_follows_failed_attempt(self):
-        path = self.store / 'rules.toml'
-        path.write_text(path.read_text().replace('after_unsubscribe="trash"', 'unsubscribe_fallback="archive"'))
-        machine = self.machine()
-        machine.step()
-        with patch.object(client, 'request', return_value='failed'):
-            self.assertEqual(machine.step(local=True)['status'], 'failed')
-        self.assertTrue(machine.step()['done'])
-        self.assertEqual([r['action'] for r in execute.read(self.store / 'results.json')['results']], ['unsubscribe'])
 
     def test_unsafe_unsubscribe_is_decision_without_companion(self):
         for url, flags in [('mailto:leave@example.net', {}), ('http://example.net/', {}),
@@ -191,7 +174,7 @@ class FlowTests(unittest.TestCase):
         machine.step()
         with patch.object(client, 'request', return_value='failed') as request:
             self.assertEqual(machine.step(local=True)['status'], 'failed')
-            self.assertEqual(machine.step()['action'], 'trash')
+            self.assertTrue(machine.step()['done'])
             self.assertEqual(execute.read(self.store / 'results.json')['results'][0]['status'], 'failed')
             triage.release(self.store, self.token)
             self.token = triage.acquire(self.store)
@@ -215,8 +198,8 @@ class FlowTests(unittest.TestCase):
             self.assertEqual(machine.step(local=True), {'status': 'failed'})
         self.assertEqual(execute.read(self.store / 'results.json')['results'],
                          [dict(account='cedar', id='m1', action='unsubscribe', status='failed')])
-        self.assertEqual(machine.step()['action'], 'trash')
-        self.assertEqual(len(execute.read(self.store / 'results.json')['results']), 1)
+        self.assertTrue(machine.step()['done'])
+        self.assertEqual(execute.read(self.store / 'results.json')['results'][-1]['status'], 'unexecuted')
 
     def test_flags_and_strict_store(self):
         for flag in ('spam', 'phishing'):
@@ -293,9 +276,10 @@ class FlowTests(unittest.TestCase):
         listing['messages'] = [dict(self.message, id=str(i), sender='sender' + str(i) + '@example.net',
                                     unsubscribe_url='https://example.net/' if i == 2 else 'https://example.net/') for i in range(3)]
         execute.atomic(self.store / 'inbox.json', listing)
-        rules = triage.parse_rules((self.store / 'rules.toml').read_text())
-        rules[0].pop('after_unsubscribe')
-        (self.store / 'rules.toml').write_text('[[rules]]\nid="leave"\naccounts=["cedar"]\nsubject="Weekly"\naction="unsubscribe"\n')
+        path = self.store / 'rules.md'
+        text = rules_table('| leave | subject: Weekly | unsubscribe | cedar | |')
+        path.write_text(text)
+        rules = triage.read_rules(text, path, ['cedar'])
         plan = triage.build_plan(listing, rules, [], {'accounts': {'cedar': {}}})
         plan['first_run'] = True
         save_plan(self.store, self.token, self.store / 'plan.json', plan)

@@ -14,7 +14,7 @@ WALK_STORE="$scratch/scripted" python3 - <<'PYSCRIPTED'
 import json, os, re, subprocess, sys
 from pathlib import Path
 sys.path.insert(0,'tests')
-from mock_provider import MockGateway
+from mock_provider import MockGateway, rules_table
 store=Path(os.environ['WALK_STORE'])
 env={'PATH':os.environ['PATH'],'PIGEON_HOME':str(store)}
 def cli(*args):
@@ -24,7 +24,7 @@ def cli(*args):
 cli('scripts/triage.py','setup')
 config={'accounts':{a:dict(provider=p,address='reader@example.org',quiet_kind=k,executor_app=a+'-mail',executor_account=a+'-example') for a,p,k in [('cedar','gmail','history'),('marble','outlook','ids')]}}
 (store/'config.toml').write_text('inbox_limit=200\n'+'\n'.join('[accounts.'+a+']\n'+'\n'.join(k+'='+json.dumps(v) for k,v in f.items()) for a,f in config['accounts'].items()))
-(store/'rules.toml').write_text('[[rules]]\nid="file"\naccounts=["cedar","marble"]\nsubject="Weekly"\naction="archive"\n')
+(store/'rules.md').write_text(rules_table('| file | subject: Weekly | archive | todas | |'))
 (store/'never-touch.toml').write_text('allow_empty=true\n')
 cli('scripts/triage.py','validate')
 text=Path('docs/quickstart.md').read_text()
@@ -148,6 +148,13 @@ command=blocks[6].replace('--results /absolute/private-store/gateway-results.jso
 blocks[6]=command
 assert json.loads(run(6, token))['decision'] == 'full'
 listing = json.loads(Path('tests/fixtures/inbox.json').read_text())
+handles = {'home': 'cedar', 'work': 'marble'}
+listing['accounts'] = {handles[a]: total for a, total in listing['accounts'].items()}
+listing.pop('folders')
+for message in listing['messages']:
+    message['account'] = handles[message['account']]
+fixture_rules = Path('tests/fixtures/rules.md').read_text().splitlines()
+(store/'rules.md').write_text('\n'.join(row for row in fixture_rules if row.startswith(('| ID', '| ---', '| R1 |'))) + '\n')
 (store/'inbox.json').write_text(json.dumps(listing))
 run(7, token)
 ids = {a:[m['id'] for m in listing['messages'] if m['account']==a] for a in listing['accounts']}
@@ -194,6 +201,13 @@ def observed(command, value, token='', name='lock-observation.json'):
     (store/name).write_text(json.dumps(value))
     return run(command, token)
 original = json.loads(Path('tests/fixtures/inbox.json').read_text())
+handles = {'home': 'cedar', 'work': 'marble'}
+original['accounts'] = {handles[a]: total for a, total in original['accounts'].items()}
+original.pop('folders')
+for message in original['messages']:
+    message['account'] = handles[message['account']]
+fixture_rules = Path('tests/fixtures/rules.md').read_text().splitlines()
+(store/'rules.md').write_text('\n'.join(row for row in fixture_rules if row.startswith(('| ID', '| ---', '| R1 |'))) + '\n')
 for dry in (True, False):
     lock_calls = json.loads(run(blocks[0]))['calls']
     token = observed(blocks[1], dict(create=drive.perform(lock_calls[0]), read=drive.perform(lock_calls[1])))
@@ -285,58 +299,18 @@ def command(index, token='', observation=None, first=False):
                           capture_output=True,
                           env={'PATH': os.environ['PATH']})
 
-# A private fixture uses every accepted rule key and action and listing key.
-# Eleven body matches prove limit=12 overrides the default ten.
-rules = """
-[[rules]]
-id="dated"
-accounts=["cedar"]
-sender="billing@example.org"
-domain="example.org"
-subject="Invoice"
-body="paid"
-has_attachment=true
-exclusions=["retain"]
-action="move"
-target="Bills/{year}/{month}"
-limit=12
-
-[[rules]]
-id="question"
-accounts=["cedar"]
-subject="Renewal"
-action="report"
-question="Keep this renewal?"
-
-[[rules]]
-id="trash"
-accounts=["cedar"]
-subject="Discard"
-action="trash"
-exclusions=[]
-
-[[rules]]
-id="archive"
-accounts=["cedar"]
-subject="Receipt"
-action="archive"
-
-[[rules]]
-id="spam"
-accounts=["cedar"]
-subject="Offer"
-action="spam"
-
-[[rules]]
-id="unsubscribe"
-accounts=["cedar"]
-subject="Newsletter"
-action="unsubscribe"
-after_unsubscribe="archive"
-"""
-(store/'rules.toml').write_text(rules)
+rules = '''| ID | Patrón | Acción | Alcance | Fuente |
+| --- | --- | --- | --- | --- |
+| dated | subject: Invoice | move Bills/{year}/{month} | cedar | |
+| question | subject: Renewal | Keep this renewal? | cedar | |
+| trash | subject: Discard | trash | cedar | |
+| archive | subject: Receipt | archive | cedar | |
+| spam | subject: Offer | spam | cedar | |
+| unsubscribe | subject: Newsletter | unsubscribe + archive | cedar | |
+'''
+(store/'rules.md').write_text(rules)
 messages = []
-for i, subject in enumerate(['Invoice'] * 11 + ['Renewal', 'Discard', 'Receipt', 'Offer', 'Newsletter']):
+for i, subject in enumerate(['Invoice'] * 9 + ['Renewal', 'Discard', 'Receipt', 'Offer', 'Newsletter']):
     messages.append(dict(account='cedar', id='item-'+str(i), folder='Inbox',
                          sender='billing@example.org', sender_name='Billing', subject=subject,
                          has_attachment=True, spam=False, phishing=False, body='Paid',
@@ -369,8 +343,8 @@ else:
 (store/'plan.json').write_text(original)
 plan = json.loads(original)
 assert len([a for a in plan['actions'] if a['action'] == 'create-folder']) == 1
-assert len([a for a in plan['actions'] if a['action'] == 'move']) == 11
-assert plan['decisions'][0]['question'] == 'Keep this renewal?'
+assert len([a for a in plan['actions'] if a['action'] == 'move']) == 9
+assert plan['decisions'][0]['reason'] == 'Needs you: Keep this renewal?'
 ids = [m['id'] for m in messages]
 verbs = []
 while True:
@@ -405,14 +379,15 @@ assert final_message.count('Keep this renewal?') == 1
 
 assert 'extra' in (store/'execution-report.md').read_text()
 command(5, token)
-assert json.loads((store/'state.json').read_text()) == {'_next_number': 2, '_run_counter': 1, 'version': 1, 'cedar': 1, 'marble': 0}
+state = json.loads((store/'state.json').read_text())
+assert state == {'_next_number': 2, '_run_counter': 1, 'version': 1, 'cedar': 2, 'marble': 0}, state
 command(6, token)
 assert not (store/'run.lock').exists()
 
 # Full scheduled run -> quiet skip -> changed observation -> full, using the
 # current documented commands in fresh shells, with a fake report channel.
 (store/'config.toml').write_text('timezone="UTC"\n[schedule]\nweekdays=["00:00"]\nweekends=["00:00"]\nalways_full=[]\n[accounts.cedar]\nquiet_kind="history"\n[accounts.marble]\nquiet_kind="ids"\n')
-(store/'rules.toml').write_text('rules=[]\n')
+(store/'rules.md').write_text('| ID | Patrón | Acción | Alcance | Fuente |\n')
 (store/'never-touch.toml').write_text('allow_empty=true\n')
 observation = {'cedar': dict(outcome='ok', position='100', arrivals=[]),
                'marble': dict(outcome='ok', ids=[])}
@@ -533,7 +508,7 @@ def prepare(label):
     store = base / label
     store.mkdir()
     (store / 'config.toml').write_text('[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n[accounts.cedar]\n')
-    (store / 'rules.toml').write_text('rules=[]\n')
+    (store / 'rules.md').write_text('| ID | Patrón | Acción | Alcance | Fuente |\n')
     (store / 'never-touch.toml').write_text('allow_empty=true\n')
     (store / 'guardrails.md').write_text((root / 'config/guardrails.example.md').read_text())
     (store / 'inbox.json').write_text('{"accounts":{"cedar":10},"messages":[]}')
@@ -636,7 +611,7 @@ for iteration in (1, 2, 3, 4):
     (store/'config.toml').write_text('[schedule]\nweekdays=["00:00"]\nweekends=["00:00"]\nalways_full=[]\n[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n[state]\nkind="gdrive"\naccount="state-example"\nfolder="files-example"\n[accounts.cedar]\nquiet_kind="history"\n')
     (store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
     if iteration == 1:
-        (store/'rules.toml').write_text('rules=[]\n')
+        (store/'rules.md').write_text('| ID | Patrón | Acción | Alcance | Fuente |\n')
         (store/'never-touch.toml').write_text('allow_empty=true\n')
     print('run', iteration, 'create pigeon-run-lock conflict=fail -> guardrails.example.md:9 lock exchange')
     assert json.loads(run(store, blocks[0]))['call']['operation'] == 'create'
@@ -733,7 +708,10 @@ event = dict(id='event-a', start=start.isoformat(), end=(start+timedelta(hours=1
 (store/'calendar.json').write_text(json.dumps({'oak':[event], 'elm':[event]}))
 (store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
 (store/'never-touch.toml').write_text('allow_empty=true\n')
-(store/'rules.toml').write_text('[[rules]]\nid="d"\naccounts=["cedar"]\nsubject="Question"\naction="draft"\ndraft="reply"\ndraft_text="Owner prepared reply."\n')
+(store/'rules.md').write_text('''| ID | Patrón | Acción | Alcance | Fuente |
+| --- | --- | --- | --- | --- |
+| a | subject: Question | archive | cedar | |
+''')
 (store/'inbox.json').write_text(json.dumps(dict(accounts={'cedar':100},messages=[dict(account='cedar',id='original',folder='Inbox',sender='helper@example.org',subject='Question')])))
 token = run('triage.py','lock').strip()
 plan = str(store/'plan.json')
@@ -743,16 +721,16 @@ assert not (store/'state.json').exists() and not (store/'numbers.json').exists()
 run('triage.py','plan','--token',token,'--inbox',str(store/'inbox.json'),'--plan-out',plan,'--calendar',str(store/'calendar.json'))
 assert 'oak stays' in '\n'.join(json.loads((store/'plan.json').read_text())['calendar_section'])
 call = json.loads(run('execute.py','next','--token',token,'--plan',plan))
-assert call['action']=='create-draft' and call['draft_text']=='Owner prepared reply.'
-assert json.loads(run('execute.py','result','--token',token,'--plan',plan,'--observation',json.dumps(dict(outcome='ok',draft_id='draft-a'))))['status']=='executed'
+assert call['action']=='archive'
+assert json.loads(run('execute.py','result','--token',token,'--plan',plan,'--observation',json.dumps(dict(outcome='ok',inbox_ids=[]))))['status']=='executed'
 assert json.loads(run('execute.py','next','--token',token,'--plan',plan))['done']
 run('triage.py','commit-state','--token',token,'--plan',plan)
-assert json.loads((store/'state.json').read_text())['cedar']==1
+assert json.loads((store/'state.json').read_text())['cedar']==0
 message = run('triage.py','message','--token',token,'--plan',plan)
-assert 'Owner prepared reply.' in message and 'Calendar' in message and 'oak stays' in message
+assert 'Calendar' in message and 'oak stays' in message
 assert not any('calendar' in key for key in json.loads((store/'state.json').read_text()))
 run('triage.py','release','--token',token)
-print('PASS: draft rule creates once, preserves Inbox, saves id and shows whole text')
+print('PASS: calendar stays read-only during rehearsal and a Markdown-rule archive')
 PYDRAFT
 
 # Identity is fictional; the hook must refuse the private path, not bad content.
@@ -760,9 +738,9 @@ git config user.name 'Kit Test'
 git config user.email 'kit@example.com'
 git config commit.gpgsign false
 mkdir -p private/probe
-printf 'fixture only\n' > private/probe/rules.toml
-git check-ignore -q private/probe/rules.toml
-git add -f private/probe/rules.toml
+printf 'fixture only\n' > private/probe/rules.md
+git check-ignore -q private/probe/rules.md
+git add -f private/probe/rules.md
 before=$(git rev-parse HEAD)
 if git commit -m 'Test private path refusal' > "$scratch/refusal" 2>&1; then
     echo 'FAIL: private file commit succeeded' >&2

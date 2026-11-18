@@ -136,6 +136,14 @@ class Guards(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('deny-term', result.stdout)
 
+    def test_fixture_domains_are_allowed_only_in_the_invented_inbox_and_report(self):
+        sender = 'info@' + 'mail.example.net'
+        self.assertIn('address', checker.rules(sender))
+        self.assertNotIn('address', checker.rules(sender, fixture=True))
+        self.assertIn('address', checker.rules(sender + '.invalid.example', fixture=True))
+        self.assertIn('address', checker.rules(sender, terms=['mail.example.net']))
+        self.assertIn('deny-term', checker.rules(sender, terms=['mail.example.net'], fixture=True))
+
     def test_allowed_forms(self):
         forms = ['a@example.com', 'b@example.org', 'c@example.net', 'd@demo.invalid',
                  'Python 3.11.8', 'v1.2.3', 'v1.2.3.4', '2026-11-10',

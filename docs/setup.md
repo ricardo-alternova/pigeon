@@ -28,74 +28,19 @@ Keep calendar items without reply numbers. Answer invitations in the calendar it
 
 ## Rules
 
-Both files use TOML arrays of tables named [[rules]]. In rules.toml, order matters; see the precedence policy in guardrails. Conditions in an entry all have to match.
+Put the UTF-8 Markdown table in `rules.md` in your private store. Setup copies a [header-only table](../rules/rules.example.md). Add a Markdown separator under the header before adding rows.
 
-| Key | Type and match |
-| --- | --- |
-| id | Unique required rule string; forbidden in never-touch. |
-| enabled | Optional boolean, default true. Set false to load and validate the rule while excluding it from matching, limits and reports. rules.toml only. |
-| action | String: trash, archive, move, spam, unsubscribe, draft or report. Required in rules.toml; not allowed in never-touch.toml. report creates a decision, with no action. |
-| draft | Required on action draft: reply or forward. Use the mailbox's reply operation to address a reply draft. |
-| draft_text | Required on action draft: the owner's full body, 1–4000 characters. Copy it unchanged; take no text from mail. |
-| draft_to | Required only for forward: 1–5 bare addresses from the rule. Refuse it on reply; take no recipients from mail. |
-| accounts | Nonempty account-handle string array required in rules; optional in never-touch (absent means all). |
-| sender | Case-insensitive exact address; accept address or Name <address>. Ignore +tag for never-touch. |
-| domain | Case-insensitive domain and its subdomains at a label boundary (example.org matches mail.example.org, never notexample.org or example.org.evil.test). |
-| subject | String, a Python regular expression searched anywhere in the subject without case sensitivity. Escape regex punctuation when you mean literal text. |
-| body | Optional non-blank literal substring in the plain-text excerpt, matched with Python re.IGNORECASE without Unicode normalization. Regex punctuation is literal. rules.toml only; absent excerpts do not match. |
-| judgment | Optional non-blank criterion, at most 500 characters; rules and never-touch. Counts as a predicate. Forbidden on draft. See Judgment rules below. |
-| question | Optional non-blank string, at most 500 characters, on report rules only. Leaves the message in Inbox and shows this question with the message under Still in Inbox, without a mailbox call or removal count. Place a settling rule before the question rule; a sender/domain settling rule must also win specificity within its leading run. Propose edits through [Writing a rule](../AGENTS.md#writing-a-rule). |
-| has_attachment | Optional boolean; absent message flag means false. |
-| exclusions | Case-insensitive substring array for subject and body (when used). Require on trash, even []; optional elsewhere, forbidden in never-touch. |
-| after_unsubscribe | Optional trash/archive on unsubscribe only. Plan separately after safe unsubscribe even on failure; turn unsafe requests and companions into decisions. |
-| limit | Optional integer, 1 to 50 (hard cap), default 10. Counts actions across all accounts of the rule, including unsubscribes and companion removals, excluding folder creation. Exceeding it asks for owner approval, naming the rule id. Report rules create no actions and consume no limit; question rules also consume no twenty-percent brake count. |
-| target | Move-only exact folder path. Require a unique existing fixed path; resolve dated {year}/{month} from message date to four/two digits. Leave missing/invalid dates or years outside 1990–2100 as decisions. Require 1–255 characters and at most eight segments; refuse empty, dot, dot-dot, control, format, surrogate, line/paragraph separator, backslash and unknown placeholders. Refuse slash look-alikes U+2044, U+2215, U+2571, U+2572, U+27CB, U+27CD, U+29F5, U+29F8, U+FE68, U+FF0F, U+FF3C. Compare paths with casefold(), without normalization. Leave missing folder information as a decision; refuse leaf-only metadata for nested destinations. Plan one create-folder per missing dated account/path before dependent moves, comparing with casefold() and retaining the first matching rule's spelling. Forbid in never-touch.toml. |
+| ID | Patrón | Acción | Alcance | Fuente |
+| --- | --- | --- | --- | --- |
 
-Optional after_send="archive" or "trash" files the original after a confirmed kit send or a detected hand send, under normal caps and never-touch. Keep target, after_unsubscribe and question off draft rules. Keep messages in Inbox after creating drafts. Apply the approval procedure for draft, per-rule and twenty-percent limits. Count no draft toward removals. When the kit’s draft is gone and the owner sent anything later in that conversation, after_send files the original; nothing is deleted permanently.
+- **Patrón** accepts an exact sender, an exact domain, a written `*.domain` for subdomains, or a subject after `asunto:` or `subject:`. Plain subject text matches anywhere. With `*`, the pattern covers the whole subject and each star can match any text. Matching ignores case. Multiple sender and domain alternatives can be separated with joiners or set in backticks. If a subject is also present, it must match too. Text after ⚠ is an exception note.
+- **Acción** starts with trash, archive, spam, move (or mover), or unsubscribe (or baja). Put the move folder next and use backticks for spaces. Trailing text is a note. Join steps with `+` in execution order. An unrecognized step leaves the message for the owner. If an unsubscribe cannot run or fails, any following filing step stays unexecuted.
+- **Alcance** is `todas` or a comma- or space-separated list of account handles. Validate reports unknown handles and rows it could not use.
+- **Fuente** is informational. If Patrón or Acción refers to a file, the planner checks for it relative to the table before planning actions.
 
-Require a sender, domain, subject, body or judgment predicate on each rules.toml entry; require sender, domain, subject or judgment on never-touch. Refuse invalid regexes and regexes matching empty text.
+Never-touch wins. Otherwise exact senders outrank domains and domain wildcards, which outrank subject-only rows. Earlier rows break ties.
 
-
-The top level of rules.toml accepts only rules; use rules = [] explicitly for no rules. The top level of never-touch.toml accepts rules and allow_empty (boolean). An empty never-touch file is refused; to explicitly disable protection replace its entries with allow_empty = true. Never-touch entries accept only accounts, sender, domain, subject, has_attachment and judgment.
-
-See the [rule examples](../rules/rules.example.toml), including commented-out examples for every feature.
-
-Full addresses still match exactly. Never-touch wins over every action; ties in specificity keep file order.
-
-On an unsubscribe rule, `unsubscribe_fallback = "ask"` (default), `"trash"` or `"archive"` chooses what happens when no safe link exists. Removal uses ordinary limits and approval, with the reason “No usable unsubscribe link found”. Spam/phishing stays a decision. This option never handles a failed or unknown unsubscribe attempt; `after_unsubscribe` still applies only to the unsubscribe path.
-
-Conditional keys and has_attachment only filter matches; each action entry still needs sender, domain, subject, body or judgment. keep_latest = false is equivalent to omitting the key.
-
-## Conditional rules
-
-Rules may combine these predicates with exact predicates and judgment. They are
-forbidden in never-touch and on draft/report. `keep_latest` is boolean, only on
-trash/archive/move. True retains every equal newest valid received date per
-account among matches of that entry, without a tag or fall-through to another
-rule. Missing, invalid or timezone-less dates are retained. False disables this
-condition. Limits and approval count only actions on the older matches.
-`recipients_min` and `recipients_max` are integers 1–1000, min no greater than max:
-the distinct case-insensitive To/Cc address count. `is_reply` is boolean. Missing
-recipient or reply evidence never matches the respective condition. Cases may supply date,
-recipients and is_reply; a keep_latest case has one message, so expects none.
-Run `python3 scripts/triage.py rule-kinds` for the current validation catalog.
-
-For accounts using recipient/reply predicates, supply --manual-part exactly like
-body accounts, including on fresh approval readings. Only those accounts need
-extra fields. Listing `recipients` is a combined To/Cc array of bare addresses,
-at most 2000 entries of at most 254 characters. Deduplicate ignoring case; count
-only, never render addresses. Omit when unavailable. Listing `is_reply` is an
-optional boolean; omit when evidence is unavailable, never infer from subject.
-Gmail: extend the documented metadataHeaders with To and Cc for recipient rules,
-and In-Reply-To and References for reply rules. Parse RFC address headers; combine
-To/Cc. Reply is true when either reply header contains a message reference, false
-when both headers are absent in a complete metadata response. Outlook: extend
-the Inbox $select with toRecipients,ccRecipients for counts. For reply rules use
-the documented read-only meMessage.meGetMessages by ID with
-query:{$select:["id","internetMessageHeaders"]}; inspect In-Reply-To/References
-as above. Omit is_reply if headers are unavailable. Never use conversationId
-alone to label an initial message as a reply. Collect no recipient fields for
-accounts without these predicates. These reads never change mailbox data.
+Never-touch uses TOML `[[rules]]` entries with optional accounts, sender, domain, subject, has_attachment and judgment. Require sender, domain, subject or judgment. Domains include subdomains. Sender matching ignores +tags. Subjects are case-insensitive Python regular expressions that must not match empty text. An empty never-touch file is refused unless it explicitly sets `allow_empty = true`.
 
 ## Judgment rules
 
@@ -119,70 +64,9 @@ Reason is a non-blank string of 1–200 characters. Unknown keys, wrong types, d
 
 Rule cases may include judgments as an array of answer objects with pair, answer and reason in the same format, using message id case. Binding is derived internally for a case. Omitted answers follow the same conservative defaults.
 
-## Convert a rules table
-
-Convert a UTF-8 Markdown file with five-column pipe tables. Put id, pattern, action, scope and source in that order; choose any header words. Separate each header from its rows with a Markdown separator. Keep prose outside the tables.
-
-```bash
-python3 scripts/triage.py convert-rules --table /absolute/table.md --scopes /absolute/scopes.toml --out /absolute/converted.toml --review /absolute/review.txt
-```
-
-Choose new output paths. Omit --review to print the review list on stdout. Read the counts as rows read, active, switched off and sent to review. Run this file conversion without a lock or private store.
-
-Write scopes.toml as scope names mapped to nonempty arrays of account handles:
-
-```toml
-all = ["cedar", "marble"]
-"owner@example.com" = ["cedar"]
-```
-
-Separate scope names in a table cell with commas. Put each match token in backticks: `digest@example.net` for an exact sender, `example.org` or `@example.org` for a domain and its subdomains, or `subject:Weekly [news]` for literal subject text. Use double backticks around a token containing a backtick; escape a cell pipe as \| or put it inside the code span. Use several sender/domain tokens to produce separate rules with IDs ID, ID-2, ID-3. Send combinations containing a subject token and another token to review.
-
-Use trash, archive, spam, move PATH, mover PATH, unsubscribe, baja or baja HTTPS://example.org/leave as actions, ignoring case around the action words. Preserve move path spelling. Join unsubscribe or baja with + trash or + archive for a companion removal. Keep the source cell as a comment.
-
-Review the three outcomes:
-
-- Active: every cell is understood and the pattern contains only tokens and whitespace.
-- Switched off: every cell is understood and the pattern also contains notes or warning marks. Read the note comment above each enabled = false rule. Translate exceptions into exclusions or narrower predicates, then set enabled = true.
-- Review: a cell is unknown, the pattern has no token, or an ID is invalid or duplicated. Read each row ID, table line number and fixed reason; correct the original row and convert to a new output path.
-
-Keep converted rules in table order. Apply never-touch protection first, then the most specific matching enabled rule within the leading sender/domain run (full address, longest domain, then file order). File order is the base: a first match without sender/domain wins; otherwise only matching sender/domain rules before the first matching rule without either compete, under the kit's action limits. Check scopes against config.toml with validate.
-
-Install the converted file as rules.toml in the private store. Run `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py validate`. Take the lock, copy a fixture or fresh Inbox listing to inbox.json in the private store and follow [Dry run](#dry-run) before using the rules.
-
 ## Rule cases
 
-Write optional cases.toml in the private store after editing or converting rules. Use [[cases]] entries with a unique nonempty name, account, sender, subject and expect. Add has_attachment, body and expect_rule when needed. Use an action name, none for no matching rule, or never-touch as expect; use a rule ID as expect_rule. Run `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py validate` to check never-touch precedence and the same rule selection as plan. Read the failing case names, expected and found actions/rules, and totals. Correct failures before running mail.
-
-Copy these cases for the example rules:
-
-```toml
-[[cases]]
-name = "weekly digest"
-account = "cedar"
-sender = "digest@example.net"
-subject = "Weekly news"
-expect = "trash"
-expect_rule = "digest"
-
-[[cases]]
-name = "receipt attachment"
-account = "cedar"
-sender = "shop@example.org"
-subject = "Receipt"
-has_attachment = true
-expect = "archive"
-expect_rule = "receipts"
-
-[[cases]]
-name = "owner question"
-account = "marble"
-sender = "helper@example.com"
-subject = "Question"
-expect = "none"
-```
-
-Keep cases.toml local; supply it from the host's lasting storage. Setup leaves it absent. Validate reads cases without calls or writes.
+Write optional cases.toml in the private store after editing rules. Use [[cases]] entries with a unique nonempty name, account, sender, subject and expect. Add has_attachment, body and expect_rule when needed. Use an action name, none for no matching rule, or never-touch as expect; use a rule ID as expect_rule. Run `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py validate` to check never-touch precedence and the same rule selection as plan. Read the failing case names, expected and found actions/rules, and totals. Correct failures before running mail.
 
 ## Saved tool paths
 
@@ -316,6 +200,7 @@ Read one JSON object on success or a nonzero one-line Refused: on stderr; follow
 | `draft_to` | Rule forward recipients; original sender for a send reply, empty for reply creation. |
 | `digest` | Recorded SHA-256 binding a send action to its approved draft values. |
 | `reason` | No usable unsubscribe link found: ordinary alternative removal. |
+| `note` | Rule-table note for the report. |
 | `judgment` | Entry and assistant reason; bookkeeping, never gateway input. |
 
 ### Result statuses
@@ -375,7 +260,7 @@ It records its own status; do not submit a gateway observation. See the listing 
 
 The client allows HTTPS on port 443 only, checks every DNS answer for public addresses, pins a checked address and verifies the host certificate. It follows at most three redirects, rechecking the scheme and addresses at each hop. It refuses credentials in URLs, authentication challenges, password forms and oversized headers; never handle login prompts yourself. It sends no cookies or credentials.
 
-The planner makes unsafe unsubscribe links decisions by default; unsubscribe_fallback may instead plan an ordinary removal. Provider-flagged spam or phishing stays a decision. No unsafe request or companion is planned. Reports show safe planned unsubscribe destinations as hosts; mail values remain plain text on their item lines. Do not write unsubscribe rules for senders you suspect of spam or phishing; use spam instead. See the status table for local refusals and remembered failures.
+Unsafe unsubscribe links and provider-flagged spam or phishing leave the message in Inbox. A following filing step requires a successful unsubscribe. Reports show safe planned unsubscribe destinations as hosts; mail values remain plain text on their item lines. Do not write unsubscribe rules for senders you suspect of spam or phishing; use spam instead. See the status table for local refusals and remembered failures.
 
 The network request releases the store gate. Ownership and the unchanged checkpoint are checked before saving its outcome or failure memory. Lost ownership leaves the issued call uncertain.
 
