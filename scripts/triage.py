@@ -206,22 +206,26 @@ def clean_simulation(store):
         shutil.rmtree(folder)
 
 
+def release_locked(store, token):
+    try:
+        held = read_lock(store)
+    except FileNotFoundError:
+        return 'already released'
+    if not secrets.compare_digest(held['token'], token):
+        raise ValueError(str(store / 'run.lock') + ': token expected to match the holder; only the holder may release the lock')
+    (store / 'run.lock').unlink()
+    try:
+        clean_simulation(store)
+    except OSError:
+        return 'released; dry-run cleanup failed'
+    return 'released'
+
+
 def release(store, token):
     if store_lock_setting(store)['kind'] == 'onedrive':
         raise ValueError('run.lock: release requires the conditional drive exchange')
     with lock_gate(store):
-        try:
-            held = read_lock(store)
-        except FileNotFoundError:
-            return 'already released'
-        if not secrets.compare_digest(held['token'], token):
-            raise ValueError(str(store / 'run.lock') + ': token expected to match the holder; only the holder may release the lock')
-        (store / 'run.lock').unlink()
-        try:
-            clean_simulation(store)
-        except OSError:
-            return 'released; dry-run cleanup failed'
-        return 'released'
+        return release_locked(store, token)
 
 
 LOCK_NAME = 'pigeon-run-lock'
@@ -793,10 +797,14 @@ def finish_run(store, token, plan=None, observation=None, *, now=None):
         return sent | {'message': (sent.get('warning', '') + '\n' if sent.get('warning') else '') + pending['message']}
     drive_lock(store, 'finish', token, observed, now=now)
     message = ''
-    if plan is not None:
-        commit_state(store, token, plan, now=now, lock_verified=True)
-        message = render_message(store, token, plan, None, now=now)
-    uploads = drive_state(store, 'send', token, now=now, batch=True, verified=True).get('calls', [])
+    try:
+        if plan is not None:
+            commit_state(store, token, plan, now=now, lock_verified=True)
+            message = render_message(store, token, plan, None, now=now)
+        uploads = drive_state(store, 'send', token, now=now, batch=True, verified=True).get('calls', [])
+    except ValueError as error:
+        released = drive_lock(store, 'release', token, now=now)
+        return {'calls': [released['call']], 'refused': str(error)}
     released = drive_lock(store, 'release', token, now=now)
     execute.atomic(path, dict(token=token, phase='issued', uploads=bool(uploads), message=message))
     return {'calls': uploads + [released['call']]}
@@ -861,7 +869,7 @@ def validate_holds(holds):
                 raise ValueError('judgment: expected a non-blank category')
             validate_predicate(hold, category='judgment' in hold)
             if 'domain' in hold and not domain_pattern(hold['domain']):
-                raise ValueError('domain: expected example.com or *.example.com')
+                raise ValueError('domain: expected example.com or *.example.com, got "' + chat_text(hold['domain']) + '"')
         except ValueError as error:
             raise ValueError(('never-touch entry ' + str(i)) + ': ' + str(error)) from error
 
@@ -944,12 +952,20 @@ CODE_SPAN = r'(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)'
 FILE_REFERENCE = re.compile(r"\]\(<?(?!\w+://)([^<>\n)]+)>?\)|`([^`]+\.(?:md|txt|csv))`|(?<![\w/@.])([\w./-]+\.(?:md|txt|csv))\b", re.I)
 
 
+def idna_domain(domain):
+    """Convert a domain to its IDNA (punycode) ASCII form, or None."""
+    try:
+        return domain.encode('idna').decode('ascii')
+    except UnicodeError:
+        return None
+
+
 def domain_pattern(text):
     """Read an exact domain or a wildcard for its subdomains."""
     token = text.casefold().removeprefix('@')
-    domain = token.removeprefix('*.')
-    if re.fullmatch(DOMAIN_TOKEN, domain) and ('.' in domain or token.startswith('*.')):
-        return token
+    domain = idna_domain(token.removeprefix('*.'))
+    if domain and re.fullmatch(DOMAIN_TOKEN, domain) and ('.' in domain or token.startswith('*.')):
+        return '*.' + domain if token.startswith('*.') else domain
     return None
 
 
@@ -1138,9 +1154,14 @@ def normalize_sender(value):
         if len(addresses) != 1:
             return None
         address = addresses[0][1].casefold().rstrip('.')
-        if not re.fullmatch(r"[^\s@<>;,]+@[^\s@<>;,]+\.[^\s@<>;,]+", address):
+        if (not re.fullmatch(r"[^\s@<>;,]+@[^\s@<>;,]+\.[^\s@<>;,]+", address)
+                or any(unicodedata.category(c) in {'Cc', 'Cf'} for c in address)):
             return None
-        return address
+        local, domain = address.rsplit('@', 1)
+        domain = idna_domain(domain)
+        if domain is None:
+            return None
+        return local + '@' + domain
     except (TypeError, ValueError):
         return None
 
@@ -1900,7 +1921,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         reason = 'No matching rule'
         question = {}
         if sender is None:
-            reason = 'Invalid sender'
+            reason = 'Invalid sender: not one valid address'
         elif any(matches(message, hold, protection=True) for hold in exact_holds):
             reason = 'Protected by never-touch'
         else:
@@ -2523,8 +2544,10 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
                     raise ValueError('Number is not in the fresh Inbox for its saved account')
                 continue
             message = dict(messages[key], sender=normalize_sender(messages[key]['sender']))
-            if message['sender'] is None or any(matches(message, h, protection=True) for h in holds if 'judgment' not in h):
-                raise ValueError('Number is protected by never-touch or has an invalid sender')
+            if message['sender'] is None:
+                raise ValueError('Number ' + str(part['number']) + ' has an invalid sender')
+            if any(matches(message, h, protection=True) for h in holds if 'judgment' not in h):
+                raise ValueError('Number ' + str(part['number']) + ' is protected by never-touch')
             entry = dict(part, account=key[0], id=key[1])
             entries.append(entry)
             if part['verb'] in {'leave', 'yes', 'no'}:
@@ -2824,7 +2847,7 @@ def message_outcomes(plan, listing, items, observed=None, language='en', *, know
         if item['account'] in listing.get('skipped', {}):
             reason = re.sub(r': (?:provider|pigeon) error \([^)]*\)', '', reason)
         if language == 'es':
-            for source, target in {'A send was issued; the result is unknown; check Sent and Drafts by hand': 'Se emitió un envío; el resultado es desconocido; comprueba Sent y Drafts a mano', 'A forward was issued; the result is unknown; check Sent and Drafts by hand': 'Se emitió un reenvío; el resultado es desconocido; comprueba Sent y Drafts a mano', 'Protected by never-touch': 'Protegido por never-touch', 'Run stopped': 'Ejecución detenida', 'action not confirmed': 'acción no confirmada', 'rule refused by brake': 'regla rechazada por el freno', 'failed': 'falló', 'unexecuted': 'sin ejecutar', 'issued_unknown': 'resultado desconocido'}.items():
+            for source, target in {'A send was issued; the result is unknown; check Sent and Drafts by hand': 'Se emitió un envío; el resultado es desconocido; comprueba Sent y Drafts a mano', 'A forward was issued; the result is unknown; check Sent and Drafts by hand': 'Se emitió un reenvío; el resultado es desconocido; comprueba Sent y Drafts a mano', 'Protected by never-touch': 'Protegido por never-touch', 'Invalid sender: not one valid address': 'Remitente no válido: no es una dirección válida', 'Run stopped': 'Ejecución detenida', 'action not confirmed': 'acción no confirmada', 'rule refused by brake': 'regla rechazada por el freno', 'failed': 'falló', 'unexecuted': 'sin ejecutar', 'issued_unknown': 'resultado desconocido'}.items():
                 reason = reason.replace(source, target)
         if section == 'handled':
             completed = handled.get(key, []) or planned
@@ -4650,8 +4673,8 @@ def _main(argv=None, *, now=None):
         print('\n'.join(diagnostics))
         for hold in holds:
             domain = hold.get('domain')
-            if domain and not domain.startswith('*.'):
-                print(f'never-touch {domain} matches {domain} only; write *.{domain} for its subdomains')
+            if domain and not domain.startswith('*.') and '*.' + domain not in {h.get('domain') for h in holds}:
+                print(f'never-touch {domain} matches {domain} only; add *.{domain} for its subdomains')
         for rule in rules:
             if 'after_send' in rule and any(not config['accounts'][a].get('provider') for a in rule['accounts']):
                 raise ValueError('after_send: configured provider required for every rule account')

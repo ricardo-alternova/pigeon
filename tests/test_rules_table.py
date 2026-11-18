@@ -526,7 +526,8 @@ class RulesTableTests(unittest.TestCase):
         self.assertEqual([(a['id'], a['action'], a['rule']) for a in plan['actions']],
                          [('1', 'archive', 'D')])
         self.assertEqual({d['id']: d['reason'] for d in plan['decisions']},
-                         dict.fromkeys(('2', '3', '4'), 'No matching rule'))
+                         dict.fromkeys(('2', '3'), 'No matching rule')
+                         | {'4': 'Invalid sender: not one valid address'})
 
     def test_wildcard_subdomain_only_when_written(self):
         rules = self.read('| W | *.example.com | trash | todas | |')
@@ -536,7 +537,8 @@ class RulesTableTests(unittest.TestCase):
         self.assertEqual([(a['id'], a['action']) for a in plan['actions']],
                          [('1', 'trash'), ('2', 'trash')])
         self.assertEqual({d['id']: d['reason'] for d in plan['decisions']},
-                         dict.fromkeys(('3', '4'), 'No matching rule'))
+                         dict.fromkeys(('3',), 'No matching rule')
+                         | {'4': 'Invalid sender: not one valid address'})
 
         holds = triage.parse_holds('[[rules]]\ndomain="@*.EXAMPLE.COM"\n')
         rules += self.read('| D | example.com | archive | todas | |')
@@ -544,7 +546,7 @@ class RulesTableTests(unittest.TestCase):
         self.assertEqual([(a['id'], a['rule']) for a in plan['actions']], [('3', 'D')])
         self.assertEqual({d['id']: d['reason'] for d in plan['decisions']},
                          {'1': 'Protected by never-touch', '2': 'Protected by never-touch',
-                          '4': 'No matching rule'})
+                          '4': 'Invalid sender: not one valid address'})
 
     def test_never_touch_domain_exact(self):
         self.setup_store(rules_table('| W | *.example.com | trash | todas | |'))
@@ -560,10 +562,10 @@ class RulesTableTests(unittest.TestCase):
                          [('2', 'trash', 'W'), ('4', 'trash', 'W')])
         self.assertEqual({d['id']: d['reason'] for d in plan['decisions']},
                          {'1': 'Protected by never-touch', '3': 'No matching rule',
-                          '5': 'No matching rule'})
+                          '5': 'Invalid sender: not one valid address'})
 
         numbers = dict(next=6, items=[dict(number=i, account='home', id=str(i)) for i in range(1, 6)])
-        with self.assertRaisesRegex(ValueError, 'protected by never-touch'):
+        with self.assertRaisesRegex(ValueError, 'Number 1 is protected by never-touch'):
             triage.reply_plan(self.store, listing, holds, self.config, {},
                               triage.parse_reply('1 trash'), numbers=numbers)
         reply = triage.reply_plan(self.store, listing, holds, self.config, {},
@@ -584,6 +586,85 @@ class RulesTableTests(unittest.TestCase):
         self.assertEqual({item['id']: item['reason'] for item in remaining},
                          dict.fromkeys(('2', '3', '4', '5'), 'New arrival during run')
                          | {'1': 'Protected by never-touch'})
+
+    def test_empty_label_sender_is_invalid_at_plan_reply_and_final(self):
+        self.setup_store(rules_table('| S | subject: invoice | trash | todas | |'))
+        (self.store / 'never-touch.toml').write_text(
+            '[[rules]]\ndomain="bank.example"\n[[rules]]\ndomain="*.bank.example"\n')
+        holds = triage.parse_holds((self.store / 'never-touch.toml').read_text())
+        rules = triage.read_rules(self.path.read_text(), self.path, self.config['accounts'])
+        listing = self.domain_inbox('a@x..bank.example', 'a@.bank.example')
+        plan = triage.build_plan(listing, rules, holds, self.config)
+        self.assertEqual(plan['actions'], [])
+        self.assertEqual({d['id']: d['reason'] for d in plan['decisions']},
+                         dict.fromkeys(('1', '2'), 'Invalid sender: not one valid address'))
+
+        numbers = dict(next=3, items=[dict(number=i, account='home', id=str(i)) for i in (1, 2)])
+        for number in (1, 2):
+            with self.assertRaisesRegex(ValueError, 'Number ' + str(number) + ' has an invalid sender'):
+                triage.reply_plan(self.store, listing, holds, self.config, {},
+                                  triage.parse_reply(str(number) + ' trash'), numbers=numbers)
+
+        execute.atomic(self.store / 'inbox.json', listing)
+        token = triage.acquire(self.store)
+        self.addCleanup(triage.release, self.store, token)
+        path = self.store / 'plan.json'
+        save_plan(self.store, token, path, triage.build_plan(listing, rules, holds, self.config))
+        machine = execute.Execution(self.store, token, path)
+        machine.final(listing)
+        remaining = machine.remaining_items(listing, [])
+        self.assertEqual({item['id']: item['reason'] for item in remaining},
+                         dict.fromkeys(('1', '2'), 'Invalid sender: not one valid address'))
+        spanish = triage.build_plan(listing, rules, holds, dict(self.config, language='es'))
+        self.assertIn('Remitente no válido: no es una dirección válida',
+                      '\n'.join(triage.render_remaining(spanish, listing, 'es')))
+
+    def test_control_or_invisible_sender_is_invalid(self):
+        for sender in ('a@' + 'bank.example\u200b', 'a@' + 'bank.example\u202e', 'a@' + 'bank.example\u0000'):
+            with self.subTest(sender=sender):
+                self.assertIsNone(triage.normalize_sender(sender))
+        listing = self.domain_inbox('a@' + 'bank.example\u200b')
+        plan = triage.build_plan(listing, self.read('| S | subject: Hello | trash | todas | |'), [], self.config)
+        self.assertEqual(plan['actions'], [])
+        self.assertEqual(plan['decisions'][0]['reason'], 'Invalid sender: not one valid address')
+
+    def test_idn_domain_entry_and_sender_compare_in_one_form(self):
+        self.setup_store(rules_table('| D | bánk.example | archive | todas | |'))
+        (self.store / 'never-touch.toml').write_text('[[rules]]\ndomain="bánk.example"\n')
+        holds = triage.parse_holds((self.store / 'never-touch.toml').read_text())
+        self.assertEqual(holds, [{'domain': 'xn--bnk-ela.example'}])
+        rules = triage.read_rules(self.path.read_text(), self.path, self.config['accounts'])
+        self.assertEqual(rules[0]['domain'], 'xn--bnk-ela.example')
+        listing = self.domain_inbox('a@' + 'bánk.example', 'a@' + 'xn--bnk-ela.example', 'a@' + 'other.example')
+        plan = triage.build_plan(listing, rules, holds, self.config)
+        self.assertEqual(plan['actions'], [])
+        self.assertEqual({d['id']: d['reason'] for d in plan['decisions']},
+                         {'1': 'Protected by never-touch', '2': 'Protected by never-touch',
+                          '3': 'No matching rule'})
+        (self.store / 'never-touch.toml').write_text('[[rules]]\ndomain="xn--bnk-ela.example"\n')
+        holds = triage.parse_holds((self.store / 'never-touch.toml').read_text())
+        plan = triage.build_plan(listing, [], holds, self.config)
+        self.assertEqual({d['id']: d['reason'] for d in plan['decisions']},
+                         {'1': 'Protected by never-touch', '2': 'Protected by never-touch',
+                          '3': 'No matching rule'})
+        with self.assertRaisesRegex(ValueError, 'domain: expected example.com or \\*.example.com, got "bánk..example"'):
+            triage.parse_holds('[[rules]]\ndomain="bánk..example"\n')
+        self.assertIsNone(triage.normalize_sender('a@bánk..example'))
+
+    def test_unclassifiable_alternative_skips_and_names_row_and_token(self):
+        rules = self.read('| Main | `a@example.com` `*.@example.net` | archive | todas | |')
+        self.assertEqual(rules, [])
+        self.assertIn('Rule Main (line 3) not used: unrecognised backticked token', self.diagnostics)
+
+    def test_exact_sender_report_rule_outranks_wildcard_filing_rule(self):
+        rules = [dict(id='wildcard', accounts=['home'], domain='*.example.com', action='archive'),
+                 dict(id='report', accounts=['home'], sender='a@' + 'sub.example.com', action='report')]
+        listing = self.domain_inbox('a@example.com', 'a@' + 'sub.example.com', 'b@' + 'sub.example.com')
+        plan = triage.build_plan(listing, rules, [], self.config)
+        self.assertEqual([(a['id'], a['action'], a['rule']) for a in plan['actions']],
+                         [('3', 'archive', 'wildcard')])
+        self.assertEqual({d['id']: d['reason'] for d in plan['decisions']},
+                         {'1': 'No matching rule', '2': 'Rule requests a decision'})
 
     def test_exact_sender_precedence_kept(self):
         rules = self.read('| W | *.example.com | trash | todas | |',
@@ -618,6 +699,7 @@ class RulesTableTests(unittest.TestCase):
                                         capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('never-touch.toml: never-touch entry 2: domain:', result.stderr)
+                self.assertIn('got "' + invalid + '"', result.stderr)
 
     def test_validate_reminds_for_each_exact_never_touch_domain(self):
         self.setup_store(rules_table())
@@ -626,8 +708,7 @@ class RulesTableTests(unittest.TestCase):
             '[[rules]]\ndomain="*.example.com"\n[[rules]]\nsender="a@example.net"\n')
         output = self.cli('validate')
         self.assertEqual([line for line in output.splitlines() if line.startswith('never-touch ')],
-                         ['never-touch example.com matches example.com only; write *.example.com for its subdomains',
-                          'never-touch example.org matches example.org only; write *.example.org for its subdomains'])
+                         ['never-touch example.org matches example.org only; add *.example.org for its subdomains'])
 
     def test_priority_and_exact_domains(self):
         rules = self.read('| S | subject: receipt | spam | todas | |',

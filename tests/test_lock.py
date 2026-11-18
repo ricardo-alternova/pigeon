@@ -2248,6 +2248,17 @@ class DriveStateTests(unittest.TestCase):
         self.assertIsNone(self.drive.item)
         self.assertTrue((self.store / 'run-message.md').exists())
 
+    def test_finish_refused_upload_releases_lock(self):
+        token = self.configured()
+        self.fetch()
+        (self.store / 'never-touch.toml').write_text('[[rules]]\ndomain="example.com."\n')
+        first = triage.finish_run(self.store, token, now=self.now)
+        result = triage.finish_run(self.store, token, observation=self.drive.perform(first['call']), now=self.now)
+        self.assertIn('never-touch', result['refused'])
+        self.assertEqual(result['calls'][-1]['operation'], 'delete')
+        self.drive.perform(result['calls'][-1])
+        self.assertIsNone(self.drive.item)
+
     def test_incoming_cleanup_refuses_links_and_subfolders(self):
         self.configured()
         incoming = self.store / 'state-incoming'

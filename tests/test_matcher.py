@@ -402,7 +402,7 @@ class MatcherTests(unittest.TestCase):
         for sender in ('broken', 'a@example.net, b@example.net'):
             m['sender'] = sender
             self.assertEqual(self.plan()['actions'], [])
-            self.assertEqual(self.plan()['decisions'][0]['reason'], 'Invalid sender')
+            self.assertEqual(self.plan()['decisions'][0]['reason'], 'Invalid sender: not one valid address')
 
     def test_unsubscribe_hosts(self):
         self.batch(1, verb='unsubscribe')

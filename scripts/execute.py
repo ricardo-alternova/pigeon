@@ -438,9 +438,30 @@ class Execution:
                     item.pop('question', None)
         return items
 
+    def protected_actions(self):
+        holds = triage.parse_holds(triage.read_text(self.store / 'never-touch.toml'))
+        messages = {(m['account'], m['id']): m for m in read(self.store / 'inbox.json')['messages']}
+        return [a for a in self.plan['actions']
+                if (a['account'], a['id']) in messages
+                and any(triage.matches(messages[a['account'], a['id']], h, protection=True) for h in holds if 'judgment' not in h)]
+
+    def done_actions(self):
+        done = [c for b in self.state.get('batches', []) for i, c in enumerate(b['calls'])
+                if b['outcomes'] is not None and b['outcomes'][i]]
+        done += [r for r in self.state['results'] if r['status'] == 'executed']
+        return list(dict.fromkeys(a['action'] + ' ' + a['account'] + '/' + a['id'] for a in done))
+
     def final(self, listing):
         with triage.lock_gate(self.store):
             triage.require_lock(self.store, self.token)
+            protected = self.protected_actions()
+            if protected:
+                reason = ('final: never-touch now protects ' + ', '.join(a['account'] + '/' + a['id'] for a in protected)
+                          + '; done: ' + (', '.join(self.done_actions()) or 'none'))
+                if triage.store_lock_setting(self.store)['kind'] == 'local':
+                    triage.release_locked(self.store, self.token)
+                    raise ValueError(reason + '; the lock is released')
+                raise ValueError(reason + '; release the lock')
             self.validate()
             if self.state.get('draft_reads'):
                 raise ValueError('draft reading: report requested results first')

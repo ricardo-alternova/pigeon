@@ -2972,6 +2972,30 @@ class ExecuteTests(unittest.TestCase):
         self.assertTrue(all(r['reason'] == 'provider error (503)' for r in self.machine().state['results']))
         self.assertFalse(self.machine().stop_reason())
 
+    def test_final_refuses_old_run_with_reason_done_and_release(self):
+        (self.store / 'config.toml').write_text('[accounts.cedar]\n')
+        (self.store / 'rules.md').write_text(rules_table('| R | *.example.com | archive | cedar | |'))
+        (self.store / 'never-touch.toml').write_text('[[rules]]\ndomain="*.example.com"\n')
+        listing = dict(accounts={'cedar': 5}, messages=[
+            dict(account='cedar', id='2', folder='Inbox', sender='a@' + 'sub.example.com', subject='Message')])
+        execute.atomic(self.store / 'inbox.json', listing)
+        plan = dict(actions=[dict(account='cedar', id='2', action='archive', rule='R')], decisions=[], reasons=[],
+                    counts={'cedar': 1}, expected_counts={'cedar': 0}, not_listed=[], skip_reasons={},
+                    relist_inbox='all', account_names={'cedar': 'cedar'}, remaining=[], rule_diagnostics=[],
+                    run_id='fixture', run_token=self.token, first_run=True)
+        execute.atomic(self.path, plan)
+        machine = self.machine()
+        execute.atomic(machine.path, dict(
+            signature=machine.signature, pending=None,
+            results=[dict(account='cedar', id='2', action='archive', status='issued_unknown')],
+            failures={'archive': 0},
+            batches=[dict(start=0, calls=[dict(account='cedar', id='2', action='archive', rule='R')],
+                          outcomes=[True])],
+            single_reads=True))
+        with self.assertRaisesRegex(ValueError, 'never-touch now protects cedar/2; done: archive cedar/2; the lock is released'):
+            self.machine().final(dict(accounts={'cedar': 5}, messages=[]))
+        self.assertFalse((self.store / 'run.lock').exists())
+
     def test_final_failure_commits_healthy_account(self):
         self.batch_fixture(3)
         (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="gmail"\nexecutor_app="cedar"\nexecutor_account="cedar-example"\n[accounts.marble]\nprovider="outlook"\nexecutor_app="marble"\nexecutor_account="marble-example"\n')
