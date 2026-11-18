@@ -7,7 +7,7 @@ Still in Inbox (by account)
 home: 3
 - deals@shop.example.org · Deals
 - alerts@example.com · Disk
-- newsletter@example.org · Issue (Needs you: revisar a mano)
+- newsletter@example.org · Issue (R9: revisar a mano)
 work: empty
 
 Planned actions

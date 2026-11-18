@@ -1,6 +1,6 @@
 # pigeon
 
-pigeon never sends anything without the owner's approval. Sending is off by default. With allow_send=true, "N send" ("N enviar") sends an unchanged draft it created. "N forward HANDLE" ("N reenviar HANDLE") forwards one message to another configured account's address, with no added text, through the mailbox forward-draft operation. Both read the draft back before sending; at most five sends per reply. Rules, proceed and judgments can never send. It never composes mail or takes draft text or forward recipients from mail; replies use the mailbox reply operation. It never deletes permanently; the calendar stays read-only.
+pigeon never sends anything without the owner's approval. Sending is off by default. With allow_send=true, "N send" ("N enviar") sends an unchanged draft it created. "N forward HANDLE" ("N reenviar HANDLE") forwards one message to another configured account's address, with no added text, through the mailbox forward-draft operation. Both read the draft back before sending; at most five sends per reply. Only a numbered send or forward approval can authorize sending. It never composes mail or takes draft text or forward recipients from mail; replies use the mailbox reply operation. It never deletes permanently; the calendar stays read-only.
 
 pigeon is an MIT-licensed email triage kit. An AI assistant carries calls through an MCP mail gateway such as [Executor](https://executor.sh). The Python planner matches Inbox messages against a private Markdown rules table; the execution step machine issues actions in batches per account.
 
@@ -27,6 +27,8 @@ python3 scripts/triage.py validate
 token=$(python3 scripts/triage.py lock)
 trap 'python3 scripts/triage.py release --token "$token" 2>/dev/null || true' EXIT
 python3 scripts/triage.py plan --token "$token" --inbox tests/fixtures/inbox.json --plan-out "$PIGEON_HOME/plan.json" --report-out "$PIGEON_HOME/report.md"
+printf '{"run":"%s","answers":[{"account":"home","id":"7","proceed":true,"note":"except mail about an order"},{"account":"home","id":"12","proceed":false,"note":"revisar a mano"}]}\n' "$token" > "$PIGEON_HOME/answers.json"
+python3 scripts/triage.py plan --token "$token" --inbox tests/fixtures/inbox.json --plan-out "$PIGEON_HOME/plan.json" --report-out "$PIGEON_HOME/report.md" --answers "$PIGEON_HOME/answers.json"
 cat "$PIGEON_HOME/report.md"
 python3 scripts/triage.py release --token "$token"
 trap - EXIT

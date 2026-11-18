@@ -81,7 +81,7 @@ class Execution:
         triage.require_plan_token(self.plan, token)
         if self.plan.get('dry_run'):
             raise ValueError('dry-run plan: execution is refused; no call issued')
-        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'judgments', 'judgment_token', 'hand_sent', 'rule_diagnostics'}, str(self.plan_path))
+        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'ignored_answers', 'hand_sent', 'rule_diagnostics'}, str(self.plan_path))
         for key in ('actions', 'decisions', 'reasons'):
             if not isinstance(self.plan.get(key), list):
                 raise ValueError(str(self.plan_path) + '.' + key + ': expected an array')
@@ -90,7 +90,7 @@ class Execution:
         triage.known_keys(self.plan.get('counts'), set(self.plan.get('counts', {})), str(self.plan_path) + '.counts')
         creates = set()
         for action in self.plan['actions']:
-            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'digest', 'reason', 'judgment', 'note'}, str(self.plan_path) + '.actions')
+            triage.known_keys(action, {'account', 'id', 'action', 'rule', 'target', 'target_path', 'url', 'draft', 'draft_text', 'draft_to', 'digest', 'reason', 'note'}, str(self.plan_path) + '.actions')
             if any(not isinstance(action.get(k), str) for k in ('account', 'id', 'action', 'rule')):
                 raise ValueError(str(self.plan_path) + '.actions: expected account, id, action and rule strings')
             if 'target_path' in action:
@@ -194,7 +194,7 @@ class Execution:
             raise ValueError(label + '.pending: expected null or the next planned action')
         pending = self.state['pending']
         if pending is not None:
-            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to', 'digest', 'reason', 'judgment', 'note'}, label + '.pending')
+            triage.known_keys(pending, {'account', 'id', 'action', 'rule', 'url', 'target', 'target_path', 'draft', 'draft_text', 'draft_to', 'digest', 'reason', 'note'}, label + '.pending')
             if len(results) == len(self.plan['actions']) or pending != self.plan['actions'][len(results)]:
                 raise ValueError(label + '.pending: expected the next planned action unchanged')
 
@@ -243,17 +243,15 @@ class Execution:
                     raise ValueError('reply.json: expected current token')
             source = self.plan.get('reply_source', {})
             expected = triage.reply_plan(self.store, listing, holds, config, previous, saved['parts'], stops,
-                                         numbers=source.get('numbers'), judgments=self.plan.get('judgments'), run_token=self.plan.get('judgment_token'))
-            if 'judgments_needed' in expected:
-                raise ValueError('judgments: answers required; plan the reply again')
+                                         numbers=source.get('numbers'), answers=self.plan.get('answers'), run_token=self.token)
             if self.plan['reply'] != expected['reply']:
                 raise ValueError('reply: expected saved user selections')
         elif self.plan['reasons'] and self.plan['reasons'][0].startswith('Reply refused:'):
             expected = triage.build_plan(listing, [], holds, config, previous, self.plan['reasons'])
         else:
-            expected = triage.build_plan(listing, rules, holds, config, previous, stops, judgments=self.plan.get('judgments'), run_token=self.plan.get('judgment_token'), hand_sent=self.plan.get('hand_sent'), store=self.store)
+            expected = triage.build_plan(listing, rules, holds, config, previous, stops, answers=self.plan.get('answers'), run_token=self.token, hand_sent=self.plan.get('hand_sent'), store=self.store)
         if self.plan.get('approval_state') == 'approved':
-            triage.check_question_judgments(self.store, self.plan)
+            triage.check_question_answers(self.store, self.plan)
             if expected['reasons'] != self.plan.get('approved_thresholds'):
                 raise ValueError('approval: thresholds changed; plan again')
             history = self.store / 'history.log'
@@ -1064,6 +1062,9 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
             atomic(scratch / 'inbox.json', plan['dry_listing'])
         real_plan = {k: v for k, v in plan.items() if k not in ('dry_run', 'dry_listing', 'ungrouped_run')}
         real_plan['run_token'] = simulated_token
+        answers = real_plan.get('answers')
+        if isinstance(answers, dict) and answers.get('run') == token:
+            real_plan['answers'] = answers | dict(run=simulated_token)
         if 'reply_source' in real_plan:
             atomic(scratch / 'reply.json', dict(token=simulated_token, parts=real_plan['reply_source']['parts']))
         path = scratch / 'simulation-plan.json'

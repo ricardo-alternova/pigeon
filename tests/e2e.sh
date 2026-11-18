@@ -290,11 +290,13 @@ reply = re.search(r'`(PIGEON_HOME=[^`]*triage.py reply [^`]*)`', reply_section).
 observed = re.search(r'```bash\n([^\n]*execute.py observed [^\n]*)\n\s*```', Path('AGENTS.md').read_text(), re.S).group(1).strip()
 blocks = [qblocks[i] for i in (0,5,6,7,8,9)] + [observed, qblocks[10], qblocks[13], qblocks[0], reply, qblocks[8], qblocks[9], qblocks[10], qblocks[13]]
 assert len(blocks) == 15
-def command(index, token='', observation=None, first=False):
+def command(index, token='', observation=None, first=False, answers=False):
     text = blocks[index + (2 if index else 0)].replace('/absolute/private-store', str(store)).replace('TOKEN', token).replace(' --batch', '')
     if observation is not None:
         text = text.replace('{"outcome":"ok","inbox_ids":["id-2","id-3"]}',
                             json.dumps(observation))
+    if answers:
+        text += f' --answers "{store / "answers.json"}"'
     return subprocess.run(['bash', '-eu', '-c', text], check=True, text=True,
                           capture_output=True,
                           env={'PATH': os.environ['PATH']})
@@ -327,7 +329,13 @@ key = 'ab' * 32
 digest = hmac.new(bytes.fromhex(key), b'cedar\0billing@example.org', hashlib.sha256).hexdigest()
 (store/'unsubscribe-failures.json').write_text(json.dumps(dict(version=2, senders=[digest])))
 token = command(0).stdout.strip()
-command(1, token, first=True)
+questions = json.loads(command(1, token, first=True).stdout)
+asked = json.loads(Path(questions['questions']).read_text())
+assert [q['id'] for q in asked['questions']] == ['item-9']
+(store/'answers.json').write_text(json.dumps(dict(run=token, answers=[
+    dict(account='cedar', id='item-9', proceed=False, note='Keep this renewal?')
+])))
+command(1, token, first=True, answers=True)
 plan = json.loads((store/'plan.json').read_text())
 assert not plan['reasons'], plan
 # Preserve the edited-plan refusal check from the original CLI walkthrough.
@@ -344,7 +352,7 @@ else:
 plan = json.loads(original)
 assert len([a for a in plan['actions'] if a['action'] == 'create-folder']) == 1
 assert len([a for a in plan['actions'] if a['action'] == 'move']) == 9
-assert plan['decisions'][0]['reason'] == 'Needs you: Keep this renewal?'
+assert plan['decisions'][0]['reason'] == 'question: Keep this renewal?'
 ids = [m['id'] for m in messages]
 verbs = []
 while True:

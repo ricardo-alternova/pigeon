@@ -1,0 +1,294 @@
+{
+ "accounts": {
+  "home": 100,
+  "work": 100
+ },
+ "folders": {
+  "home": [],
+  "work": []
+ },
+ "messages": [
+  {
+   "account": "home",
+   "id": "1",
+   "folder": "Inbox",
+   "sender": "sender1@example.com",
+   "subject": "Plain 1"
+  },
+  {
+   "account": "home",
+   "id": "2",
+   "folder": "Inbox",
+   "sender": "sender2@example.com",
+   "subject": "Plain 2"
+  },
+  {
+   "account": "home",
+   "id": "3",
+   "folder": "Inbox",
+   "sender": "sender3@example.com",
+   "subject": "Plain 3"
+  },
+  {
+   "account": "home",
+   "id": "4",
+   "folder": "Inbox",
+   "sender": "sender4@example.com",
+   "subject": "Plain 4"
+  },
+  {
+   "account": "home",
+   "id": "5",
+   "folder": "Inbox",
+   "sender": "sender5@example.com",
+   "subject": "Plain 5"
+  },
+  {
+   "account": "home",
+   "id": "6",
+   "folder": "Inbox",
+   "sender": "sender6@example.com",
+   "subject": "Plain 6"
+  },
+  {
+   "account": "home",
+   "id": "7",
+   "folder": "Inbox",
+   "sender": "sender7@example.com",
+   "subject": "Plain 7"
+  },
+  {
+   "account": "home",
+   "id": "8",
+   "folder": "Inbox",
+   "sender": "sender8@example.com",
+   "subject": "Plain 8"
+  },
+  {
+   "account": "home",
+   "id": "9",
+   "folder": "Inbox",
+   "sender": "sender9@example.com",
+   "subject": "Plain 9"
+  },
+  {
+   "account": "home",
+   "id": "10",
+   "folder": "Inbox",
+   "sender": "sender10@example.com",
+   "subject": "Plain 10"
+  },
+  {
+   "account": "home",
+   "id": "11",
+   "folder": "Inbox",
+   "sender": "sender11@example.com",
+   "subject": "Plain 11"
+  },
+  {
+   "account": "home",
+   "id": "12",
+   "folder": "Inbox",
+   "sender": "sender12@example.com",
+   "subject": "Plain 12"
+  },
+  {
+   "account": "home",
+   "id": "13",
+   "folder": "Inbox",
+   "sender": "sender13@example.com",
+   "subject": "Plain 13"
+  },
+  {
+   "account": "home",
+   "id": "14",
+   "folder": "Inbox",
+   "sender": "sender14@example.com",
+   "subject": "Plain 14"
+  },
+  {
+   "account": "home",
+   "id": "15",
+   "folder": "Inbox",
+   "sender": "sender15@example.com",
+   "subject": "Plain 15"
+  },
+  {
+   "account": "home",
+   "id": "16",
+   "folder": "Inbox",
+   "sender": "sender16@example.com",
+   "subject": "Plain 16"
+  },
+  {
+   "account": "home",
+   "id": "17",
+   "folder": "Inbox",
+   "sender": "sender17@example.com",
+   "subject": "Plain 17"
+  },
+  {
+   "account": "home",
+   "id": "18",
+   "folder": "Inbox",
+   "sender": "sender18@example.com",
+   "subject": "Plain 18"
+  },
+  {
+   "account": "home",
+   "id": "19",
+   "folder": "Inbox",
+   "sender": "bills@example.com",
+   "subject": "Invoice 1042"
+  },
+  {
+   "account": "home",
+   "id": "20",
+   "folder": "Inbox",
+   "sender": "bills@example.com",
+   "subject": "Your cart is waiting"
+  },
+  {
+   "account": "home",
+   "id": "21",
+   "folder": "Inbox",
+   "sender": "promo@example.com",
+   "subject": "Your order has shipped"
+  },
+  {
+   "account": "home",
+   "id": "22",
+   "folder": "Inbox",
+   "sender": "promo@example.com",
+   "subject": "20% off"
+  },
+  {
+   "account": "home",
+   "id": "23",
+   "folder": "Inbox",
+   "sender": "a@example.org",
+   "subject": "Pedido 77 confirmado"
+  },
+  {
+   "account": "home",
+   "id": "24",
+   "folder": "Inbox",
+   "sender": "b@example.org",
+   "subject": "Bolet\u00edn"
+  },
+  {
+   "account": "home",
+   "id": "25",
+   "folder": "Inbox",
+   "sender": "digest@example.com",
+   "subject": "Digest Monday",
+   "date": "2026-03-02T08:00:00Z"
+  },
+  {
+   "account": "home",
+   "id": "26",
+   "folder": "Inbox",
+   "sender": "digest@example.com",
+   "subject": "Digest Tuesday",
+   "date": "2026-03-03T08:00:00Z"
+  },
+  {
+   "account": "home",
+   "id": "27",
+   "folder": "Inbox",
+   "sender": "team@example.net",
+   "subject": "Lunch"
+  },
+  {
+   "account": "home",
+   "id": "28",
+   "folder": "Inbox",
+   "sender": "alerts@example.net",
+   "subject": "Re: Disk full"
+  },
+  {
+   "account": "home",
+   "id": "29",
+   "folder": "Inbox",
+   "sender": "chair@example.com",
+   "subject": "Weekly report 12"
+  },
+  {
+   "account": "home",
+   "id": "30",
+   "folder": "Inbox",
+   "sender": "receipts@example.com",
+   "subject": "Receipt"
+  },
+  {
+   "account": "home",
+   "id": "31",
+   "folder": "Inbox",
+   "sender": "newsletter@example.org",
+   "subject": "Issue 9"
+  },
+  {
+   "account": "home",
+   "id": "32",
+   "folder": "Inbox",
+   "sender": "ops@example.com",
+   "subject": "Deploy"
+  },
+  {
+   "account": "home",
+   "id": "33",
+   "folder": "Inbox",
+   "sender": "shop@example.com",
+   "subject": "Sale today"
+  },
+  {
+   "account": "home",
+   "id": "34",
+   "folder": "Inbox",
+   "sender": "person34@example.com",
+   "subject": "Hello 34"
+  },
+  {
+   "account": "home",
+   "id": "35",
+   "folder": "Inbox",
+   "sender": "person35@example.com",
+   "subject": "Hello 35"
+  },
+  {
+   "account": "home",
+   "id": "36",
+   "folder": "Inbox",
+   "sender": "person36@example.com",
+   "subject": "Hello 36"
+  },
+  {
+   "account": "home",
+   "id": "37",
+   "folder": "Inbox",
+   "sender": "person37@example.com",
+   "subject": "Hello 37"
+  },
+  {
+   "account": "home",
+   "id": "38",
+   "folder": "Inbox",
+   "sender": "person38@example.com",
+   "subject": "Hello 38"
+  },
+  {
+   "account": "home",
+   "id": "39",
+   "folder": "Inbox",
+   "sender": "person39@example.com",
+   "subject": "Hello 39"
+  },
+  {
+   "account": "home",
+   "id": "40",
+   "folder": "Inbox",
+   "sender": "person40@example.com",
+   "subject": "Hello 40"
+  }
+ ]
+}

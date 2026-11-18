@@ -14,7 +14,7 @@ rules/rules.example.md rules/never-touch.example.toml
 scripts/unsubscribe.py tests/test_unsubscribe.py scripts/triage.py scripts/execute.py tests/mock_provider.py tests/test_execute.py scripts/leak_check.py hooks/pre-commit hooks/pre-push
 .github/workflows/check.yml tests/test_leak_check.py tests/test_matcher.py
 tests/test_lock.py tests/test_kit_text.py tests/test_rules_table.py tests/e2e.sh tests/fixtures/inbox.json tests/fixtures/rules.md
-tests/fixtures/expected-report.md'''.split())
+tests/fixtures/expected-report.md tests/fixtures/.gitignore tests/fixtures/rules-30.md tests/fixtures/inbox-40.json'''.split())
 FIXTURE_PATHS = {'tests/fixtures/inbox.json', 'tests/fixtures/expected-report.md'}
 FIXTURE_DOMAINS = {'mail.example.net', 'shop.example.org', 'lists.example.com'}
 RETIRED_PATHS = {'docs/migrate-rules.md', 'rules/rules.example.toml'}

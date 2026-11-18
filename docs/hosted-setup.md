@@ -1,6 +1,6 @@
 # Install pigeon
 
-pigeon never sends anything without the owner's approval. Sending is off by default. With allow_send=true, "N send" ("N enviar") sends an unchanged draft it created. "N forward HANDLE" ("N reenviar HANDLE") forwards one message to another configured account's address, with no added text, through the mailbox forward-draft operation. Both read the draft back before sending; at most five sends per reply. Rules, proceed and judgments can never send. It never composes mail or takes draft text or forward recipients from mail; replies use the mailbox reply operation. It never deletes permanently; the calendar stays read-only.
+pigeon never sends anything without the owner's approval. Sending is off by default. With allow_send=true, "N send" ("N enviar") sends an unchanged draft it created. "N forward HANDLE" ("N reenviar HANDLE") forwards one message to another configured account's address, with no added text, through the mailbox forward-draft operation. Both read the draft back before sending; at most five sends per reply. Only a numbered send or forward approval can authorize sending. It never composes mail or takes draft text or forward recipients from mail; replies use the mailbox reply operation. It never deletes permanently; the calendar stays read-only.
 
 ## Hosted setup
 

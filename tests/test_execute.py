@@ -73,74 +73,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertIn('dry-run', result.stderr)
         self.assertEqual(before, {p.name:p.read_bytes() for p in (self.path, self.store/'history.log')})
 
-    def test_r174_reply_judgments(self):
-        (self.store/'guardrails.md').write_text('Fixture guardrails')
-        (self.store/'rules.md').write_text(rules_table())
-        self.assertEqual(self.plan_cli().returncode, 0)
-        self.machine().step()
-        triage.commit_state(self.store, self.token, self.path)
-        triage.release(self.store, self.token)
-        self.token = triage.acquire(self.store)
-        number = triage.read_numbers(self.store)['items'][0]['number']
-        (self.store/'never-touch.toml').write_text('[[rules]]\njudgment="Bills"\n')
-        (self.store/'reply.txt').write_text(str(number)+' archive')
-        args = ('reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'), '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path))
-        result = self.run_cli('triage.py', *args)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        needed = execute.read(Path(json.loads(result.stdout)['judgments_needed']))
-        self.assertEqual(len(needed['pairs']), 4)
-        self.assertTrue(all(p['pair'][0]=='never-touch' for p in needed['pairs']))
-        for answers, expected in [([], 0), ([True]*4, 0), ([False]*4, 4), ([False,True,False,True], 2)]:
-            document = dict(binding=needed['binding'], answers=[dict(pair=p['pair'], answer=a, reason='Fixture reason') for p,a in zip(needed['pairs'], answers)])
-            execute.atomic(self.store/'judgments.json', document)
-            result = self.run_cli('triage.py', *args, '--judgments', str(self.store/'judgments.json'))
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(len(execute.read(self.path)['actions']), expected)
-            self.assertIn('cedar: '+str(expected)+' message', result.stdout)
-            if expected < 4:
-                self.assertIn('a@example.net · move · Protected by never-touch', result.stdout)
-            self.machine().validate()
-        saved_plan = execute.read(self.path)
-        damaged = dict(saved_plan)
-        damaged.pop('judgments')
-        execute.atomic(self.path, damaged)
-        try:
-            with self.assertRaisesRegex(ValueError, 'judgments'):
-                self.machine().validate()
-        finally:
-            execute.atomic(self.path, saved_plan)
-        config = {'accounts': {'cedar':{}, 'marble':{}}}
-        parts = triage.parse_reply(str(number)+' archive')
-        plain = triage.reply_plan(self.store, self.listing, [], config, {}, parts)
-        unrelated = triage.reply_plan(self.store, self.listing, [dict(accounts=['marble'], judgment='Bills')], config, {}, parts)
-        self.assertEqual(json.dumps(plain, sort_keys=True).encode(), json.dumps(unrelated, sort_keys=True).encode())
-        holds = triage.parse_holds((self.store/'never-touch.toml').read_text())
-        with self.assertRaisesRegex(ValueError, 'judgments.binding'):
-            triage.reply_plan(self.store, self.listing, holds, config, {}, parts, judgments=document, run_token='another-run')
-        dry = self.run_cli('triage.py', *args, '--dry-run', '--judgments', str(self.store/'judgments.json'))
-        self.assertEqual(dry.returncode, 0, dry.stderr)
-        self.assertIn('judged', triage.render_message(self.store, self.token, self.path, None))
-        self.assertTrue(execute.simulate(self.store, self.path)['dry_run'])
-        (self.store/'reply.txt').write_text(str(number)+' trash')
-        result = self.run_cli('triage.py', *args, '--judgments', str(self.store/'judgments.json'))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('judgments.binding', result.stderr)
-        (self.store/'reply.txt').write_text(str(number)+' archive')
-        self.assertEqual(self.run_cli('triage.py', *args, '--judgments', str(self.store/'judgments.json')).returncode, 0)
-        self.assertEqual(len(execute.read(self.path)['actions']), 2, execute.read(self.path))
-        provider = MockProvider([m['id'] for m in self.listing['messages']])
-        while not self.machine().step().get('done'):
-            self.machine().step(provider)
-        triage.commit_state(self.store, self.token, self.path)
-        message = triage.render_message(self.store, self.token, self.path, None)
-        self.assertIn('judged', message)
-        self.assertFalse(triage.read_numbers(self.store)['items'])
-        for name in ('state.json', 'numbers.json', 'decisions.jsonl', 'history.log', 'calls.jsonl'):
-            if (self.store/name).exists():
-                self.assertNotIn('Fixture reason', (self.store/name).read_text())
-
-
-    def test_no_judgment_message_base_bytes(self):
+    def test_plain_message_base_bytes(self):
         import re
         def normalized(value):
             return re.sub(rb"(?<=\xc2\xb7 ).*?(?= \xc2\xb7)", b"RUN TIME", value, count=1)
@@ -152,7 +85,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(normalized(triage.render_message(self.store, self.token, self.path, None).encode()), normalized(b'\xf0\x9f\x93\xac Triage \xc2\xb7 Monday, 2026-11-16, 05:35 UTC \xc2\xb7 1 needs you \xc2\xb7 0 handled\nrules: table at line 1\n\nStill in Inbox (by account)\n\ncedar: 4\n1. a@example.net (4) \xc2\xb7 latest: move\nReply with a number and action, for example: 1 trash, 1 archive, 1 spam, 1 move to Reading, 1 leave, 1 yes, 1 no\n'))
 
 
-    def test_no_judgment_reply_keeps_initial_validation(self):
+    def test_plain_reply_keeps_initial_validation(self):
         (self.store/'guardrails.md').write_text('Fixture guardrails')
         (self.store/'rules.md').write_text(rules_table())
         self.assertEqual(self.plan_cli().returncode, 0)
@@ -172,7 +105,7 @@ class ExecuteTests(unittest.TestCase):
         for rule, expected in [
             ('move Missing', 'Move target is ambiguous or missing'),
             ('unsubscribe', 'Unsafe unsubscribe'),
-            ('check this notice', 'Needs you: check this notice'),
+            ('check this notice', 'notice: Left for review'),
             ('', 'Draft waiting since 2026-01-01T00:00:00+00:00; draft may exist; check Drafts by hand'),
         ]:
             with self.subTest(reason=expected):
@@ -191,7 +124,15 @@ class ExecuteTests(unittest.TestCase):
                     state['_drafts'] = [dict(account='cedar',id=str(i),created='2026-01-01T00:00:00+00:00',draft_id=None,rule='notice') for i in range(4)]
                     execute.atomic(self.store/'state.json', state)
                 for run in range(2):
-                    self.assertEqual(self.plan_cli().returncode, 0)
+                    if rule == 'check this notice':
+                        answer_path = self.store / 'answers.json'
+                        execute.atomic(answer_path, dict(run=self.token, answers=[
+                            dict(account='cedar', id=str(i), proceed=False, note='Left for review') for i in range(4)
+                        ]))
+                        planned = self.plan_cli('--answers', str(answer_path))
+                    else:
+                        planned = self.plan_cli()
+                    self.assertEqual(planned.returncode, 0, planned.stderr)
                     self.machine().step()
                     triage.commit_state(self.store,self.token,self.path)
                     message = self.run_cli('triage.py','message','--token',self.token,'--plan',str(self.path)).stdout
@@ -2606,7 +2547,7 @@ class ExecuteTests(unittest.TestCase):
         messages += [dict(messages[0], id='waiting', subject='Hello'),
                      dict(messages[0], account='marble', id='other')]
         listing = dict(accounts={'cedar': 20, 'marble': 20}, messages=messages)
-        rules = [dict(id='t', accounts=['cedar'], subject='trash', action='trash', limit=50, exclusions=[])]
+        rules = [dict(id='t', accounts=['cedar'], subject='trash', action='trash', limit=50)]
         plan = triage.build_plan(listing, rules, [], dict(accounts={'cedar': {}, 'marble': {}}))
         self.assertEqual(plan['approval_state'], 'awaiting approval')
         self.assertEqual({i['id'] for i in plan['actions']}, {str(i) for i in range(11)})
@@ -3065,9 +3006,14 @@ class ExecuteTests(unittest.TestCase):
     def test_batched_calls_strip_the_row_note(self):
         self.batch_fixture()
         (self.store / 'rules.md').write_text(rules_table('| t | subject: trash | trash, except orders | cedar | fixture |'))
-        self.plan = triage.build_plan(self.listing, self.read_rules(), [], triage.state_config(self.store))
-        self.plan['first_run'] = True
-        save_plan(self.store, self.token, self.path, self.plan)
+        (self.store / 'guardrails.md').write_text('Fixture guardrails')
+        path = self.store / 'answers.json'
+        execute.atomic(path, dict(run=self.token, answers=[
+            dict(account=m['account'], id=m['id'], proceed=True, note='No orders') for m in self.listing['messages']
+        ]))
+        result = self.plan_cli('--answers', str(path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(a.get('note') == 'No orders' for a in execute.read(self.path)['actions']))
         batch = self.machine().step()
         self.assertTrue(batch['calls'])
         self.assertTrue(all('note' not in c for c in batch['calls']))
@@ -3815,13 +3761,6 @@ class ExecuteTests(unittest.TestCase):
         machine.plan['counts']['marble'] = 1
         machine.state.update(outside_change={'account': 'cedar', 'ids': ['0']}, final_listing={'accounts': {'cedar': 0, 'marble': 0}, 'messages': []})
         self.assertIn('marble (1 message left', machine.stop_reason())
-
-    def test_validate_names_manual_never_touch_part(self):
-        (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
-        (self.store/'never-touch.toml').write_text('[[rules]]\njudgment="Protect manual cases"\n')
-        result = subprocess.run(['python3','scripts/triage.py','validate'], env=dict(os.environ,PIGEON_HOME=str(self.store)),capture_output=True,text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('manual part required', result.stdout)
 
     def test_calendar_does_not_hide_unknown_reply_number(self):
         (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
@@ -5330,16 +5269,10 @@ class ReplyTests(unittest.TestCase):
             if name != self.path.name:
                 self.assertEqual((self.store/name).read_bytes(), data, name)
 
-    def test_r182_forward_cap_judgments_and_provider(self):
+    def test_r182_forward_cap_and_provider(self):
         self.forward_fixture()
         previous = execute.read(self.store/'state.json')
         parts = triage.parse_reply('1 forward marble')
-        holds = [dict(sender='a@example.net', judgment='Protect example')]
-        needed = triage.reply_plan(self.store, self.listing, holds, self.config, previous, parts, run_token=self.token)['judgments_needed']
-        for answer in (False, True, None):
-            document = dict(binding=needed['binding'], answers=[] if answer is None else [dict(pair=needed['pairs'][0]['pair'], answer=answer, reason='Fixture')])
-            plan = triage.reply_plan(self.store, self.listing, holds, self.config, previous, parts, judgments=document, run_token=self.token)
-            self.assertEqual(len(plan['actions']), 2 if answer is False else 0)
         for provider in ('gmail', None):
             config = json.loads(json.dumps(self.config))
             if provider is None: config['accounts']['cedar'].pop('provider')
@@ -6157,7 +6090,7 @@ class MessageFormatTests(unittest.TestCase):
             dict(account=a, id=a, folder='Inbox', sender='Copy <copy@example.org>',
                  subject='trash', internet_message_id='<copy@example.org>') for a in ('cedar', 'marble')])
         (self.store/'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n[accounts.marble]\n')
-        rules = [dict(id='copy', accounts=['cedar','marble'], sender='copy@example.org', action='trash', exclusions=[])]
+        rules = [dict(id='copy', accounts=['cedar','marble'], sender='copy@example.org', action='trash')]
         plan = triage.build_plan(self.listing, rules, [], triage.state_config(self.store))
         text = triage.awaiting_message(self.store, plan, self.listing, 'en', new_question=True)
         self.assertEqual(text.count('Copy <copy@example.org>'), 1, text)
