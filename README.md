@@ -27,7 +27,7 @@ python3 scripts/triage.py validate
 token=$(python3 scripts/triage.py lock)
 trap 'python3 scripts/triage.py release --token "$token" 2>/dev/null || true' EXIT
 python3 scripts/triage.py plan --token "$token" --inbox tests/fixtures/inbox.json --plan-out "$PIGEON_HOME/plan.json" --report-out "$PIGEON_HOME/report.md"
-printf '{"run":"%s","answers":[{"account":"home","id":"7","proceed":true,"note":"except mail about an order"},{"account":"home","id":"12","proceed":false,"note":"revisar a mano"}]}\n' "$token" > "$PIGEON_HOME/answers.json"
+printf '{"run":"%s","answers":[{"account":"home","id":"7","proceed":true,"note":"is an order confirmation"},{"account":"home","id":"12","proceed":false,"note":"needs a human"}]}\n' "$token" > "$PIGEON_HOME/answers.json"
 python3 scripts/triage.py plan --token "$token" --inbox tests/fixtures/inbox.json --plan-out "$PIGEON_HOME/plan.json" --report-out "$PIGEON_HOME/report.md" --answers "$PIGEON_HOME/answers.json"
 cat "$PIGEON_HOME/report.md"
 python3 scripts/triage.py release --token "$token"

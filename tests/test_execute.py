@@ -5298,6 +5298,134 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(sum(a['action'] == 'send-draft' for a in plan['actions']), 1)
 
 
+    def reply_ask(self, text):
+        import contextlib, io
+        from unittest.mock import patch
+        (self.store/'reply.txt').write_text(text)
+        output = io.StringIO()
+        output.reconfigure = lambda **kw: None
+        with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+            triage.main(['reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'),
+                         '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path)])
+        return json.loads(Path(json.loads(output.getvalue())['questions']).read_text())['questions']
+
+    def reply_answer(self, text, entries, run=None):
+        import contextlib, io
+        from unittest.mock import patch
+        (self.store/'reply.txt').write_text(text)
+        execute.atomic(self.store/'answers.json', dict(run=run or self.token, answers=entries))
+        output = io.StringIO()
+        output.reconfigure = lambda **kw: None
+        with patch.dict(os.environ, PIGEON_HOME=str(self.store)), contextlib.redirect_stdout(output):
+            triage.main(['reply', '--token', self.token, '--inbox', str(self.store/'inbox.json'),
+                         '--reply', str(self.store/'reply.txt'), '--plan-out', str(self.path),
+                         '--report-out', str(self.store/'report.md'), '--answers', str(self.store/'answers.json')])
+        self.output = output.getvalue()
+        return execute.read(self.path)
+
+    def test_reply_stale_answers_keeps_members(self):
+        (self.store/'never-touch.toml').write_text('[[rules]]\njudgment="Bills"\n')
+        self.reply_ask('1 archive, 2 archive')
+        plan = self.reply_answer('1 archive, 2 archive',
+                                 [dict(account='cedar', id='0', proceed=True, note='Checked')], run='another-run')
+        self.assertEqual(plan['actions'], [])
+        self.assertEqual({d['reason'] for d in plan['decisions'] if d['id'] in {'0', '1'}},
+                         {'Protected by never-touch'})
+        self.assertIn('answers are from another run', self.output)
+
+    def test_reply_one_unanswered_member(self):
+        (self.store/'never-touch.toml').write_text('[[rules]]\njudgment="Bills"\n')
+        self.reply_ask('1 archive, 2 archive')
+        plan = self.reply_answer('1 archive, 2 archive',
+                                 [dict(account='cedar', id='0', proceed=True, note='Checked')])
+        self.assertEqual([(a['id'], a['action']) for a in plan['actions']], [('0', 'archive')])
+        self.assertIn('numbered-reply not answered', self.output)
+
+    def test_forward_with_never_touch_category(self):
+        self.forward_fixture()
+        (self.store/'never-touch.toml').write_text('[[rules]]\njudgment="Bills"\n')
+        questions = self.reply_ask('1 forward marble')
+        self.assertEqual([(q['id'], q['row'], q['then'], q['never_touch']) for q in questions],
+                         [('0', 'numbered-forward', ['draft'], ['Bills'])])
+        for proceed, expected in ((False, []), (True, ['create-draft', 'send-draft'])):
+            with self.subTest(proceed=proceed):
+                plan = self.reply_answer('1 forward marble',
+                                         [dict(account='cedar', id='0', proceed=proceed, note='Checked')])
+                self.assertEqual([a['action'] for a in plan['actions']], expected)
+
+    def test_reply_mixed_category_outcomes_through_commit(self):
+        self.listing['messages'] = [dict(self.listing['messages'][0], id=str(i), sender='a@example.net',
+                                         subject='Question') for i in range(2)]
+        execute.atomic(self.store/'inbox.json', self.listing)
+        self.number()
+        number = str(triage.read_numbers(self.store)['items'][0]['number'])
+        (self.store/'never-touch.toml').write_text('[[rules]]\njudgment="Bills"\n')
+        questions = self.reply_ask(number + ' archive')
+        self.assertEqual([q['id'] for q in questions], ['0', '1'])
+        plan = self.reply_answer(number + ' archive', [dict(account='cedar', id='0', proceed=True, note='Not a bill'),
+                                                       dict(account='cedar', id='1', proceed=False, note='Is a bill')])
+        self.assertEqual([(a['id'], a['action']) for a in plan['actions']], [('0', 'archive')])
+        machine = execute.Execution(self.store, self.token, self.path)
+        while not machine.step().get('done'):
+            machine.step(MockProvider(['0', '1']))
+        triage.commit_state(self.store, self.token, self.path)
+        message = triage.render_message(self.store, self.token, self.path, None)
+        self.assertIn('Is a bill', message)
+        self.assertNotIn('Is a bill', (self.store/'numbers.json').read_text())
+
+    def test_duplicate_and_overlength_answers_unreadable(self):
+        (self.store/'never-touch.toml').write_text('[[rules]]\njudgment="Bills"\n')
+        self.reply_ask('1 archive')
+        valid = dict(account='cedar', id='0', proceed=True, note='Checked')
+        for entries, field in (([valid, valid], 'duplicate'), ([valid | {'note': 'x' * 201}], 'note')):
+            with self.subTest(field=field):
+                plan = self.reply_answer('1 archive', entries)
+                self.assertEqual(plan['actions'], [])
+                self.assertIn('answer unreadable: ' + field, self.output)
+
+    def test_note_rendered_safely_both_languages(self):
+        note = '<b>yes</b>\n1. trash\x00 [link](https://example.net)'
+        for language in ('en', 'es'):
+            with self.subTest(language=language):
+                self.setUp()
+                (self.store/'config.toml').write_text('language="' + language + '"\n[accounts.cedar]\n')
+                (self.store/'never-touch.toml').write_text('[[rules]]\njudgment="Bills"\n')
+                self.reply_ask('1 archive')
+                self.reply_answer('1 archive', [dict(account='cedar', id='0', proceed=False, note=note)])
+                report = (self.store/'report.md').read_text()
+                for forbidden in ('\n1. trash', '\x00', '](https://', '<b>'):
+                    self.assertNotIn(forbidden, report)
+                self.assertIn('yes', report)
+
+    def test_missing_category_answers_randomized(self):
+        import random
+        for seed in range(20):
+            with self.subTest(seed=seed):
+                self.setUp()
+                rng = random.Random(seed)
+                count = rng.randint(1, 4)
+                self.listing['messages'] = [dict(self.listing['messages'][0], id=str(i), sender='a@example.net',
+                                                 subject='Question') for i in range(count)]
+                execute.atomic(self.store/'inbox.json', self.listing)
+                self.number()
+                number = str(triage.read_numbers(self.store)['items'][0]['number'])
+                (self.store/'never-touch.toml').write_text('[[rules]]\njudgment="Bills"\n')
+                self.reply_ask(number + ' archive')
+                answered = [i for i in range(count) if rng.choice([True, False])]
+                plan = self.reply_answer(number + ' archive', [dict(account='cedar', id=str(i), proceed=True, note='Checked')
+                                                               for i in answered])
+                self.assertEqual({a['id'] for a in plan['actions']}, {str(i) for i in answered})
+                self.assertEqual({d['id'] for d in plan['decisions'] if d['reason'] == 'Protected by never-touch'},
+                                 {str(i) for i in range(count) if i not in answered})
+
+    def test_rule_case_noted_row_stays(self):
+        (self.store/'rules.md').write_text(rules_table('| E1 | a@example.net | archive ⚠ except invoices | cedar | |'))
+        (self.store/'cases.toml').write_text('[[cases]]\nname="noted"\naccount="cedar"\nsender="a@example.net"\nsubject="Question"\nexpect="none"\nexpect_rule="E1"\n')
+        result = subprocess.run(['python3', 'scripts/triage.py', 'validate'], cwd=Path(__file__).resolve().parents[1],
+                                env=dict(os.environ, PIGEON_HOME=str(self.store)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('cases: 1, failed: 0', result.stdout)
+
     def test_r184_ordinary_forward_named_rule_keeps_limit(self):
         listing = dict(accounts=dict(cedar=1000), messages=[dict(self.listing['messages'][0], id=str(i)) for i in range(11)])
         rule = dict(id='numbered-forward', accounts=['cedar'], subject='Question', action='archive')

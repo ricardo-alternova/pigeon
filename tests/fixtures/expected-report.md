@@ -7,7 +7,7 @@ Still in Inbox (by account)
 home: 3
 - deals@shop.example.org · Deals
 - alerts@example.com · Disk
-- newsletter@example.org · Issue (R9: revisar a mano)
+- newsletter@example.org · Issue (R9: needs a human)
 work: empty
 
 Planned actions
@@ -19,7 +19,7 @@ home
 - trash: sale@example.org · Sale
 - archive: info@mail.example.net · Status
 - trash: digest@lists.example.com · Weekly digest 47
-- trash (except mail about an order): promo@example.com · 20% off
+- trash (is an order confirmation): promo@example.com · 20% off
 - unsubscribe: news@example.com · Newsletter · example.com
 - trash: news@example.com · Newsletter
 - move to Archive/Reports: reports@example.com · Report

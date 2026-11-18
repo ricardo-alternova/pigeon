@@ -66,7 +66,7 @@ On skip go to Release without commit, message or chat. On full: `PIGEON_HOME=/ab
 PIGEON_HOME=/absolute/private-store python3 scripts/triage.py plan --token TOKEN --scheduled --inbox /absolute/private-store/inbox.json --plan-out /absolute/private-store/plan.json --report-out /absolute/private-store/report.md
 ```
 
-Keep inputs fixed. When plan prints questions, follow [Questions for matched mail](setup.md#questions-for-matched-mail) and repeat the command with `--answers PATH`. Stopped plans have no actions. Awaiting approval uses [Approval question](#approval-question). Both continue through Commit and message. On refresh_lock follow Lock refresh.
+Keep inputs fixed. When plan prints questions for matched mail, follow [Questions for matched mail](setup.md#questions-for-matched-mail) and repeat the command with `--answers PATH`. Stopped plans have no actions. Awaiting approval uses [Approval question](#approval-question). Both continue through Commit and message. On refresh_lock follow Lock refresh.
 
 ```bash
 PIGEON_HOME=/absolute/private-store python3 scripts/execute.py next --token TOKEN --plan /absolute/private-store/plan.json

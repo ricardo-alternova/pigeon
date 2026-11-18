@@ -105,6 +105,15 @@ class RulesTableTests(unittest.TestCase):
         output = self.question_command('--answers', str(self.answers_path), *args, command=command)
         return json.loads(self.plan_path.read_text()), output
 
+    def real_ask(self):
+        output = self.cli('plan', '--token', self.token, '--inbox', str(self.inbox), '--plan-out', str(self.plan_path))
+        return json.loads(output)['questions']
+
+    def real_answer(self, entries):
+        execute.atomic(self.answers_path, dict(run=self.token, answers=entries))
+        return self.cli('plan', '--token', self.token, '--inbox', str(self.inbox),
+                        '--plan-out', str(self.plan_path), '--answers', str(self.answers_path))
+
     def test_question_count(self):
         self.start_questions()
         self.assertIn('rules: 30 rows read, 0 not used', self.cli('validate'))
@@ -164,7 +173,7 @@ class RulesTableTests(unittest.TestCase):
                 self.assertNotIn('40', actions)
                 self.assertNotIn('20', actions)
                 self.assertIn('E1 answer unreadable', report)
-                self.assertIn('Answers ignored: 3', report)
+                self.assertIn('Answers ignored: home 1, home 40, work 20', report)
 
     def test_exception_text_read_only_for_matched_rows(self):
         self.start_questions()
@@ -217,6 +226,107 @@ class RulesTableTests(unittest.TestCase):
         actions = {a['id']: a['action'] for a in plan['actions']}
         self.assertEqual(actions.get('1'), 'trash')
         self.assertNotIn('20', actions)
+
+    def test_rule_changed_after_the_question(self):
+        self.start_questions()
+        self.path.write_text(rules_table('| E1 | bills@example.com | archive ⚠ except invoices | home | |'))
+        self.ask()
+        self.path.write_text(rules_table('| E1 | bills@example.com | trash ⚠ except invoices | home | |'))
+        plan, report = self.answer([dict(account='home', id='19', proceed=True, note='Not an invoice')])
+        self.assertNotIn('19', {a['id'] for a in plan['actions']})
+        self.assertIn('the rule changed after the question', report)
+        self.path.write_text(rules_table('| E1 | bills@example.com | archive ⚠ except invoices | home | |'))
+        plan, report = self.answer([dict(account='home', id='19', proceed=True, note='Not an invoice')])
+        self.assertEqual([(a['id'], a['action']) for a in plan['actions'] if a['id'] == '19'], [('19', 'archive')])
+
+    def test_malformed_answer_is_named(self):
+        self.start_questions()
+        self.ask()
+        plan, report = self.answer(['not-an-object', dict(account='home', id='20', proceed=True, note='Cart')])
+        self.assertIn('Answers ignored: answer 1', report)
+        self.assertEqual([(a['id'], a['action']) for a in plan['actions'] if a['id'] == '20'], [('20', 'trash')])
+
+    def test_unreadable_answers_reported_without_a_question(self):
+        self.start_questions()
+        self.path.write_text(rules_table('| P1 | sender1@example.com | trash | home | |'))
+        self.answers_path.write_text('{')
+        plan, report = self.read_answered_plan()
+        self.assertIn('Answers file unreadable', report)
+        self.assertEqual([(a['id'], a['action']) for a in plan['actions']], [('1', 'trash')])
+
+    def test_answer_unreadable_names_the_field(self):
+        self.start_questions()
+        self.ask()
+        valid = dict(account='home', id='27', proceed=True, note='Only recipient')
+        for entry, field in [(valid | {'proceed': 'true'}, 'proceed'), (valid | {'note': ' '}, 'note'),
+                             (valid | {'reason': 'x'}, 'unexpected reason')]:
+            with self.subTest(field=field):
+                plan, report = self.answer([entry])
+                self.assertIn('E5 answer unreadable: ' + field, report)
+                self.assertNotIn('27', {a['id'] for a in plan['actions']})
+
+    def test_answered_row_that_fails_shows_the_check_reason(self):
+        self.start_questions()
+        self.path.write_text(rules_table('| E1 | bills@example.com | move Missing ⚠ except invoices | home | |'))
+        self.ask()
+        plan, report = self.answer([dict(account='home', id='19', proceed=True, note='Not an invoice')])
+        decision = next(d for d in plan['decisions'] if d['id'] == '19')
+        self.assertEqual(decision['reason'], 'Move target is ambiguous or missing')
+        self.assertNotIn('note', decision)
+        self.assertIn('Move target is ambiguous or missing', report)
+        self.assertNotIn('Not an invoice', report)
+
+    def test_answers_keep_no_note_in_durable_state(self):
+        self.start_questions()
+        self.path.write_text(rules_table('| E1 | bills@example.com | trash ⚠ except invoices | home | |'))
+        self.real_ask()
+        output = self.real_answer([dict(account='home', id='19', proceed=False, note='fixture-note-19'),
+                                   dict(account='home', id='20', proceed=True, note='fixture-note-20')])
+        self.assertIn('fixture-note-19', output)
+        execute.Execution(self.store, self.token, self.plan_path).step()
+        triage.commit_state(self.store, self.token, self.plan_path)
+        for name in ('state.json', 'numbers.json', 'decisions.jsonl', 'history.log', 'calls.jsonl'):
+            path = self.store / name
+            if path.exists():
+                self.assertNotIn('fixture-note', path.read_text(), name)
+        message = triage.render_message(self.store, self.token, self.plan_path, None)
+        self.assertIn('fixture-note-19', message)
+
+    def test_plan_without_a_question_keeps_approval_across_locks(self):
+        self.start_questions()
+        self.path.write_text(rules_table('| P1 | sender1@example.com | trash | home | |'))
+        config = self.store / 'config.toml'
+        config.write_text('inbox_limit=1\n' + config.read_text())
+        self.real_answer([])
+        plan = json.loads(self.plan_path.read_text())
+        self.assertEqual(plan['approval_state'], 'awaiting approval')
+        self.assertNotIn('answers', plan)
+        triage.approve_plan(self.store, self.token, self.plan_path, plan['run_id'], validate_only=True)
+        triage.release(self.store, self.token)
+        self.token = triage.acquire(self.store)
+        self.assertTrue(triage.approve_plan(self.store, self.token, self.plan_path, plan['run_id'], validate_only=True))
+
+    def test_older_version_plan_refused_with_one_reason(self):
+        self.start_questions()
+        self.path.write_text(rules_table('| P1 | sender1@example.com | trash | home | |'))
+        self.real_answer([])
+        plan = json.loads(self.plan_path.read_text())
+        plan.update(judgments=dict(binding='old', answers=[]), judgment_token=self.token)
+        execute.atomic(self.plan_path, plan)
+        with self.assertRaisesRegex(ValueError, 'this plan was made by an older version; plan again'):
+            execute.Execution(self.store, self.token, self.plan_path)
+        with self.assertRaisesRegex(ValueError, 'this plan was made by an older version; plan again'):
+            triage.approve_plan(self.store, self.token, self.plan_path, plan['run_id'], validate_only=True)
+
+    def test_compound_row_with_missing_destination_runs_nothing(self):
+        self.start_questions()
+        self.path.write_text(rules_table('| E1 | bills@example.com | unsubscribe + move Missing | home | |'))
+        self.inbox.write_text(json.dumps(dict(accounts={'home': 1}, folders={'home': []}, messages=[
+            dict(account='home', id='19', folder='Inbox', sender='bills@example.com', subject='Invoice 1042',
+                 unsubscribe_url='https://example.com/leave')])))
+        plan, report = self.answer([])
+        self.assertEqual(plan['actions'], [])
+        self.assertIn('Move target is ambiguous or missing', report)
 
     def test_agent_step_then_kit_step(self):
         self.start_questions()

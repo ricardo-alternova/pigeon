@@ -79,9 +79,11 @@ class Execution:
         triage.require_fetched(store, token)
         self.plan = read(self.plan_path)
         triage.require_plan_token(self.plan, token)
+        if 'judgment_token' in self.plan or 'judgments' in self.plan:
+            raise ValueError('this plan was made by an older version; plan again')
         if self.plan.get('dry_run'):
             raise ValueError('dry-run plan: execution is refused; no call issued')
-        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'ignored_answers', 'hand_sent', 'rule_diagnostics'}, str(self.plan_path))
+        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'answers_error', 'answers_used', 'ignored_answers', 'hand_sent', 'rule_diagnostics'}, str(self.plan_path))
         for key in ('actions', 'decisions', 'reasons'):
             if not isinstance(self.plan.get(key), list):
                 raise ValueError(str(self.plan_path) + '.' + key + ': expected an array')
@@ -243,13 +245,15 @@ class Execution:
                     raise ValueError('reply.json: expected current token')
             source = self.plan.get('reply_source', {})
             expected = triage.reply_plan(self.store, listing, holds, config, previous, saved['parts'], stops,
-                                         numbers=source.get('numbers'), answers=self.plan.get('answers'), run_token=self.token)
+                                         numbers=source.get('numbers'), answers=self.plan.get('answers'), run_token=self.token,
+                                         asked=triage.read_asked(self.store, self.token))
             if self.plan['reply'] != expected['reply']:
                 raise ValueError('reply: expected saved user selections')
         elif self.plan['reasons'] and self.plan['reasons'][0].startswith('Reply refused:'):
             expected = triage.build_plan(listing, [], holds, config, previous, self.plan['reasons'])
         else:
-            expected = triage.build_plan(listing, rules, holds, config, previous, stops, answers=self.plan.get('answers'), run_token=self.token, hand_sent=self.plan.get('hand_sent'), store=self.store)
+            expected = triage.build_plan(listing, rules, holds, config, previous, stops, answers=self.plan.get('answers'), run_token=self.token,
+                                         asked=triage.read_asked(self.store, self.token), hand_sent=self.plan.get('hand_sent'), store=self.store)
         if self.plan.get('approval_state') == 'approved':
             triage.check_question_answers(self.store, self.plan)
             if expected['reasons'] != self.plan.get('approved_thresholds'):

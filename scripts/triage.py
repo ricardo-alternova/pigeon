@@ -1777,21 +1777,56 @@ def after_send_listing(listing, failed):
 
 def question_answers(document, run_token):
     if document is None:
-        return {}, ''
+        return {}, '', []
     if (not isinstance(document, dict) or set(document) != {'run', 'answers'}
             or not isinstance(document['run'], str) or not isinstance(document['answers'], list)):
-        return {}, 'answers file unreadable'
+        return {}, 'answers file unreadable', []
     if not run_token or document['run'] != run_token:
-        return {}, 'answers are from another run'
-    answers = {}
-    for entry in document['answers']:
+        return {}, 'answers are from another run', []
+    answers, malformed = {}, []
+    for position, entry in enumerate(document['answers'], 1):
         if isinstance(entry, dict) and all(isinstance(entry.get(k), str) for k in ('account', 'id')):
             key = (entry['account'], entry['id'])
             answers.setdefault(key, []).append(entry)
-    return answers, ''
+        else:
+            malformed.append('answer ' + str(position))
+    return answers, '', malformed
 
 
-def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=(), *, selections=None, answers=None, run_token=None, questions=None, hand_sent=None, store=None):
+def answer_problem(entry):
+    """Name the field that makes an answer unreadable, so the owner can fix it."""
+    unexpected = sorted(set(entry) - {'account', 'id', 'proceed', 'note'})
+    if unexpected:
+        return 'unexpected ' + ', '.join(unexpected)
+    if type(entry.get('proceed')) is not bool:
+        return 'proceed'
+    if not isinstance(entry.get('note'), str) or not entry['note'].strip() or len(entry['note']) > 200:
+        return 'note'
+    return ''
+
+
+def same_question(question, rule):
+    """An answer authorizes the row the question showed, not whatever the table says now."""
+    if rule is None:
+        return False
+    then = [step['verb'] for step in rule['steps'] if 'verb' in step] if 'steps' in rule else [rule['action']]
+    return (question.get('row'), question.get('then'), question.get('text')) == (rule['id'], then, rule.get('note', ''))
+
+
+def read_asked(store, token, dry_run=False):
+    """This run's questions, so an answer stays bound to the row it showed."""
+    path = store / ('.dry-run' if dry_run else '') / 'questions.json'
+    try:
+        document = parse_json(read_text(path), path)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(document, dict) or document.get('run') != token or not isinstance(document.get('questions'), list):
+        return None
+    return {(q['account'], q['id']): q for q in document['questions']
+            if isinstance(q, dict) and isinstance(q.get('account'), str) and isinstance(q.get('id'), str)}
+
+
+def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=(), *, selections=None, answers=None, run_token=None, questions=None, asked=None, hand_sent=None, store=None):
     validate_inputs(listing, config, previous if previous is not None else {})
     if hand_sent is not None:
         known_keys(hand_sent, {'closed', 'filed', 'failed', 'unchecked'}, 'hand_sent')
@@ -1823,7 +1858,8 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
             filing[tuple(key)] = dict(id=rule['id'], action=rule['after_send'], reason='Owner sent the draft')
     exact_holds = [hold for hold in never_touch if 'judgment' not in hold]
     categories = [hold for hold in never_touch if 'judgment' in hold]
-    answer_entries, answer_error = question_answers(answers, run_token)
+    answer_entries, answer_error, malformed = question_answers(answers, run_token)
+    asked_any = False
     messages = listing['messages']
     totals = listing['accounts']
     not_listed = [a for a in config['accounts'] if a not in totals and a not in listing.get('quiet', [])]
@@ -1866,7 +1902,11 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         else:
             key = message['account'], message['id']
             selected = filing.get(key) or (select_rule(message, rules) if selections is None else selections.get(key))
-            for rule in [selected] if selected is not None else []:
+            changed = asked is not None and key in asked and not same_question(asked[key], selected)
+            if changed:
+                asked_any = True
+                reason = 'the rule changed after the question'
+            for rule in [selected] if selected is not None and not changed else []:
                 steps = rule.get('steps', [])
                 agent = [step['agent'] for step in steps if 'agent' in step]
                 kit = [step for step in steps if 'verb' in step]
@@ -1879,6 +1919,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                         break
                 note = ''
                 if text or agent or category_text:
+                    asked_any = True
                     if questions is not None:
                         questions.append(dict(account=key[0], id=key[1], sender=original['sender'],
                                               subject=message['subject'], date=message.get('date', ''),
@@ -1887,21 +1928,21 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                                               never_touch=category_text))
                     submitted = answer_entries.pop(key, [])
                     entry = submitted[0] if len(submitted) == 1 else {}
+                    problem = 'duplicate' if len(submitted) > 1 else answer_problem(entry) if submitted else ''
                     if answer_error or not submitted:
                         reason = answer_error or rule['id'] + ' not answered'
-                    elif (set(entry) != {'account', 'id', 'proceed', 'note'} or type(entry['proceed']) is not bool
-                          or not isinstance(entry['note'], str) or not entry['note'].strip() or len(entry['note']) > 200):
-                        reason = rule['id'] + ' answer unreadable'
+                        question = {'note': reason}
+                    elif problem:
+                        reason = rule['id'] + ' answer unreadable: ' + problem
+                        question = {'note': reason}
                     else:
                         note = entry['note'].strip()
-                        reason = '' if entry['proceed'] and ('steps' not in rule or kit) else rule['id'] + ': ' + note
+                        reason = '' if entry['proceed'] and ('steps' not in rule or kit) else rule['id'] + ': ' + safe_text(note)
+                        question = {'note': note} if reason else {}
                     if reason:
-                        question = {'note': reason}
                         if category_text and (not note or not entry['proceed']):
                             reason = 'Protected by never-touch'
                         break
-                if note:
-                    question = {'note': rule['id'] + ': ' + note}
                 if 'steps' in rule:
                     rule = rule | dict(action=kit[-1]['verb'], target=kit[-1].get('target'))
                 if rule.get('keep_latest'):
@@ -2056,8 +2097,12 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
             'expected_counts': expected, 'not_listed': not_listed, 'skip_reasons': {a:listing.get('skipped', {}).get(a, 'pigeon error (listing answer)') for a in not_listed},
             'relist_inbox': config.get('relist_inbox', 'all'),
             'account_names': {a: f.get('name', a) for a, f in config['accounts'].items()}}
-    if answer_entries:
-        result['ignored_answers'] = sum(map(len, answer_entries.values()))
+    if answer_entries or malformed:
+        result['ignored_answers'] = [f'{account} {message_id}' for account, message_id in answer_entries] + malformed
+    if answer_error and not any(d['reason'] == answer_error for d in decisions):
+        result['answers_error'] = answer_error
+    if asked_any:
+        result['answers_used'] = True
     if reasons and not unconditional:
         result['approval_state'] = 'awaiting approval'
         result['approval_thresholds'] = thresholds
@@ -2290,6 +2335,9 @@ def read_answers(store, data=None, *, recover=False):
 def number_decisions(store, plan, listing, *, read_only=False, language='en', outcome_plan=None, observed=None, final_listing=None, owner_answers=None, run_counter=None, draft_records=None):
     import execute
     data = read_numbers(store)
+    # The answer note is display-only; the saved number keeps no note text.
+    notes = {(a['account'], a['id']): a['note'] for a in (plan.get('answers') or {}).get('answers', [])
+             if isinstance(a, dict) and isinstance(a.get('note'), str)}
     state_path = store / 'state.json'
     previous = parse_json(read_text(state_path), state_path) if state_path.exists() else {}
     log = store / 'decisions.jsonl'
@@ -2376,6 +2424,16 @@ def number_decisions(store, plan, listing, *, read_only=False, language='en', ou
             record = next(i for i in saved_items if i['number'] == number)
             record['presentation'] = json.loads(json.dumps(group))
             for saved_outcome in record['presentation']:
+                key = saved_outcome['item']['account'], saved_outcome['item']['id']
+                note = safe_text(notes[key]) if key in notes else ''
+                for copy in [saved_outcome['item'], *saved_outcome['copies']]:
+                    if (copy['account'], copy['id']) == key:
+                        copy.pop('note', None)
+                        if note:
+                            copy['reason'] = copy['reason'].replace(': ' + note, '').replace('; ' + note, '').strip()
+                if note:
+                    saved_outcome['tag'] = saved_outcome['tag'].replace(': ' + note, '').replace('; ' + note, '').strip()
+            for saved_outcome in record['presentation']:
                 saved_outcome['saved_number'] = number
             if 'run_token' in plan:
                 record['run_token'] = plan['run_token']
@@ -2434,7 +2492,7 @@ def parse_reply(text):
     return parts
 
 
-def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numbers=None, answers=None, run_token=None, questions=None):
+def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numbers=None, answers=None, run_token=None, questions=None, asked=None):
     # Reuse listing validation, never-touch precedence, ceilings and brakes.
     source = read_numbers(store, numbers)
     selected = {p['number'] for p in parts}
@@ -2516,7 +2574,7 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
 
     # One reply batch has the existing default per-rule limit of ten.
     ceiling_rule = dict(id='numbered-reply', accounts=list(config['accounts']), subject='reply', action='report')
-    result = build_plan(listing, [ceiling_rule], holds, config, previous, stops, selections=selections, answers=answers, run_token=run_token, questions=questions)
+    result = build_plan(listing, [ceiling_rule], holds, config, previous, stops, selections=selections, answers=answers, run_token=run_token, questions=questions, asked=asked)
     if questions:
         return result
     if sum(a['action'] == ('create-draft' if selections[(a['account'], a['id'])]['action'] == 'draft' else selections[(a['account'], a['id'])]['action']) for a in result['actions']) + sum((d['account'], d['id']) in selections and d['reason']=='Protected by never-touch' for d in result['decisions']) != len(selections) and not result['reasons']:
@@ -2645,7 +2703,7 @@ def action_label(action, listing, language='en', planned=False):
         target = next((f['name'] for f in listing.get('folders', {}).get(action['account'], []) if f['id'] == target), target)
         verb += (' to ' if language == 'en' else ' a ') + chat_text(target)
     if action.get('note'):
-        verb += ' (' + chat_text(action['note']) + ')'
+        verb += ' (' + safe_text(action['note']) + ')'
     if action.get('reason'):
         reason = ('Owner sent the draft' if language == 'en' else 'El propietario envió el borrador') if action['reason'] == 'Owner sent the draft' else ('No usable unsubscribe link found' if language == 'en' else 'No se encontró un enlace de baja utilizable')
         if action['reason'] == 'Other filing omitted under safety thresholds; file by hand':
@@ -2790,7 +2848,7 @@ def message_outcomes(plan, listing, items, observed=None, language='en', *, know
             if protection not in tag:
                 tag += ('; ' if tag else '') + protection
         if key in decision_notes and decision_notes[key] not in tag:
-            tag += ('; ' if tag else '') + chat_text(decision_notes[key])
+            tag += ('; ' if tag else '') + safe_text(decision_notes[key])
         outcomes.append(dict(item=item, kind=kind, actions=handled.get(key, []), failure=failure,
                              visible=visible, hidden=hidden, remaining=section == 'inbox', section=section, tag=tag,
                              owner=section == 'inbox' and visible and (
@@ -3048,7 +3106,9 @@ def render_report(plan, listing, language='en', store=None, *, new_question=Fals
     lines += [account_name(plan, a) + ': no new mail' for a in listing.get('quiet', [])]
     if plan.get('ignored_answers'):
         label = 'Answers ignored' if language == 'en' else 'Respuestas ignoradas'
-        lines.append(f"{label}: {plan['ignored_answers']}")
+        lines.append(label + ': ' + ', '.join(plan['ignored_answers']))
+    if plan.get('answers_error'):
+        lines.append(plan['answers_error'].capitalize())
     if plan.get('approval_state') != 'awaiting approval':
         lines += [stopped + ': ' + account_reason(plan, r) for r in plan['reasons']]
     if plan.get('dry_run'): lines += render_sends(plan, listing)
@@ -3364,6 +3424,8 @@ def approve_plan(store, token, path, run_id, *, validate_only=False, reading=Non
         require_fetched(store, token)
         path = Path(path).resolve()
         plan = execute.read(path)
+        if 'judgment_token' in plan or 'judgments' in plan:
+            raise ValueError('this plan was made by an older version; plan again')
         if plan.get('dry_run') or plan.get('approval_state') != 'awaiting approval':
             raise ValueError('approval: expected a plan awaiting approval')
         if plan.get('run_id') != run_id:
@@ -3376,7 +3438,7 @@ def approve_plan(store, token, path, run_id, *, validate_only=False, reading=Non
         check_approval_age(store, plan)
         check_question_answers(store, plan)
         answers = plan.get('answers')
-        if isinstance(answers, dict) and answers.get('run') == plan.get('run_token') and plan['run_token'] != token:
+        if plan.get('answers_used') and isinstance(answers, dict) and answers.get('run') == plan.get('run_token') and plan['run_token'] != token:
             raise ValueError('approval: answers are from another run; plan again')
         if validate_only:
             return plan
@@ -3498,11 +3560,13 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
         stops = ['Missing state; prior run records exist'] if not (store / 'state.json').exists() and not plan.get('first_run') else []
         if 'reply_source' in plan:
             source = plan['reply_source']
-            expected = reply_plan(store, listing, holds, config, previous, source['parts'], stops, numbers=source['numbers'], answers=plan.get('answers'), run_token=token)
+            expected = reply_plan(store, listing, holds, config, previous, source['parts'], stops, numbers=source['numbers'],
+                                  answers=plan.get('answers'), run_token=token, asked=read_asked(store, token, dry_run=True))
         elif plan['reasons'] and plan['reasons'][0].startswith('Reply refused:'):
             expected = build_plan(listing, [], holds, config, previous, plan['reasons'])
         else:
-            expected = build_plan(listing, rules, holds, config, previous, stops, answers=plan.get('answers'), run_token=token, hand_sent=plan.get('hand_sent'), store=store)
+            expected = build_plan(listing, rules, holds, config, previous, stops, answers=plan.get('answers'), run_token=token,
+                                  asked=read_asked(store, token, dry_run=True), hand_sent=plan.get('hand_sent'), store=store)
         number_decisions(store, expected, listing, read_only=True)
         if any(plan.get(k) != expected[k] for k in expected):
             raise ValueError('dry-run plan: expected unchanged private inputs and listing')
@@ -3554,6 +3618,18 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
                                 final_listing=execution.state.get('final_listing', {}), excluded=covered, ungrouped=saved.get('ungrouped_run') == token, store=store)
     for record in records:
         outcomes.extend(record['presentation'])
+    # The saved number keeps no note text; the message shows it from this run's plan.
+    answer_notes = {(d['account'], d['id']): d['note'] for d in plan['decisions'] if 'note' in d}
+    reasons = {(d['account'], d['id']): d['reason'] for d in plan['decisions']}
+    for outcome in outcomes:
+        key = outcome['item']['account'], outcome['item']['id']
+        note = safe_text(answer_notes[key]) if key in answer_notes else ''
+        if not note or note in outcome['tag']:
+            continue
+        reason = reasons.get(key, '')
+        prefix = reason[:-len(note) - 2] if reason.endswith(': ' + note) else outcome['item']['reason']
+        if prefix and prefix in outcome['tag']:
+            outcome['tag'] = outcome['tag'].replace(prefix, prefix + ': ' + note, 1)
     handled = {}
     for outcome in outcomes:
         if outcome['section'] == 'handled':
@@ -3737,7 +3813,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         require_plan_token(plan, token)
         if plan.get('dry_run'):
             raise ValueError('dry-run plan: commit-state is refused')
-        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'ignored_answers', 'hand_sent', 'rule_diagnostics'}, str(plan_path))
+        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'answers_error', 'answers_used', 'ignored_answers', 'hand_sent', 'rule_diagnostics'}, str(plan_path))
         for key in ('actions', 'reasons', 'not_listed'):
             if not isinstance(plan.get(key), list):
                 raise ValueError(str(plan_path) + '.' + key + ': expected an array')
@@ -4727,6 +4803,7 @@ def _main(argv=None, *, now=None):
                 stops = ['Missing state; prior run records exist'] if not state.exists() and not first_run else []
                 answers = None
                 questions = [] if args.answers is None else None
+                asked = None
                 if args.answers is not None:
                     try:
                         answers = parse_json(load_inputs([args.answers])[0], args.answers)
@@ -4734,6 +4811,8 @@ def _main(argv=None, *, now=None):
                         answers = {}
                     if answers is None:
                         answers = {}
+                    # The answer authorizes the row this run's question showed, not a later edit.
+                    asked = read_asked(store, args.token, dry_run=args.dry_run)
                 hand_sent = None
                 if args.command == 'plan':
                     validate_inputs(listing, config, previous)
@@ -4769,7 +4848,7 @@ def _main(argv=None, *, now=None):
                         hand_sent = (hand_sent or dict(closed=[], filed=[])) | dict(unchecked=unchecked)
                 try:
                     result = build_plan(listing, rules if args.command == 'plan' else [], holds, config, previous, stops, answers=answers, run_token=args.token,
-                                        questions=questions if args.command == 'plan' else None, hand_sent=hand_sent, store=store)
+                                        questions=questions if args.command == 'plan' else None, asked=asked, hand_sent=hand_sent, store=store)
                 except ValueError as error:
                     message = str(error)
                     if message.startswith('rules.md:') or message.startswith('never-touch.toml:'):
@@ -4793,7 +4872,7 @@ def _main(argv=None, *, now=None):
                             raise ValueError('--reply: expected UTF-8 text') from None
                         parts = parse_reply(reply_text)
                         result = reply_plan(store, listing, holds, config, previous, parts, stops,
-                                            answers=answers, run_token=args.token, questions=questions)
+                                            answers=answers, run_token=args.token, questions=questions, asked=asked)
                         import execute
                         if not args.dry_run and not questions:
                             execute.atomic(store / 'reply.json', dict(token=args.token, parts=parts))
@@ -4819,7 +4898,7 @@ def _main(argv=None, *, now=None):
                 if args.command == 'plan' and config.get('calendars'):
                     data = parse_json(load_inputs([args.calendar])[0], args.calendar) if args.calendar else {}
                     result['calendar_section'] = calendar_section(data, config, now or datetime.now(timezone.utc))
-                if answers is not None:
+                if answers is not None and result.get('answers_used'):
                     result['answers'] = answers
                 result['run_id'] = secrets.token_hex(32)
                 result['run_token'] = args.token
@@ -4863,7 +4942,7 @@ def _main(argv=None, *, now=None):
                             print(str(part['number']) + ' ' + verb + ': ' + accounts + '; ' + str(skipped) + (' skipped as gone.' if language == 'en' else ' omitido' + ('s' if skipped != 1 else '') + ' por no estar en Recibidos.'))
                             for decision in protected:
                                 message = next(m for m in listing['messages'] if (m['account'], m['id']) == (decision['account'], decision['id']))
-                                print(str(part['number']) + ': ' + chat_text(message['sender'])[:160] + ' · ' + chat_text(message['subject'])[:240] + ' · ' + ('Protected by never-touch' if language == 'en' else 'Protegido por never-touch') + (' · ' + chat_text(decision['note']) if 'note' in decision else ''))
+                                print(str(part['number']) + ': ' + chat_text(message['sender'])[:160] + ' · ' + chat_text(message['subject'])[:240] + ' · ' + ('Protected by never-touch' if language == 'en' else 'Protegido por never-touch') + (' · ' + safe_text(decision['note']) if 'note' in decision else ''))
                         if result.get('approval_state') == 'awaiting approval':
                             print('Nothing has run yet.' if language == 'en' else 'Todavía no se ha ejecutado nada.')
                             print(approval_question(result, language))
