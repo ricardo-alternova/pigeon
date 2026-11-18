@@ -169,7 +169,7 @@ Page each Inbox into private UTF-8 JSON inbox.json, even above inbox_limit. Neve
 | messages[].unsubscribe_url | First HTTPS URI in List-Unsubscribe angle brackets, stripped; omit if absent. Leave unsafe/missing links as decisions. |
 | messages[].unsubscribe_one_click | List-Unsubscribe-Post boolean, default false; true selects RFC 8058 POST, otherwise GET. |
 | messages[].body | Optional plain text, max 2000 characters, for every message in body-rule accounts; request truncation or keep the first 2000. No HTML, attachments or links. Omit absent text (no body match). Matching only. |
-| messages[].date | Optional ISO 8601 provider received/internal date; never sender Date/body. Preserve year/month unconverted. For dated moves, leave missing/invalid dates or years outside 1990–2100 to the user. |
+| messages[].date | Optional ISO 8601 provider received/internal date; never sender Date/body. |
 | messages[].conversation_id, messages[].internet_message_id | Optional strings: Gmail threadId/Message-ID; Outlook conversationId/internetMessageId. |
 | messages[].sender_name | Do not collect. |
 | skipped | Omitted account to reason map: {"cedar":"provider error (503)"} or {"cedar":"pigeon error (listing answer)"}; keep the account and its messages absent. |

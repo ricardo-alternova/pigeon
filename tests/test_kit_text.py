@@ -158,20 +158,6 @@ class KitTextTests(unittest.TestCase):
         self.assertIn('provider error (STATUS)', text)
         self.assertIn('pigeon error (WHAT)', text)
 
-    def test_gmail_received_datetime_plans_dated_move(self):
-        from datetime import datetime, timezone
-        sys.path.insert(0, str(ROOT / 'scripts'))
-        import triage
-        date = datetime.fromtimestamp(1772323200000 / 1000, timezone.utc).isoformat()
-        listing = dict(accounts={'cedar': 100}, messages=[dict(account='cedar',
-            id='item-a', folder='Inbox', sender='billing@example.org', subject='Invoice', date=date)],
-            folders={'cedar': [dict(id='folder-a', name='Bills/2026/03')]})
-        rule = dict(id='dated', accounts=['cedar'], subject='Invoice', action='move', target='Bills/{year}/{month}')
-        plan = triage.build_plan(listing, [rule], [], {'accounts': {'cedar': {}}})
-        self.assertEqual(plan['reasons'], [])
-        self.assertEqual([(a['action'], a['target']) for a in plan['actions']], [('move', 'folder-a')])
-
-
     def test_execution_commands(self):
         text = (ROOT / 'AGENTS.md').read_text() + (ROOT / 'docs/quickstart.md').read_text()
         for command in ('triage.py lock', 'triage.py plan', 'execute.py next',

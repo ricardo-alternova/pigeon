@@ -803,12 +803,13 @@ class RulesTableTests(unittest.TestCase):
 
     def test_row_cap_shared_by_alternative_tokens(self):
         rules = self.read('| A | billing@example.com or second@example.com | archive | todas | |')
-        listing = dict(accounts={'home': 100}, messages=[
-            dict(account='home', id=str(i), folder='Inbox', subject='Receipt',
+        listing = dict(accounts={'home': 100, 'work': 100}, messages=[
+            dict(account='home' if i % 2 else 'work', id=str(i), folder='Inbox', subject='Receipt',
                  sender=('billing' if i % 2 else 'second') + '@example.com') for i in range(11)])
         plan = triage.build_plan(listing, rules, [], self.config)
-        self.assertEqual(len(plan['actions']), 11)
-        self.assertEqual(plan['approval_thresholds'], [dict(kind='rule', rule='A', count=11, limit=10)])
+        self.assertEqual(len(plan['actions']), 10)
+        self.assertNotIn('approval_state', plan)
+        self.assertEqual([m['id'] for m in plan['cap_holds']], ['10'])
 
     def test_rehearsal_checks_references_relative_to_the_table(self):
         self.start_questions('rules.md', 'inbox.json')

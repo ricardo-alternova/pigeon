@@ -34,7 +34,12 @@ Put the UTF-8 Markdown table in `rules.md` in your private store. Setup copies a
 | --- | --- | --- | --- | --- |
 
 - **Patrón** accepts an exact sender, an exact domain, `*.domain` for its subdomains, or a subject after `asunto:` or `subject:`. Plain subject text matches anywhere. With `*`, the pattern covers the whole subject and each star can match any text. Matching ignores case. Separate sender and domain alternatives with a space, comma, `y`, `o`, `and`, `or`, `/` or `+`, or set each in backticks. If a subject is also present, it must match too. The assistant reads text after the pattern, including after ⚠, only for mail that row wins.
-- **Acción** starts with trash, archive, spam, move (or mover), or unsubscribe (or baja). The kit only recognizes these action words. Treat other steps as requests for read-only review. Put the move folder next and use backticks for spaces; the listing must carry the account's folder list, or the message stays in Inbox. Trailing text is a note. Put the filing step last: `unsubscribe + trash`. A read-only assistant step requires an answer before any kit action. A row with only assistant steps leaves the message in Inbox. If an unsubscribe cannot run or fails, any following filing step stays unexecuted.
+- **Acción** starts with trash, archive, spam, move (or mover), or unsubscribe (or baja). The kit only recognizes these action words. Treat other steps as requests for read-only review. Put the move folder next and use backticks for spaces; the listing must carry the account's folder list, or the message stays in Inbox. Write `max N` or `máx N` after the action to set its per-run message cap from 1 to 50. Other trailing text is a note. Put the filing step last: `unsubscribe + trash`. A read-only assistant step requires an answer before any kit action. A row with only assistant steps leaves the message in Inbox. If an unsubscribe cannot run or fails, any following filing step stays unexecuted.
+
+Each row can act on 10 messages per run by default. A line such as `- C1 max 25` in guardrails.md can set a cap for row C1. When both files set a cap, the lower number applies. An unreadable cap skips the row. The cap counts qualifying messages in Inbox listing order across the row’s accounts. Any overflow stays in Inbox and the report asks once per row for `proceed` for that run. Whole-run limits still pause the entire batch.
+
+A move to `Reports/{year}/{month}` uses the run’s start time in the configured time zone, including for old or undated mail. If the month folder is missing, the planner creates only that folder. If its parent is missing, the message stays and the report names the parent.
+
 - **Alcance** is `todas` or a comma- or space-separated list of account handles. A blank Alcance is not `todas`; the row is not used. Validate reports unknown handles and rows it could not use.
 - **Fuente** is informational. If Patrón or Acción refers to a file, the planner checks for it inside the rules folder before planning actions. If the file is missing, the message stays in Inbox and the report says why.
 
@@ -89,7 +94,7 @@ Account totals count messages; owner totals count numbered lines. Spam/phishing-
 
 ## Decision and stop reasons
 
-Read decisions and reasons in plan.json. Keep decisions in Still in Inbox once. After commit, print their saved number and line record; before commit, print no numbers. Keep questions for matched mail; never number protected messages. Treat report rules, missing/ambiguous move targets, invalid dates, missing folder information, invalid senders (the reason says not one valid address, covering an empty label, an unconvertible domain and control or invisible characters), unsafe unsubscribes without a removal option and unmatched mail as decisions. Follow [Approval question](quickstart.md#approval-question) for threshold approvals and [Run exits](../AGENTS.md#run-exits) for command refusals.
+Read decisions and reasons in plan.json. Keep decisions in Still in Inbox once. After commit, print their saved number and line record; before commit, print no numbers. Keep questions for matched mail; never number protected messages. Treat report rules, mail held above its row cap, missing or ambiguous move targets, missing month-folder parents, missing folder information, invalid senders (the reason says not one valid address, covering an empty label, an unconvertible domain and control or invisible characters), unsafe unsubscribes without a removal option and unmatched mail as decisions. Follow [Approval question](quickstart.md#approval-question) for threshold approvals and [Run exits](../AGENTS.md#run-exits) for command refusals.
 
 Stop for missing state with prior records, unconfigured accounts, no configured account listed, or an unexpectedly empty account whose saved expected count was at least three.
 
@@ -127,7 +132,7 @@ When reply prints questions, answer the never-touch questions as above and repea
 
 Keep reply.txt UTF-8, verbatim and at most 2000 characters. Use ASCII numbers of at most nine digits. Verbs ignore case and surrounding spaces; retain move-path spelling and compare with Unicode casefold without normalization. Allow spaces, nested paths and non-English letters, but no reply separators inside targets. leave, yes and no keep the number and make no call.
 
-Refuse the whole reply for empty, malformed, oversized or control-bearing text, unsupported verbs, unknown/repeated numbers, messages absent from their fresh Inbox (groups skip absent members), exact never-touch matches, invalid senders or missing/ambiguous targets. Execute no partial reply. Keep normal listing validation, brakes, global ceilings and the default ten-action limit. Omit --scheduled; it gives zero actions. Use plan's safety/input/output options when needed.
+Refuse the whole reply for empty, malformed, oversized or control-bearing text, unsupported verbs, unknown/repeated numbers, messages absent from their fresh Inbox (groups skip absent members), exact never-touch matches, invalid senders or missing/ambiguous targets. Execute no partial reply. Keep normal listing validation, brakes, global ceilings and the ten-action limit for numbered replies. Omit --scheduled; it gives zero actions. Use plan's safety/input/output options when needed.
 
 ## State and execution files
 

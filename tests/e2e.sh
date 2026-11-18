@@ -273,6 +273,7 @@ export PIGEON_HOME="$PWD/private/walk"
 env -i PATH="$PATH" PIGEON_HOME="$PIGEON_HOME" python3 scripts/triage.py setup
 env -i PATH="$PATH" PIGEON_HOME="$PIGEON_HOME" python3 scripts/triage.py validate
 env -i PATH="$PATH" TMPDIR="$scratch" PIGEON_HOME="$PIGEON_HOME" python3 - <<'PYCLI'
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -320,7 +321,7 @@ for i, subject in enumerate(['Invoice'] * 9 + ['Renewal', 'Discard', 'Receipt', 
                          unsubscribe_url='https://example.org/unsubscribe',
                          unsubscribe_one_click=True))
 listing = dict(accounts={'cedar': 200, 'marble': 0}, messages=messages,
-               folders={'cedar': [], 'marble': []})
+               folders={'cedar': [{'id': 'bills-year', 'name': 'Bills/2026'}], 'marble': []})
 (store/'inbox.json').write_text(json.dumps(listing))
 # Remembered sender prevents all network contact while exercising the exact
 # local command returned by next. Transport behavior has its own offline suite.
@@ -329,6 +330,10 @@ key = 'ab' * 32
 digest = hmac.new(bytes.fromhex(key), b'cedar\0billing@example.org', hashlib.sha256).hexdigest()
 (store/'unsubscribe-failures.json').write_text(json.dumps(dict(version=2, senders=[digest])))
 token = command(0).stdout.strip()
+lock_path = store/'run.lock'
+lock = json.loads(lock_path.read_text())
+lock['started'] = datetime(2026, 3, 15, tzinfo=timezone.utc).timestamp()
+lock_path.write_text(json.dumps(lock))
 questions = json.loads(command(1, token, first=True).stdout)
 asked = json.loads(Path(questions['questions']).read_text())
 assert [q['id'] for q in asked['questions']] == ['item-9']
@@ -369,6 +374,7 @@ while True:
     verbs.append(call['action'])
     observation = dict(outcome='ok', inbox_ids=ids.copy())
     if call['action'] == 'create-folder':
+        assert call['target_path'] == 'Bills/2026/03'
         observation['folder_id'] = 'created-bills'
     else:
         if call['action'] == 'move':

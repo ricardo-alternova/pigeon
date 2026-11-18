@@ -2547,7 +2547,7 @@ class ExecuteTests(unittest.TestCase):
         messages += [dict(messages[0], id='waiting', subject='Hello'),
                      dict(messages[0], account='marble', id='other')]
         listing = dict(accounts={'cedar': 20, 'marble': 20}, messages=messages)
-        rules = [dict(id='t', accounts=['cedar'], subject='trash', action='trash', limit=50)]
+        rules = self.read_rules(rules_table('| t | subject: trash | trash, max 50 | cedar | |'))
         plan = triage.build_plan(listing, rules, [], dict(accounts={'cedar': {}, 'marble': {}}))
         self.assertEqual(plan['approval_state'], 'awaiting approval')
         self.assertEqual({i['id'] for i in plan['actions']}, {str(i) for i in range(11)})
@@ -3130,11 +3130,12 @@ class ExecuteTests(unittest.TestCase):
                     self.setUp()
                     config = {'accounts':{'cedar':dict(provider=provider, executor_app='cedar-mail', executor_account='cedar-example')}}
                     (self.store / 'config.toml').write_text('[accounts.cedar]\nprovider="'+provider+'"\nexecutor_app="cedar-mail"\nexecutor_account="cedar-example"\n')
+                    self.start_run_at()
                     action = {'move': 'move Reading', 'folder': 'move Reading/{year}'}.get(verb, verb)
                     (self.store/'rules.md').write_text(rules_table(f'| r | subject: trash | {action} | cedar | |'))
                     self.listing['messages'] = [dict(self.listing['messages'][-1], date='2026-03-01T00:00:00+00:00')]
                     execute.atomic(self.store/'inbox.json', self.listing)
-                    self.plan = triage.build_plan(self.listing, self.read_rules(), [], config)
+                    self.plan = triage.build_plan(self.listing, self.read_rules(), [], config, month=triage.run_month(self.store, config))
                     self.plan['first_run'] = True
                     save_plan(self.store, self.token, self.path, self.plan)
                     calls = self.machine().step()['calls']
@@ -3396,10 +3397,9 @@ class ExecuteTests(unittest.TestCase):
 
     def test_provider_batch_rule_limit_brake_and_refresh(self):
         self.batch_fixture(11)
-        self.assertIn('Per-rule action limit exceeded', ' '.join(self.plan['reasons']))
-        self.assertTrue(self.machine().step()['done'])
-        self.assertFalse((self.store / 'calls.jsonl').exists())
-        self.machine().path.unlink()
+        self.assertEqual(len(self.plan['actions']), 10)
+        self.assertEqual(len(self.plan['cap_holds']), 1)
+        self.assertNotIn('approval_state', self.plan)
         text = (self.store / 'rules.md').read_text()
         (self.store / 'rules.md').write_text(text)
         self.listing['accounts']['cedar'] = 20
@@ -3653,6 +3653,7 @@ class ExecuteTests(unittest.TestCase):
             config += 'provider="'+provider+'"\naddress="reader@example.org"\n'
         (self.store/'config.toml').write_text(config)
         (self.store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
+        self.start_run_at()
         verbs = ['trash', 'archive', 'move', 'dated', 'spam', 'unsubscribe']
         folders = {'move': 'move Reading', 'dated': 'move Bills/{year}/{month}'}
         rules = rules_table(*(f'| {verb} | subject: {verb} fixture | {folders.get(verb, verb)} | cedar | |'
@@ -3662,7 +3663,7 @@ class ExecuteTests(unittest.TestCase):
         execute.atomic(self.store/'inbox.json', self.listing)
         saved = 'tools["cedar-private-app"].'+('meMailFolder.meListMailFolders' if provider=='outlook' else 'gmail.users.labels.list' if provider=='gmail' else 'folders.list')
         execute.atomic(self.store/'tool-paths.json', {'cedar':{'labels' if provider=='gmail' else 'folders':saved}})
-        self.plan = triage.build_plan(self.listing, self.read_rules(rules), [], triage.state_config(self.store))
+        self.plan = triage.build_plan(self.listing, self.read_rules(rules), [], triage.state_config(self.store), month=triage.run_month(self.store, {}))
         save_plan(self.store,self.token,self.path,dict(self.plan,first_run=True,dry_run=True,run_token=self.token))
         return saved
 
@@ -4320,24 +4321,119 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual((self.store / 'calls.jsonl').read_bytes(), before)
 
 
+    def start_run_at(self, stamp='2026-03-15T12:00:00+00:00'):
+        lock = execute.read(self.store / 'run.lock')
+        execute.atomic(self.store / 'run.lock', lock | dict(started=datetime.fromisoformat(stamp).timestamp()))
+
     def dated(self, *, existing=False, count=2):
+        self.start_run_at()
         text = (rules_table('| dated | subject: move | move `Bills/{year}/{month}` | cedar | fixture |'))
         (self.store / 'rules.md').write_text(text)
         self.listing['messages'] = [dict(account='cedar', id=str(i), folder='Inbox',
                                         sender='billing@example.org', subject='move',
                                         date='2026-03-31T23:00:00-05:00') for i in range(count)]
-        self.listing['folders'] = {'cedar': [dict(id='present', name='Bills/2026/03')] if existing else []}
+        folders = [dict(id='year', name='Bills/2026')]
+        if existing:
+            folders.append(dict(id='present', name='Bills/2026/03'))
+        self.listing['folders'] = {'cedar': folders}
         execute.atomic(self.store / 'inbox.json', self.listing)
-        self.plan = triage.build_plan(self.listing, self.read_rules(text), [], {'accounts': {'cedar': {}}})
+        self.plan = triage.build_plan(self.listing, self.read_rules(text), [], {'accounts': {'cedar': {}}}, month=triage.run_month(self.store, {}))
         self.plan['first_run'] = True
         save_plan(self.store, self.token, self.path, self.plan)
+
+    def test_current_month_folder_from_run_date(self):
+        self.dated(existing=True, count=3)
+        self.listing['messages'][0]['date'] = '2025-11-03T09:00:00Z'
+        self.listing['messages'][1]['date'] = '2026-03-14T09:00:00Z'
+        self.listing['messages'][2].pop('date')
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        (self.store / 'config.toml').write_text('timezone="America/Bogota"\n[accounts.cedar]\n')
+        (self.store / 'guardrails.md').write_text('Fixture policy')
+        for stamp in ('2026-03-15T12:00:00+00:00', '2026-04-01T03:00:00+00:00'):
+            with self.subTest(stamp=stamp):
+                self.start_run_at(stamp)
+                planned = self.plan_cli()
+                self.assertEqual(planned.returncode, 0, planned.stderr)
+                self.assertEqual([(a['action'], a['target']) for a in execute.read(self.path)['actions']],
+                                 [('move', 'present')] * 3)
+                self.machine().validate()
+
+    def test_missing_month_folder_created_without_parents(self):
+        self.dated(count=3)
+        self.assertEqual([a['action'] for a in self.plan['actions']], ['create-folder', 'move', 'move', 'move'])
+        self.assertEqual(self.plan['actions'][0]['target_path'], 'Bills/2026/03')
+        self.listing['folders']['cedar'] = []
+        plan = self.rebuild()
+        self.assertEqual(plan['actions'], [])
+        self.assertEqual([d['reason'] for d in plan['decisions']],
+                         ['Move folder Bills/2026 is missing; create it by hand'] * 3)
+
+    def test_proceed_for_this_run_only(self):
+        for case in ('proceed', 'protection added', 'new run'):
+            with self.subTest(case=case):
+                self.setUp()
+                (self.store / 'guardrails.md').write_text('Fixture policy')
+                (self.store / 'rules.md').write_text(rules_table('| C1 | bulk@example.com | trash, max 25 | todas | |'))
+                self.listing = dict(accounts={'cedar': 1000}, messages=[
+                    dict(account='cedar', id=str(i), folder='Inbox', sender='bulk@example.com', subject=f'Item {i}')
+                    for i in range(30)])
+                execute.atomic(self.store / 'inbox.json', self.listing)
+                planned = self.plan_cli()
+                self.assertEqual(planned.returncode, 0, planned.stderr)
+                first = execute.read(self.path)
+                self.assertEqual(len(first['actions']), 25)
+                self.assertEqual(len(first['cap_holds']), 5)
+                ids = [m['id'] for m in self.listing['messages']]
+
+                def run_actions():
+                    acted = []
+                    while not (call := self.machine().step()).get('done'):
+                        ids.remove(call['id'])
+                        acted.append(call['id'])
+                        self.machine().step(execute.AssistantProvider(dict(outcome='ok', inbox_ids=ids)))
+                    triage.commit_state(self.store, self.token, self.path)
+                    return acted
+
+                self.assertEqual(run_actions(), [str(i) for i in range(25)])
+                message = triage.render_message(self.store, self.token, self.path, None)
+                self.assertEqual(message.count('C1 held 5 above its cap of 25 · reply proceed'), 1)
+                triage.release(self.store, self.token)
+                self.token = triage.acquire(self.store)
+                self.listing['messages'] = self.listing['messages'][25:]
+                execute.atomic(self.store / 'inbox.json', self.listing)
+
+                if case == 'protection added':
+                    (self.store / 'never-touch.toml').write_text('[[rules]]\nsubject="^Item 25$"\n')
+                if case == 'new run':
+                    self.assertEqual(self.plan_cli().returncode, 0)
+                    self.assertEqual(run_actions(), [str(i) for i in range(25, 30)])
+                    triage.release(self.store, self.token)
+                    self.token = triage.acquire(self.store)
+
+                reply = self.store / 'reply.txt'
+                reply.write_text('proceed')
+                args = ('reply', '--token', self.token, '--question', first['run_id'], '--reply', str(reply),
+                        '--inbox', str(self.store / 'inbox.json'), '--plan-out', str(self.path))
+                result = self.run_cli('triage.py', *args)
+                if case == 'new run':
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('no plan awaits approval', result.stderr)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plan = execute.read(self.path)
+                start = 26 if case == 'protection added' else 25
+                self.assertEqual([a['id'] for a in plan['actions']], [str(i) for i in range(start, 30)])
+                if case == 'protection added':
+                    self.assertIn(dict(account='cedar', id='25', reason='Protected by never-touch'), plan['decisions'])
+                self.assertEqual(run_actions(), [str(i) for i in range(start, 30)])
+                self.assertNotEqual(self.run_cli('triage.py', *args).returncode, 0)
 
     def test_dry_dated_move_folds_folder_creation(self):
         self.dated(count=1)
         (self.store/'guardrails.md').write_text('Fixture policy')
         for language in ('en', 'es'):
             (self.store/'config.toml').write_text('language="'+language+'"\n[accounts.cedar]\n')
-            plan = triage.build_plan(self.listing, self.read_rules(), [], triage.state_config(self.store))
+            plan = triage.build_plan(self.listing, self.read_rules(), [], triage.state_config(self.store), month=triage.run_month(self.store, {}))
             save_plan(self.store, self.token, self.path, dict(plan, first_run=True, dry_run=True, run_token=self.token))
             text = triage.render_message(self.store, self.token, self.path, None)
             self.assertNotIn('create-folder', text)
@@ -4392,10 +4488,11 @@ class ExecuteTests(unittest.TestCase):
                 rules = self.read_rules(rules_table(
                     '| first | subject: first | move Bills/{year}/{month} | cedar | |',
                     f'| second | subject: second | move {second} | cedar | |'))
+                self.listing['folders']['cedar'].append(dict(id='other-year', name='Other/2026'))
                 # Reverse message order to prove spelling follows file order.
                 for message, subject in zip(self.listing['messages'], ('second', 'first')):
                     message['subject'] = subject
-                plan = triage.build_plan(self.listing, rules, [], {'accounts': {'cedar': {}}})
+                plan = triage.build_plan(self.listing, rules, [], {'accounts': {'cedar': {}}}, month=triage.run_month(self.store, {}))
                 creates = [a for a in plan['actions'] if a['action'] == 'create-folder']
                 self.assertEqual(len(creates), expected)
                 if expected == 1:
@@ -4405,18 +4502,6 @@ class ExecuteTests(unittest.TestCase):
         self.dated(existing=True)
         self.assertEqual(self.machine().step()['target'], 'present')
         self.assertTrue(all(a['action'] == 'move' for a in self.plan['actions']))
-
-    def test_dated_bad_dates_stay(self):
-        for value in (None, 'bad', '2026-02-30'):
-            self.dated()
-            for m in self.listing['messages']:
-                if value is None:
-                    m.pop('date')
-                else:
-                    m['date'] = value
-            plan = triage.build_plan(self.listing, self.read_rules(), [], {'accounts': {'cedar': {}}})
-            self.assertEqual(plan['actions'], [])
-            self.assertTrue(all('date' in d['reason'] for d in plan['decisions']))
 
     def test_creation_failure_keeps_dependents(self):
         self.dated()
@@ -4462,7 +4547,9 @@ class ExecuteTests(unittest.TestCase):
         rules = self.read_rules()
         target = 'Mail.Box/<Bills>_[x]`/{year}/{month}'
         rules[0]['steps'][0]['target'] = target
-        plan = triage.build_plan(self.listing, rules, [], {'accounts': {'cedar': {}}})
+        self.listing['folders']['cedar'].append(dict(id='escaped-year', name=target.rsplit('/', 1)[0].replace('{year}', '2026')))
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        plan = triage.build_plan(self.listing, rules, [], {'accounts': {'cedar': {}}}, month=triage.run_month(self.store, {}))
         report = triage.render_report(plan, self.listing)
         path = 'Mail.Box/<Bills>_[x]`/2026/03'
         self.assertIn(triage.chat_text(path), report)
@@ -4479,23 +4566,30 @@ class ExecuteTests(unittest.TestCase):
 
     def test_rule_limit_and_global_brake(self):
         self.dated(existing=True, count=11)
-        self.assertEqual(len(self.plan['actions']), 11)
-        self.assertEqual(self.plan['approval_state'], 'awaiting approval')
-        self.dated(existing=True, count=11)
-        self.assertEqual(len(self.plan['actions']), 11)
+        self.assertEqual(len(self.plan['actions']), 10)
+        self.assertEqual(len(self.plan['cap_holds']), 1)
+        self.assertNotIn('approval_state', self.plan)
         self.listing['accounts']['cedar'] = 20
-        plan = triage.build_plan(self.listing, self.read_rules(), [], {'accounts': {'cedar': {}}})
+        plan = triage.build_plan(self.listing, self.read_rules(), [], {'accounts': {'cedar': {}}}, month=triage.run_month(self.store, {}))
         self.assertEqual(len(plan['actions']), 11)
         self.assertEqual(plan['approval_state'], 'awaiting approval')
         self.assertTrue(plan['reasons'])
 
 
+    def separate_month_destinations(self, count):
+        rows = []
+        for index, message in enumerate(self.listing['messages'][:count]):
+            message['subject'] = f'move {index}'
+            folder = f'Folder {index}'
+            rows.append(f'| r{index} | subject: move {index} | move `{folder}/{{year}}/{{month}}` | cedar | |')
+            self.listing['folders']['cedar'].append(dict(id=f'year-{index}', name=f'{folder}/2026'))
+        (self.store / 'rules.md').write_text(rules_table(*rows))
+
     def test_create_two_failure_brake_and_lock(self):
         self.dated(count=3)
-        for i, message in enumerate(self.listing['messages']):
-            message['date'] = '2026-0' + str(i + 1) + '-01'
+        self.separate_month_destinations(3)
         execute.atomic(self.store / 'inbox.json', self.listing)
-        self.plan = triage.build_plan(self.listing, self.read_rules(), [], {'accounts': {'cedar': {}}})
+        self.plan = triage.build_plan(self.listing, self.read_rules(), [], {'accounts': {'cedar': {}}}, month=triage.run_month(self.store, {}))
         self.plan['first_run'] = True
         save_plan(self.store, self.token, self.path, self.plan)
         for _ in range(2):
@@ -4516,7 +4610,7 @@ class ExecuteTests(unittest.TestCase):
 
     def rebuild(self):
         execute.atomic(self.store / 'inbox.json', self.listing)
-        self.plan = triage.build_plan(self.listing, self.read_rules(), [], {'accounts': {'cedar': {}}})
+        self.plan = triage.build_plan(self.listing, self.read_rules(), [], {'accounts': {'cedar': {}}}, month=triage.run_month(self.store, {}))
         self.plan['first_run'] = True
         save_plan(self.store, self.token, self.path, self.plan)
         return self.plan
@@ -4548,23 +4642,10 @@ class ExecuteTests(unittest.TestCase):
 
     def test_folder_comparison_casefold(self):
         self.dated(existing=True)
-        self.listing['folders']['cedar'][0]['name'] = 'bILLS/2026/03'
+        self.listing['folders']['cedar'][-1]['name'] = 'bILLS/2026/03'
         plan = self.rebuild()
         self.assertEqual([a['action'] for a in plan['actions']], ['move', 'move'])
         self.assertTrue(all(a['target'] == 'present' for a in plan['actions']))
-
-    def test_year_range(self):
-        for year in (1, 1989, 2101, 9999):
-            self.dated()
-            for m in self.listing['messages']:
-                m['date'] = f'{year:04d}-01-01'
-            plan = self.rebuild()
-            self.assertEqual(plan['actions'], [])
-            self.assertTrue(all('date' in d['reason'] for d in plan['decisions']))
-        for year in (1990, 2100):
-            for m in self.listing['messages']:
-                m['date'] = f'{year}-01-01'
-            self.assertEqual(len(self.rebuild()['actions']), 3)
 
     def test_unicode_path_separators_refused(self):
         for char in ('\u2028', '\u2029', '\u2215', '\u2044', '\uff0f', '\u29f8', '\uff3c', '\ufe68', '\u2571', '\u27cb', '\u29f5', '\u2572', '\u27cd'):
@@ -4593,7 +4674,7 @@ class ExecuteTests(unittest.TestCase):
 
     def test_created_id_observation_and_checkpoint(self):
         self.dated()
-        self.listing['folders'] = {'cedar': [dict(id='known', name='Trash')]}
+        self.listing['folders']['cedar'].append(dict(id='known', name='Trash'))
         self.rebuild()
         machine = self.machine()
         machine.step()
@@ -4630,9 +4711,9 @@ class ExecuteTests(unittest.TestCase):
         self.listing['folders']['other'] = [dict(id='other-known', name='Trash')]
         # The config must declare the other account even when it is not listed.
         (self.store / 'config.toml').write_text('[accounts.cedar]\n[accounts.other]\n')
-        self.listing['messages'][1]['date'] = '2026-04-01'
+        self.separate_month_destinations(2)
         execute.atomic(self.store / 'inbox.json', self.listing)
-        self.plan = triage.build_plan(self.listing, self.read_rules(), [], {'accounts': {'cedar': {}, 'other': {}}})
+        self.plan = triage.build_plan(self.listing, self.read_rules(), [], {'accounts': {'cedar': {}, 'other': {}}}, month=triage.run_month(self.store, {}))
         self.plan['first_run'] = True
         save_plan(self.store, self.token, self.path, self.plan)
         self.machine().step()
@@ -5452,9 +5533,12 @@ class ReplyTests(unittest.TestCase):
 
     def test_r184_ordinary_forward_named_rule_keeps_limit(self):
         listing = dict(accounts=dict(cedar=1000), messages=[dict(self.listing['messages'][0], id=str(i)) for i in range(11)])
-        rule = dict(id='numbered-forward', accounts=['cedar'], subject='Question', action='archive')
-        plan = triage.build_plan(listing, [rule], [], self.config, dict(cedar=3))
-        self.assertTrue(any(t['kind'] == 'rule' and t['count'] == 11 for t in plan['approval_thresholds']))
+        rules = triage.read_rules(rules_table('| numbered-forward | subject: Question | archive | cedar | |'),
+                                  self.store / 'rules.md', self.config['accounts'])
+        plan = triage.build_plan(listing, rules, [], self.config, dict(cedar=3))
+        self.assertEqual(len(plan['actions']), 10)
+        self.assertEqual(len(plan['cap_holds']), 1)
+        self.assertNotIn('approval_state', plan)
 
 
     def test_r182_forward_failed_or_unknown_send_never_retries(self):

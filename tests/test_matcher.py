@@ -109,7 +109,7 @@ class MatcherTests(unittest.TestCase):
 
     def test_keep_latest_account_copies_and_approval(self):
         self.batch(13, verb='archive')
-        self.rules[0].update(keep_latest=True, limit=1)
+        self.rules[0].update(keep_latest=True, cap=25)
         for i, m in enumerate(self.listing['messages']):
             m['date'] = '2026-01-%02dT00:00:00Z' % (i+1)
         copies = [dict(m, account='birch') for m in self.listing['messages']]
@@ -120,7 +120,7 @@ class MatcherTests(unittest.TestCase):
         plan = self.plan()
         self.assertEqual(len(plan['actions']), 24)
         self.assertNotIn('m12', [a['id'] for a in plan['actions']])
-        self.assertTrue(plan.get('approval_thresholds'))
+        self.assertNotIn('approval_state', plan)
         self.assertEqual({a['account'] for a in plan['actions']}, {'cedar', 'birch'})
 
 
@@ -171,8 +171,9 @@ class MatcherTests(unittest.TestCase):
         self.holds = [dict(sender=message['sender'])]
         self.assertEqual(self.plan()['actions'], [])
         self.holds = []
-        self.batch(51, verb='unsubscribe')
-        self.rules[0]['unsubscribe_fallback'] = 'archive'
+        self.batch(51, groups=6, verb='unsubscribe')
+        for rule in self.rules:
+            rule['unsubscribe_fallback'] = 'archive'
         for message in self.listing['messages']: message.pop('unsubscribe_url')
         plan = self.plan()
         self.assertEqual(plan['approval_state'], 'awaiting approval')
@@ -204,7 +205,6 @@ class MatcherTests(unittest.TestCase):
 
     def test_missing_account_twenty_percent_and_empty_brake(self):
         self.batch(11)
-        self.rules[0]["limit"] = 20
         self.config['accounts']['marble'] = {}
         self.listing['accounts']['cedar'] = 11
         self.assertIn('Rule exceeds twenty percent', ' '.join(self.plan()['reasons']))
@@ -269,21 +269,88 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(result['approval_state'], 'awaiting approval')
         self.assertIn('Destructive action limit exceeded', result['reasons'])
 
+    def test_rule_cap_from_table(self):
+        self.batch(30)
+        for action, expected in [('trash, max 25', 25), ('trash, máx 25', 25), ('trash', 10)]:
+            with self.subTest(action=action):
+                self.rules = triage.read_rules(rules_table(f'| C1 | s0@example.net | {action} | todas | |'),
+                                               ROOT / 'rules.md', self.config['accounts'])
+                self.listing['messages'][-1]['subject'] = 'max 50'
+                plan = self.plan()
+                self.assertEqual([m['id'] for m in plan['actions']], [f'm{i}' for i in range(expected)])
+                self.assertNotIn('approval_state', plan)
+                self.assertEqual(len(plan['cap_holds']), 30 - expected)
+                self.assertEqual({m['reason'] for m in plan['decisions']},
+                                 {f'C1: held above its cap of {expected} for this run'})
+                report = triage.render_report(plan, self.listing)
+                self.assertEqual(report.count(f'C1 held {30 - expected} above its cap of {expected} · reply proceed'), 1)
+
+    def test_rule_cap_from_guardrails(self):
+        self.batch(30)
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory)
+            names = ('config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md')
+            for name, content in zip(names, ('[accounts.cedar]\n', rules_table(), 'allow_empty=true\n',
+                                             '- C1 max 25\n- C9 max 5\n')):
+                (store / name).write_text(content)
+            for action, expected in [('trash', 25), ('trash, max 40', 25), ('trash, max 20', 20)]:
+                with self.subTest(action=action):
+                    (store / 'rules.md').write_text(rules_table(f'| C1 | s0@example.net | {action} | todas | |'))
+                    notes = []
+                    self.config, self.rules, self.holds = triage.load_safety([store / name for name in names], notes)
+                    self.assertEqual(len(self.plan()['actions']), expected)
+                    self.assertIn('guardrails: line 2 names no row C9', notes)
+
+    def test_unreadable_rule_cap_leaves_mail(self):
+        self.batch(1)
+        for action, guardrails in [('trash, max 80', ''), ('trash, max 0', ''), ('trash, max two', ''),
+                                   ('trash, max 2.5', ''), ('trash, max', ''), ('trash, max 3, max 4', ''),
+                                   ('trash, max 25', '- C1 max 80')]:
+            with self.subTest(action=action, guardrails=guardrails):
+                notes = []
+                self.rules = triage.read_rules(rules_table(f'| C1 | s0@example.net | {action} | todas | |'),
+                                               ROOT / 'rules.md', self.config['accounts'], notes, guardrails=guardrails)
+                self.assertIn('Rule C1 (line 3) not used:', notes[2])
+                self.assertFalse(self.plan()['actions'])
+
+    def test_run_ceiling_unchanged(self):
+        for count, rows, planned in [(54, 6, 54), (60, 3, 30)]:
+            self.batch(count, rows)
+            self.rules = triage.read_rules(rules_table(*[
+                f'| C{i} | s{i}@example.net | trash | todas | |' for i in range(rows)]),
+                ROOT / 'rules.md', self.config['accounts'])
+            plan = self.plan()
+            self.assertEqual(len(plan['actions']), planned)
+            if rows == 6:
+                self.assertEqual(plan['approval_state'], 'awaiting approval')
+                self.assertIn('Destructive action limit exceeded', plan['reasons'])
+                self.assertNotIn('cap_holds', plan)
+            else:
+                self.assertNotIn('approval_state', plan)
+                self.assertEqual(len(plan['cap_holds']), 30)
+
+    def test_rule_cap_counts_messages_for_compound_row(self):
+        self.batch(6)
+        self.rules = triage.read_rules(rules_table('| U1 | s0@example.net | baja HTTPS + trash | todas | |'),
+                                       ROOT / 'rules.md', self.config['accounts'])
+        plan = self.plan()
+        self.assertEqual([a['action'] for a in plan['actions']], ['unsubscribe', 'trash'] * 6)
+        self.assertNotIn('approval_state', plan)
+
     def test_si9_rule_ceiling(self):
         self.batch(11)
         result = self.plan()
-        self.assertEqual(len(result['actions']), 11)
-        self.assertEqual(result['approval_state'], 'awaiting approval')
-        self.assertTrue(any(reason.startswith('Per-rule') and reason.endswith(': ' + self.rules[0]['id'] + ' (11 of 10)') for reason in result['reasons']))
+        self.assertEqual(len(result['actions']), 10)
+        self.assertNotIn('approval_state', result)
+        self.assertEqual(len(result['cap_holds']), 1)
 
-    def test_si9_rule_ceiling_counts_companions(self):
-        for count, stopped in ((5, False), (6, True)):
-            self.batch(count, verb='unsubscribe')
-            self.rules[0]['after_unsubscribe'] = 'archive'
-            result = self.plan()
-            self.assertEqual(any(reason.startswith('Per-rule action limit exceeded:') for reason in result['reasons']), stopped)
-            self.assertEqual(len(result['actions']), 2 * count)
-            self.assertEqual(result.get('approval_state'), 'awaiting approval' if stopped else None)
+    def test_si9_rule_ceiling_counts_messages(self):
+        self.batch(6, verb='unsubscribe')
+        self.rules[0]['after_unsubscribe'] = 'archive'
+        result = self.plan()
+        self.assertEqual(len(result['actions']), 12)
+        self.assertNotIn('approval_state', result)
+        self.assertNotIn('cap_holds', result)
 
     def test_si9_unsubscribe_ceiling(self):
         self.batch(11, 2, 'unsubscribe')
@@ -304,7 +371,6 @@ class MatcherTests(unittest.TestCase):
     def test_si10_twenty_percent(self):
         for count, total, stopped in ((5, 12, False), (10, 12, False), (11, 40, True), (11, 100, False)):
             self.batch(count)
-            self.rules[0]['limit'] = 50
             self.listing['accounts']['cedar'] = total
             plan = self.plan()
             self.assertEqual(bool(plan['reasons']), stopped)
@@ -314,8 +380,6 @@ class MatcherTests(unittest.TestCase):
 
     def test_twenty_percent_stable_pairs(self):
         self.batch(22, groups=2)
-        for rule in self.rules:
-            rule['limit'] = 50
         self.listing['accounts']['cedar'] = 40
         reasons = self.plan()['reasons']
         self.assertEqual(len(reasons), 2)
@@ -1698,7 +1762,7 @@ class CrossAccountIdentityTests(unittest.TestCase):
     def test_partial_copy_failure_keeps_account_inbox_count(self):
         messages = [dict(account=a, id=a, folder='Inbox', sender='a@example.net', subject='Fixture', internet_message_id='<same@example.net>') for a in ('cedar','birch')]
         listing = dict(accounts={'cedar':100,'birch':100}, messages=messages)
-        plan = triage.build_plan(listing, [dict(id='r', accounts=['cedar','birch'], sender='a@example.net', action='archive', limit=10)], [], dict(accounts={'cedar':{},'birch':{}}))
+        plan = triage.build_plan(listing, [dict(id='r', accounts=['cedar','birch'], sender='a@example.net', action='archive')], [], dict(accounts={'cedar':{},'birch':{}}))
         outcomes = triage.message_outcomes(plan, listing, [dict(messages[1], reason='No matching rule')], [dict(status='executed'),dict(status='failed')], known_left={('cedar','cedar')})
         text = '\n'.join(triage.render_remaining(plan, listing, outcomes=outcomes))
         self.assertIn('birch: 1', text)
