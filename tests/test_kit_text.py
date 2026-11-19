@@ -1,11 +1,15 @@
 """Contract checks for the public instructions and their assistant shims."""
+import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import tomllib
 import unittest
+
+from mock_provider import rules_table
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ['README.md', 'AGENTS.md', 'CLAUDE.md',
@@ -18,6 +22,53 @@ def setup_text():
 
 
 class KitTextTests(unittest.TestCase):
+    def test_shipped_rules_and_lists_are_empty(self):
+        header = rules_table().encode('utf-8')
+        for name, expected in (('rules', header), ('never-touch', b''), ('unsubscribe', b'')):
+            self.assertEqual((ROOT / f'rules/{name}.example.md').read_bytes(), expected, name)
+
+        with tempfile.TemporaryDirectory() as folder:
+            store = Path(folder) / 'store'
+            env = dict(os.environ, PIGEON_HOME=str(store))
+            command = ['python3', str(ROOT / 'scripts/triage.py')]
+            subprocess.run(command + ['setup'], env=env, check=True, capture_output=True, text=True)
+            before = {path.name: path.read_bytes() for path in store.iterdir()}
+            self.assertEqual(before['rules.md'], header)
+            self.assertEqual(before['never-touch.md'], b'')
+            self.assertEqual(before['unsubscribe.md'], b'')
+
+            result = subprocess.run(command + ['validate'], env=env, check=True,
+                                    capture_output=True, text=True)
+            self.assertIn('2 accounts, 0 rules, 0 never-touch', result.stdout)
+            self.assertEqual(before, {path.name: path.read_bytes() for path in store.iterdir()})
+
+    def test_no_rule_rows_outside_tests(self):
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        from triage import ACTION_WORDS, CODE_SPAN, table_cells
+
+        action = re.compile(r'(?:' + '|'.join(ACTION_WORDS) + r')\b', re.I)
+        pattern = re.compile(r'@|asunto:|subject:|\b[\w*-]+\.[a-z]{2,}\b', re.I)
+        cap = re.compile(r'(?:^|`)\s*- +[^\s`]+ +m[aá]x +\d+', re.I)
+        tracked = subprocess.check_output(
+            ['git', 'ls-files', '-z', '--', '.', ':(exclude)tests/'], cwd=ROOT)
+        hits = []
+        for name in os.fsdecode(tracked).split('\0')[:-1]:
+            path = ROOT / name
+            if path.is_symlink():
+                continue
+            for number, line in enumerate(path.read_text(encoding='utf-8', errors='replace').splitlines(), 1):
+                candidates = [line, *(content for _, content in re.findall(CODE_SPAN, line))]
+                for candidate in candidates:
+                    row = candidate.strip()
+                    if not row.startswith('|'):
+                        continue
+                    cells = table_cells(row)
+                    if len(cells) == 5 and (action.match(cells[2].strip('` ')) or pattern.search(cells[1])):
+                        hits.append(f'{name}:{number}: rule row')
+                for _ in cap.finditer(line):
+                    hits.append(f'{name}:{number}: numeric cap')
+        self.assertFalse(hits, '\n' + '\n'.join(hits))
+
     def test_r184_send_documents_match_behavior(self):
         setup = (ROOT/'docs/setup.md').read_text()
         hosted = (ROOT/'docs/hosted-setup.md').read_text()
@@ -492,35 +543,22 @@ class ReferenceTidyTests(unittest.TestCase):
         self.assertNotIn('by position for their rule', skill)
 
 class SetupValidationTests(unittest.TestCase):
-    def test_shipped_safety_files_and_all_errors(self):
-        import tempfile, shutil, os
+    def test_validate_reports_all_errors(self):
         with tempfile.TemporaryDirectory() as folder:
             store = Path(folder)
-            for source, target in [('config/config.example.toml', 'config.toml'),
-                                   ('config/guardrails.example.md', 'guardrails.md'),
-                                   ('rules/rules.example.md', 'rules.md'),
-                                   ('rules/never-touch.example.md', 'never-touch.md'),
-                                   ('rules/unsubscribe.example.md', 'unsubscribe.md')]:
-                shutil.copyfile(ROOT / source, store / target)
-            env = dict(os.environ, PIGEON_HOME=folder)
-            def validate():
-                return subprocess.run(['python3', str(ROOT / 'scripts/triage.py'), 'validate'],
-                                      env=env, capture_output=True, text=True)
-            before = {p.name: p.read_bytes() for p in store.iterdir()}
-            result = validate()
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('2 accounts, 0 rules, 0 never-touch', result.stdout)
-            self.assertEqual(before, {p.name: p.read_bytes() for p in store.iterdir()})
             (store / 'config.toml').write_text('language="bad"\ninbox_limit=0\n[accounts.cedar]\n')
             (store / 'rules.md').write_bytes(b'\xff')
             (store / 'guardrails.md').write_text('')
-            result = validate()
+            (store / 'never-touch.md').write_text('')
+            (store / 'unsubscribe.md').write_text('')
+            result = subprocess.run(['python3', str(ROOT / 'scripts/triage.py'), 'validate'],
+                                    env=dict(os.environ, PIGEON_HOME=folder),
+                                    capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             for term in ('config.toml', 'language', 'inbox_limit', 'rules.md', 'UTF-8', 'guardrails.md'):
                 self.assertIn(term, result.stderr)
 
     def test_setup_creates_missing_examples_and_keeps_existing_files(self):
-        import tempfile, os
         with tempfile.TemporaryDirectory() as folder:
             store = Path(folder) / 'new'
             env = dict(os.environ, PIGEON_HOME=str(store))

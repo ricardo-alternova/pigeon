@@ -459,8 +459,6 @@ class RulesTableTests(unittest.TestCase):
                 self.assertEqual(plan['decisions'][0]['reason'], 'A not answered')
 
     def test_header_only_table_loads_empty(self):
-        shipped = (ROOT / 'rules/rules.example.md').read_text()
-        self.assertEqual(shipped, rules_table())
         self.assertEqual(self.read(), [])
 
     def test_bad_row_refused_with_row_number(self):
