@@ -5590,7 +5590,7 @@ class ReplyTests(unittest.TestCase):
                                  [dict(account='cedar', id='0', proceed=True, note='Checked')], run='another-run')
         self.assertEqual(plan['actions'], [])
         self.assertEqual({d['reason'] for d in plan['decisions'] if d['id'] in {'0', '1'}},
-                         {'Protected by never-touch'})
+                         {'answers are from another run'})
         self.assertIn('answers are from another run', self.output)
 
     def test_reply_one_unanswered_member(self):
@@ -5675,7 +5675,7 @@ class ReplyTests(unittest.TestCase):
                 plan = self.reply_answer(number + ' archive', [dict(account='cedar', id=str(i), proceed=True, note='Checked')
                                                                for i in answered])
                 self.assertEqual({a['id'] for a in plan['actions']}, {str(i) for i in answered})
-                self.assertEqual({d['id'] for d in plan['decisions'] if d['reason'] == 'Protected by never-touch'},
+                self.assertEqual({d['id'] for d in plan['decisions'] if d['reason'] == 'numbered-reply not answered'},
                                  {str(i) for i in range(count) if i not in answered})
 
     def test_rule_case_noted_row_stays(self):

@@ -17,6 +17,8 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 import execute
 import triage
 
+FOLDER_CAUSE = 'target: expected at most 8 nonempty, non-dot path segments, no controls or unknown placeholders'
+
 
 class RulesTableTests(unittest.TestCase):
     def setUp(self):
@@ -471,9 +473,11 @@ class RulesTableTests(unittest.TestCase):
             ('| X | example.com | trash + baja | todas | |', 'kit step after filing'),
             ('| X | example.com | unsubscribe + baja | todas | |', 'more than one unsubscribe step'),
             ('| X | example.com | mover | todas | |', 'move without a folder'),
-            ('| X | example.com | mover ../x | todas | |', 'invalid move folder'),
-            ('| X | example.com | mover a/b/c/d/e/f/g/h/i | todas | |', 'invalid move folder'),
-            ('| X | example.com | mover `A\tB` | todas | |', 'invalid move folder'),
+            ('| X | example.com | mover ../x | todas | |', 'invalid move folder: ' + FOLDER_CAUSE),
+            ('| X | example.com | mover a/b/c/d/e/f/g/h/i | todas | |', 'invalid move folder: ' + FOLDER_CAUSE),
+            ('| X | example.com | mover `A\tB` | todas | |', 'invalid move folder: ' + FOLDER_CAUSE),
+            ('| X | example.com | mover ' + 'a' * 300 + ' | todas | |',
+             'invalid move folder: target: expected a folder path of 1 to 255 characters'),
             ('| X | example.com | trash | other | |', 'no configured account in scope'),
         ]
         for row, reason in cases:
@@ -943,3 +947,94 @@ class RulesTableTests(unittest.TestCase):
         plan = triage.build_plan(listing, rules, [], self.config)
         self.assertEqual(plan['actions'], [])
         self.assertEqual(plan['reasons'], [])
+
+    def test_cap_only_action_row_is_skipped_and_reported(self):
+        self.setup_store(rules_table('| C1 | bulk@example.com | max 5 | todas | |'))
+        token = triage.acquire(self.store)
+        self.addCleanup(triage.release, self.store, token)
+        for args in [('validate',), ('plan', '--dry-run', '--token', token, '--inbox',
+                                      str(FIXTURES / 'inbox.json'))]:
+            self.assertIn('Rule C1 (line 3) not used: no action step', self.cli(*args))
+
+    def test_missing_answer_on_category_row_keeps_its_number(self):
+        self.start_questions()
+        (self.store / 'never-touch.md').write_text('Family mail\n')
+        self.real_ask()
+        execute.atomic(self.answers_path, dict(run=self.token, answers=[]))
+        report_path = self.store / 'report.md'
+        self.cli('plan', '--token', self.token, '--inbox', str(self.inbox), '--plan-out', str(self.plan_path),
+                 '--report-out', str(report_path), '--answers', str(self.answers_path))
+        plan = json.loads(self.plan_path.read_text())
+        decision = next(d for d in plan['decisions'] if d['id'] == '1')
+        self.assertEqual((decision['reason'], decision['number']), ('P1 not answered', 1))
+        report = report_path.read_text()
+        self.assertIn('P1 not answered', report)
+        self.assertNotIn('Protected by never-touch', report)
+
+    def test_move_target_comma_before_note(self):
+        self.assertEqual(triage.row_steps('move Archive/Reports, except invoices'),
+                         ([{'verb': 'move', 'target': 'Archive/Reports'}], 'except invoices'))
+
+    def test_rules_table_with_bom_is_read(self):
+        text = '\ufeff' + rules_table('| C1 | bulk@example.com | trash | todas | |')
+        rules = triage.read_rules(text, self.path, self.config['accounts'], self.diagnostics)
+        self.assertEqual([(r['id'], r['sender']) for r in rules], [('C1', 'bulk@example.com')])
+        self.assertEqual(self.diagnostics, ['rules: 1 rows read, 0 not used', 'rules: table at line 1'])
+        self.assertEqual(triage.read_list('\ufeffpromo@example.com\n', 'never-touch.md'),
+                         [{'sender': 'promo@example.com'}])
+
+    def test_unicode_domain_sender_row_loads(self):
+        rules = self.read('| C1 | info@' + 'bücher.example | trash | todas | |')
+        self.assertEqual([r['sender'] for r in rules], ['info@' + 'xn--bcher-kva.example'])
+        self.assertEqual(triage.read_list('info@' + 'bücher.example\n', 'never-touch.md'),
+                         [{'sender': 'info@' + 'xn--bcher-kva.example'}])
+
+    def test_sender_without_at_is_not_a_match(self):
+        for sender in ('MAILER-DAEMON', ''):
+            with self.subTest(sender=sender):
+                self.assertFalse(triage.matches(dict(account='home', id='1', sender=sender, subject='x'),
+                                                {'domain': 'example.org'}, protection=True))
+
+    def test_final_read_with_invalid_sender_does_not_block_commit(self):
+        self.setup_store(rules_table('| C1 | bulk@example.com | trash | todas | |'))
+        (self.store / 'never-touch.md').write_text('example.org\n')
+        listing = dict(accounts={'home': 2}, messages=[
+            dict(account='home', id='1', folder='Inbox', sender='bulk@example.com', subject='Item'),
+            dict(account='home', id='2', folder='Inbox', sender='MAILER-DAEMON', subject='Item')])
+        execute.atomic(self.store / 'inbox.json', listing)
+        token = triage.acquire(self.store)
+        self.addCleanup(triage.release, self.store, token)
+        path = self.store / 'plan.json'
+        save_plan(self.store, token, path, triage.build_plan(
+            listing, triage.read_rules(self.path.read_text(), self.path, self.config['accounts']),
+            triage.load_never_touch(self.store / 'never-touch.md'), self.config))
+        machine = execute.Execution(self.store, token, path)
+        final = dict(accounts={'home': 1}, messages=[
+            dict(account='home', id='2', folder='Inbox', sender='MAILER-DAEMON', subject='Item')])
+        machine.state['final_listing'] = final
+        remaining = machine.remaining_items(final, [])
+        self.assertEqual({item['id']: item['reason'] for item in remaining},
+                         {'2': 'Invalid sender: not one valid address'})
+
+    def test_fenced_complete_table_is_not_read(self):
+        text = '\n'.join((
+            rules_table('| A | billing@example.com | trash | home | |'),
+            '```',
+            '| ID | Patrón | Acción | Alcance | Fuente |',
+            '| --- | --- | --- | --- | --- |',
+            '| C | info@example.net | trash | home | |',
+            '```',
+        ))
+        rules = triage.read_rules(text, self.path, self.config['accounts'], self.diagnostics)
+        self.assertEqual([r['id'] for r in rules], ['A'])
+
+    def test_row_without_leading_pipe_after_the_table_is_not_read(self):
+        text = '\n'.join((
+            '| ID | Patrón | Acción | Alcance | Fuente |',
+            '| --- | --- | --- | --- | --- |',
+            '| A | billing@example.com | trash | home | |',
+            'C | info@example.net | trash | home | |',
+            '| D | promo@example.com | archive | home | |',
+        ))
+        rules = triage.read_rules(text, self.path, self.config['accounts'], self.diagnostics)
+        self.assertEqual([r['id'] for r in rules], ['A'])

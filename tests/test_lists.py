@@ -127,7 +127,10 @@ class ListTests(unittest.TestCase):
                                   [(a['id'], a['action'], a['rule']) for a in plan['actions']])
                 else:
                     self.assertEqual(plan['actions'], [])
-                    self.assertTrue(all(reasons[i] == 'Protected by never-touch' for i in expected))
+                    if proceed is None:
+                        self.assertTrue(all(reasons[i].endswith(' not answered') for i in expected))
+                    else:
+                        self.assertTrue(all(reasons[i] == 'Protected by never-touch' for i in expected))
 
     def test_unsubscribe_list_referenced_by_row(self):
         listing = execute.read(self.inbox)
@@ -246,7 +249,16 @@ class ListTests(unittest.TestCase):
         custom.write_text('[[rules]]\nsender = "a@example.net"\n')
         result = self.plan('plan', '--never-touch', str(custom))
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stderr.strip(), 'Refused: ' + triage.LEGACY_HOLDS)
+        self.assertEqual(result.stderr.strip(), 'Refused: protections.toml: ' + triage.LEGACY_HOLDS)
+
+    def test_toml_form_list_names_the_file_it_found(self):
+        with self.assertRaisesRegex(ValueError, r'^unsubscribe\.md: this list is in the old TOML form'):
+            triage.read_list('[[rules]]\n', 'unsubscribe.md', never_touch=False)
+        self.rules.write_text(rules_table('| U1 | unsubscribe.md | baja + trash | todas | own |'))
+        self.unsubscribe.write_text('[[rules]]\n')
+        result = self.plan()
+        self.assertIn('Rule U1 (line 3) not used: unsubscribe.md: this list is in the old TOML form',
+                      result.stdout)
 
     def test_legacy_never_touch_file_refuses(self):
         legacy = self.store / 'never-touch.toml'

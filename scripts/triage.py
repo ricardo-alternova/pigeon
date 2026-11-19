@@ -506,7 +506,7 @@ def validate_state_file(name, raw, config, folder):
     elif name == 'rules.md':
         read_rules(text, folder / name, config['accounts'])
     elif name in LIST_FILES:
-        read_list(text, folder / name)
+        read_list(text, folder / name, never_touch=name == 'never-touch.md')
     elif name == 'tool-paths.json':
         data = parse_json(text, folder / name)
         validate_tool_paths(data, config, drop=True)
@@ -900,9 +900,11 @@ def written_forms(normalized):
     return {normalized, local + at + decoded} if decoded else {normalized}
 
 
-def read_list(text, name, diagnostics=None):
+def read_list(text, name, diagnostics=None, *, never_touch=True):
+    text = text.lstrip('\ufeff')
     if any(TOML_LINE.match(line) for line in text.splitlines()):
-        raise ValueError(LEGACY_HOLDS)
+        raise ValueError(f'{Path(name).name}: ' + (LEGACY_HOLDS if never_touch else
+                                                   'this list is in the old TOML form; write one address or domain per line'))
     entries = []
     for number, raw in enumerate(text.replace('\r\n', '\n').split('\n'), 1):
         line = raw.strip()
@@ -961,6 +963,9 @@ def row_patterns(cell):
             tokens.append(('list', token))
         elif re.fullmatch(r'[^\s@<>;,`*]+@' + DOMAIN_TOKEN, token) and '.' in token.rsplit('@', 1)[1]:
             tokens.append(('sender', token))
+        elif (re.fullmatch(r'[^\s@<>;,`*]+@[^\s@<>;,`*]+', token)
+              and (sender := normalize_sender(token)) and '.' in sender.rsplit('@', 1)[1]):
+            tokens.append(('sender', sender))
         elif domain := domain_pattern(token):
             tokens.append(('domain', domain))
         elif re.fullmatch(r'[^`]+\.(?:md|txt|csv)', word, re.I):
@@ -1001,12 +1006,12 @@ def row_steps(cell):
             if not folder:
                 raise ValueError('move without a folder')
             target = folder[2] or folder[3]
-            if folder[3] and target.endswith(',') and re.match(CAP_PHRASE, rest[folder.end():].lstrip(), re.I):
+            if folder[3] and target.endswith(',') and rest[folder.end():].strip():
                 target = target[:-1]
             try:
                 step['target'] = folder_path(target, template=True)
-            except ValueError:
-                raise ValueError('invalid move folder') from None
+            except ValueError as error:
+                raise ValueError('invalid move folder: ' + str(error)) from None
             rest = rest[folder.end():]
         if verb == 'unsubscribe':
             rest = re.sub(r'^(?:https?://\S+|https\b)', '', rest, flags=re.I)
@@ -1046,6 +1051,7 @@ def action_cap(note):
 
 
 def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
+    text = text.lstrip('\ufeff')
     rules, seen, skipped, warnings, tables = [], set(), [], [], []
     directory = Path(path).resolve().parent
     lists = {}
@@ -1114,7 +1120,8 @@ def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
                     try:
                         if not list_path.resolve().is_relative_to(directory):
                             raise ValueError('file reference outside the rules folder: ' + value)
-                        lists[value] = read_list(load_inputs([list_path], empty=True)[0], value, diagnostics)
+                        lists[value] = read_list(load_inputs([list_path], empty=True)[0], value, diagnostics,
+                                                 never_touch=False)
                     except (ValueError, OSError) as error:
                         lists[value] = str(error)
                 entries = lists[value]
@@ -1136,6 +1143,8 @@ def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
             if any(kind == 'domain' and value.startswith('*.') and value.count('.') == 1 for kind, value in tokens):
                 raise ValueError('wildcard covers a top-level domain')
             steps, action_note = row_steps(action)
+            if not steps:
+                raise ValueError('no action step')
             table_cap, action_note = action_cap(action_note)
             if ident in cap_errors:
                 raise ValueError(cap_errors[ident][0][1])
@@ -1229,11 +1238,16 @@ def folder_path(value, *, template=False):
 def matches(message, rule, protection=False):
     if not protection and message['account'] not in rule.get('accounts', []):
         return False
-    sender = (normalize_sender(message['sender']) or message['sender']) if protection else message['sender']
-    sender = sender.casefold()
+    sender = message['sender']
     if protection:
+        sender = normalize_sender(sender)
+        if sender is None:
+            return False
+        sender = sender.casefold()
         local, domain = sender.rsplit('@', 1)
         sender = local.split('+', 1)[0] + '@' + domain
+    else:
+        sender = sender.casefold()
     if 'sender' in rule and sender != rule['sender'].casefold().rstrip('.'):
         return False
     if 'domain' in rule:
@@ -2031,7 +2045,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                         reason = '' if entry['proceed'] and ('steps' not in rule or kit) else rule['id'] + ': ' + safe_text(note)
                         question = {'note': note} if reason else {}
                     if reason:
-                        if category_text and (not note or not entry['proceed']):
+                        if category_text and entry.get('proceed') is False:
                             reason = 'Protected by never-touch'
                         break
                 if 'steps' in rule:
@@ -2749,7 +2763,13 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
     result = build_plan(listing, [ceiling_rule], holds, config, previous, stops, selections=selections, answers=answers, run_token=run_token, questions=questions, asked=asked)
     if questions:
         return result
-    if sum(a['action'] == ('create-draft' if selections[(a['account'], a['id'])]['action'] == 'draft' else selections[(a['account'], a['id'])]['action']) for a in result['actions']) + sum((d['account'], d['id']) in selections and d['reason']=='Protected by never-touch' for d in result['decisions']) != len(selections) and not result['reasons']:
+    planned = {(a['account'], a['id']) for a in result['actions']}
+    planned |= {(d['account'], d['id']) for d in result['decisions']
+                if d['reason'] == 'Protected by never-touch'
+                or any(problem in d['reason'] for problem in ('not answered', 'answer unreadable',
+                                                              'answers are from another run',
+                                                              'the rule changed after the question'))}
+    if not set(selections) <= planned and not result['reasons']:
         raise ValueError('Reply action could not be planned')
     if sending and result.get('approval_state') == 'awaiting approval':
         if any(selection['action'] != 'send-draft' and selection.get('id') != 'numbered-forward' for selection in selections.values()):
@@ -5195,16 +5215,18 @@ def _main(argv=None, *, now=None):
                             entries = [e for e in result['reply'] if e['number'] == part['number']]
                             saved = next(i for i in source['numbers']['items'] if i['number'] == part['number'])
                             selected_accounts = {m['account'] for m in saved.get('members', [saved])}
-                            protected = [d for d in result['decisions'] if d['reason']=='Protected by never-touch' and any((d['account'],d['id'])==(e['account'],e['id']) for e in entries)]
-                            protected_keys = {(d['account'], d['id']) for d in protected}
-                            counts = {a: sum(e['account'] == a and (e['account'], e['id']) not in protected_keys for e in entries) for a in config['accounts'] if a in selected_accounts}
+                            acted = {(a['account'], a['id']) for a in result['actions']}
+                            kept = [d for d in result['decisions'] if any((d['account'], d['id']) == (e['account'], e['id']) for e in entries) and (d['account'], d['id']) not in acted and d['reason'] != 'Kept by owner reply']
+                            kept_keys = {(d['account'], d['id']) for d in kept}
+                            counts = {a: sum(e['account'] == a and (e['account'], e['id']) not in kept_keys for e in entries) for a in config['accounts'] if a in selected_accounts}
                             skipped = len(saved.get('members', [saved])) - len(entries)
                             accounts = ', '.join(account_name(result, a) + ': ' + str(n) + ((' message' if n == 1 else ' messages') if language == 'en' else (' mensaje' if n == 1 else ' mensajes')) for a, n in counts.items())
                             verb = ({'send-draft': 'send' if language == 'en' else 'enviar', 'forward': 'forward' if language == 'en' else 'reenviar'}.get(part['verb'], part['verb'])) + (' to ' + part['target'] if part['target'] else '')
                             print(str(part['number']) + ' ' + verb + ': ' + accounts + '; ' + str(skipped) + (' skipped as gone.' if language == 'en' else ' omitido' + ('s' if skipped != 1 else '') + ' por no estar en Recibidos.'))
-                            for decision in protected:
+                            for decision in kept:
                                 message = next(m for m in listing['messages'] if (m['account'], m['id']) == (decision['account'], decision['id']))
-                                print(str(part['number']) + ': ' + chat_text(message['sender'])[:160] + ' · ' + chat_text(message['subject'])[:240] + ' · ' + ('Protected by never-touch' if language == 'en' else 'Protegido por never-touch') + (' · ' + safe_text(decision['note']) if 'note' in decision else ''))
+                                reason = 'Protegido por never-touch' if decision['reason'] == 'Protected by never-touch' and language != 'en' else decision['reason']
+                                print(str(part['number']) + ': ' + chat_text(message['sender'])[:160] + ' · ' + chat_text(message['subject'])[:240] + ' · ' + safe_text(reason) + (' · ' + safe_text(decision['note']) if 'note' in decision and decision['note'] != decision['reason'] else ''))
                         if result.get('approval_state') == 'awaiting approval':
                             print('Nothing has run yet.' if language == 'en' else 'Todavía no se ha ejecutado nada.')
                             print(approval_question(result, language))
