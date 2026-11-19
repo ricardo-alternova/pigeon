@@ -1,6 +1,5 @@
 # Install pigeon
 
-pigeon never sends anything without the owner's approval. Sending is off by default. With allow_send=true, "N send" ("N enviar") sends an unchanged draft it created. "N forward HANDLE" ("N reenviar HANDLE") forwards one message to another configured account's address, with no added text, through the mailbox forward-draft operation. Both read the draft back before sending; at most five sends per reply. Only a numbered send or forward approval can authorize sending. It never composes mail or takes draft text or forward recipients from mail; replies use the mailbox reply operation. It never deletes permanently; the calendar stays read-only.
 
 ## Hosted setup
 
@@ -43,7 +42,6 @@ Require config.toml before locking. Use these keys:
 | language | en or es; en. |
 | relist_inbox | all, or new_plus_count for new items and earlier-item counts; all. |
 | timezone | IANA zone for slots/messages; UTC. |
-| allow_send | Boolean; false. Enable only for numbered send and forward requests. |
 | inbox_limit | Positive integer across accounts; 100. |
 | approval_hours | Hours from the question; 1–72; 12. |
 | lock.kind | local or onedrive; local. |
@@ -57,7 +55,7 @@ Require config.toml before locking. Use these keys:
 | accounts.HANDLE.executor_app | Optional app slug for discovery. |
 | accounts.HANDLE.executor_account | Optional gateway ID, 1–128 ASCII letters, digits, underscore or hyphen; unique with executor_app. |
 | accounts.HANDLE.name | Optional name, 1–80 characters, single line without controls; default HANDLE. Reject other names/handles ignoring case. |
-| accounts.HANDLE.address | Mailbox address for identity verification; required on a requested forward’s target account. |
+| accounts.HANDLE.address | Mailbox address for identity verification. |
 | accounts.HANDLE.quiet_kind | history or ids; ids. |
 
 Refuse invalid rules or list lines as described in the [rule reference](setup.md#rules) (a bad never-touch.md line stops the run and names the line; a bad unsubscribe.md line disables the row that names it), and unknown keys and wrong types in config, listings and state.
@@ -125,7 +123,6 @@ For post-action verification call gmail.users.messages.get with `{path:{userId:"
 | move | gmail.users.messages.modify |{path:{userId:"me",id:ID},body:{removeLabelIds:["INBOX"],addLabelIds:[LABEL_ID]}}|
 | spam | gmail.users.messages.modify |{path:{userId:"me",id:ID},body:{removeLabelIds:["INBOX"],addLabelIds:["SPAM"]}}|
 | create-folder | gmail.users.labels.create |{path:{userId:"me"},body:{name:NAME}}|
-| create-draft | gmail.users.drafts.create | Preserve issued draft_text and draft_to. |
 
 ### Outlook
 
@@ -148,7 +145,6 @@ Copy Outlook IDs containing = + and / unchanged.
 | move | meMessage.meMessagesMessageMove |{path:{"message-id":ID},body:{DestinationId:FOLDER_ID}}|
 | spam | meMessage.meMessagesMessageMove |{path:{"message-id":ID},body:{DestinationId:"junkemail"}}|
 | create-folder | meMailFolder.meCreateMailFolders or meMailFolder.meMailFoldersCreateChildFolders |{body:{displayName:NAME}}; for child add path:{"mailFolder-id":PARENT}. |
-| create-draft | meMessage.meMessagesMessageCreateReply or meMessage.meMessagesMessageCreateForward | path:{"message-id":ID}; preserve issued draft_text and draft_to. |
 | message-read | meMessage.meGetMessages |{path:{"message-id":ID},query:{$select:["id","parentFolderId"]}}|
 
 ## Inbox listing
@@ -175,7 +171,3 @@ Page each Inbox into private UTF-8 JSON inbox.json, even above inbox_limit. Neve
 | skipped | Omitted account to reason map: {"cedar":"provider error (503)"} or {"cedar":"pigeon error (listing answer)"}; keep the account and its messages absent. |
 | folders | Handle to existing-folder arrays; require for move rules/replies. |
 | folders.HANDLE[].id, folders.HANDLE[].name | Provider ID and full slash-separated name; include every existing path, never leaf names alone. |
-
-
-
-To enable sending: set allow_send=true in config.toml. Acquire the lock and fetch state as in the quick start. Discover the existing-draft send tool for each sending account, then run `python3 scripts/triage.py tool-save --token TOKEN --account HANDLE --kind send-draft --tool PATH` under PIGEON_HOME, upload state with send-state, and release the lock. Use gmail.users.drafts.send for Gmail or meMessage.meMessagesMessageSend for Outlook, under that account’s configured app. Send only with the owner’s numbered reply; rules and proceed never send.

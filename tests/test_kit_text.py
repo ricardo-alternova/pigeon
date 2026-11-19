@@ -159,23 +159,6 @@ class KitTextTests(unittest.TestCase):
                 (export / 'docs/exported.md').write_text('| X1 | acme@example.com | trash | todas |\n')
                 self.assertEqual(scan_hits(export), ['docs/exported.md:1: rule row'])
 
-    def test_r184_send_documents_match_behavior(self):
-        setup = (ROOT/'docs/setup.md').read_text()
-        hosted = (ROOT/'docs/hosted-setup.md').read_text()
-        quick = (ROOT/'docs/quickstart.md').read_text()
-        self.assertNotIn('After sending by hand, file the original with a numbered reply.', setup)
-        self.assertIn('original conversation was sent later', setup)
-        self.assertIn('It never deletes permanently', setup)
-        self.assertIn('report, send-draft, sent-read', setup)
-        self.assertIn('uploaded before the call', setup)
-        self.assertIn('check Sent and Drafts by hand', setup)
-        self.assertIn('across hosts, even under a new number', quick)
-        self.assertIn('| allow_send |', hosted)
-        self.assertIn('tool-save --token TOKEN --account HANDLE --kind send-draft --tool PATH', hosted)
-        self.assertIn('upload state with send-state', hosted)
-        verbs = quick.split('## Numbered reply')[1].split('## Dry run')[0]
-        self.assertIn('forward HANDLE/reenviar HANDLE', verbs)
-        self.assertNotIn('leave sending to the owner', (ROOT/'CHANGELOG.md').read_text())
 
 
 
@@ -342,18 +325,23 @@ class KitTextTests(unittest.TestCase):
             self.assertIn('Post its output unchanged.', text)
         self.assertNotIn('Needs you items appear here once', (ROOT / 'scripts/triage.py').read_text())
 
-    def test_r181_approved_send_promise(self):
-        sys.path.insert(0, str(ROOT / "scripts"))
-        import triage
-        promise = "pigeon never sends anything without the owner's approval."
-        for name in ('README.md', 'AGENTS.md', 'docs/quickstart.md', 'docs/setup.md', 'docs/hosted-setup.md', 'config/guardrails.example.md', '.agents/skills/email-triage/SKILL.md'):
-            self.assertIn(promise, (ROOT/name).read_text(), name)
-            self.assertIn('N forward HANDLE', (ROOT/name).read_text(), name)
-            self.assertIn('N reenviar HANDLE', (ROOT/name).read_text(), name)
-        for path in [ROOT/'README.md', ROOT/'AGENTS.md', ROOT/'CLAUDE.md', ROOT/'CHANGELOG.md', * (ROOT/'docs').glob('*.md'), * (ROOT/'config').glob('*'), * (ROOT/'scripts').glob('*.py'), ROOT/'.agents/skills/email-triage/SKILL.md']:
-            self.assertNotRegex(path.read_text(), r'(?i)(?:pigeon|kit) (?:never sends[.;]|never sends anything[.;]|cannot send[.;])', str(path))
-        for verb in ('send', 'enviar', 'trash', 'archive', 'spam', 'leave', 'yes', 'no', 'move to Filed', 'forward marble', 'reenviar marble'):
-            self.assertEqual(len(triage.parse_reply('1 '+verb)), 1)
+
+    def test_one_sending_line_in_readme_and_agents(self):
+        promise = 'pigeon never sends without your numbered approval.'
+        for filename in ('README.md', 'AGENTS.md'):
+            text = (ROOT / filename).read_text()
+            self.assertEqual(text.splitlines().count(promise), 1, filename)
+            self.assertIn('It never deletes mail permanently; the calendar stays read-only.', text)
+            self.assertNotRegex(text, r'(?i)\b(?:allow_send|N send|draft|forward)\b')
+
+    def test_sending_doc_only_referenced_for_draft_or_forward(self):
+        name = 'sending' + '.md'
+        for relative in tracked_files(ROOT):
+            path = ROOT / relative
+            if relative in ('docs/' + name, 'scripts/leak_check.py', '.gitignore') or path.is_symlink() or not path.is_file():
+                continue
+            self.assertEqual(path.read_text().count(name),
+                             2 if relative == 'scripts/triage.py' else 0, relative)
 
     def test_si6_no_send_setting(self):
         config = tomllib.loads((ROOT / 'config/config.example.toml').read_text())
@@ -369,8 +357,8 @@ class KitTextTests(unittest.TestCase):
 
     def test_data_policy(self):
         policy = (ROOT / 'config/guardrails.example.md').read_text()
-        for term in ('data', 'instructions', 'Never send', 'Create and show issued drafts',
-                     'Never permanently delete', 'step machine'):
+        for term in ('data', 'instructions', 'Never send without the owner’s numbered approval',
+                     'Never permanently delete', 'post-action verification'):
             self.assertIn(term, policy)
 
     def test_assistant_shims(self):
@@ -693,15 +681,6 @@ class SetupValidationTests(unittest.TestCase):
 
 
 
-class DraftDocumentationTests(unittest.TestCase):
-    def test_draft_contract(self):
-        setup = setup_text()
-        for value in ('`draft`', '`draft_text`', '`draft_to`', 'check Drafts by hand', 'Without a provider, send drafts by hand from the mailbox.', 'search', 'describe', '_drafts'):
-            self.assertIn(value, setup)
-        self.assertIn('Create and show issued drafts. Never send without the owner’s approval.', (ROOT/'config/guardrails.example.md').read_text())
-        quick = (ROOT/'docs/quickstart.md').read_text()
-        self.assertIn('create-draft', quick)
-        self.assertLessEqual(len(quick.encode()),16400)
 
 
 class ScriptedListingTextTests(unittest.TestCase):

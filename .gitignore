@@ -39,6 +39,7 @@ tests/fixtures/*
 !docs/setup.md
 !docs/hosted-setup.md
 !docs/quickstart.md
+!docs/sending.md
 !config/config.example.toml
 !config/guardrails.example.md
 !rules/rules.example.md

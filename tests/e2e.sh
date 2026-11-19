@@ -747,6 +747,77 @@ run('triage.py','release','--token',token)
 print('PASS: calendar stays read-only during rehearsal and a Markdown-rule archive')
 PYDRAFT
 
+# Walk the sending document's commands with an invented mailbox in an empty environment.
+env -i PATH="$PATH" PIGEON_HOME="$scratch/send-walk" python3 - <<'PYSEND'
+import json, os, re, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, 'tests')
+from mock_provider import MockGateway, rules_table
+
+store = Path(os.environ['PIGEON_HOME'])
+def run(*args, token=None):
+    env = dict(os.environ)
+    if token:
+        env['TOKEN'] = token
+    return subprocess.run(args, env=env, text=True, capture_output=True, check=True).stdout.strip()
+
+def triage(*args):
+    return run('python3', 'scripts/triage.py', *args)
+
+triage('setup')
+config = {'accounts': {'cedar': dict(provider='outlook', executor_app='cedar',
+                                     executor_account='cedar-example', address='reader@example.org')}}
+(store / 'config.toml').write_text('[accounts.cedar]\n' + ''.join(
+    f'{key}="{value}"\n' for key, value in config['accounts']['cedar'].items()))
+listing = dict(accounts={'cedar': 1}, folders={'cedar': [dict(id='reading', name='Reading')]}, messages=[
+    dict(account='cedar', id='m1', folder='Inbox', sender='boss@example.org',
+         subject='Question', date='2026-11-11T00:00:00+00:00')])
+mock = MockGateway(listing, config)
+plan, inbox = str(store / 'plan.json'), str(store / 'inbox.json')
+
+def list_inbox(token):
+    response = json.loads(triage('listing', '--token', token))
+    while 'calls' in response:
+        results = store / 'listing-results.json'
+        results.write_text(json.dumps(mock.batch(response['calls'])))
+        response = json.loads(triage('listing', '--token', token, '--results', str(results)))
+    assert Path(inbox).is_file(), response
+
+token = triage('lock')
+list_inbox(token)
+report = store / 'preview.md'
+args = ('--token', token, '--inbox', inbox, '--plan-out', plan, '--report-out', str(report))
+assert triage('plan', *args) == ''
+assert 'sending' not in report.read_text() and 'reply N send' not in report.read_text()
+(store / 'rules.md').write_text(rules_table('| D1 | boss@example.org | borrador Thanks, will review | cedar | |'))
+assert json.loads(triage('plan', *args)) == {'sending': 'docs/' + 'sending' + '.md'}
+assert json.loads(Path(plan).read_text())['actions'] == []
+assert json.loads(run('python3', 'scripts/execute.py', 'next', '--token', token, '--plan', plan)) == {'done': True}
+triage('commit-state', '--token', token, '--plan', plan)
+message = triage('message', '--token', token, '--plan', plan)
+assert '1. ' in message and 'D1 draft: Thanks, will review' in message
+assert 'reply N send after checking the draft' in message
+triage('release', '--token', token)
+
+token = triage('lock')
+list_inbox(token)
+(store / 'reply.txt').write_text('1 send')
+doc = Path('docs', 'sending' + '.md').read_text()
+real, dry = re.findall(r'```sh\n(.*?)\n```', doc, re.S)
+output = run('sh', '-eu', '-c', dry, token=token)
+assert output.startswith('Dry run: would approve send for 1 (D1 draft)') and 'Send approved' not in output
+output = run('sh', '-eu', '-c', real, token=token)
+assert output.startswith('Send approved for 1 (D1 draft): follow docs/')
+assert json.loads(Path(plan).read_text())['send'] == [
+    {'account': 'cedar', 'id': 'm1', 'row': 'D1', 'kind': 'draft'}]
+assert json.loads(run('python3', 'scripts/execute.py', 'next', '--token', token, '--plan', plan)) == {'done': True}
+triage('commit-state', '--token', token, '--plan', plan)
+assert not (store / 'calls.jsonl').exists()
+assert listing['messages'][0]['id'] == 'm1'
+triage('release', '--token', token)
+print('PASS: sending instructions in env -i, numbered approval and no kit mail call')
+PYSEND
+
 # Identity is fictional; the hook must refuse the private path, not bad content.
 git config user.name 'Kit Test'
 git config user.email 'kit@example.com'

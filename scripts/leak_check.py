@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 ALLOWLIST = set('''CHANGELOG.md README.md LICENSE AGENTS.md CLAUDE.md .gitignore
-.agents/skills/email-triage/SKILL.md .claude/skills docs/setup.md docs/hosted-setup.md docs/quickstart.md
+.agents/skills/email-triage/SKILL.md .claude/skills docs/setup.md docs/hosted-setup.md docs/quickstart.md docs/sending.md
 config/config.example.toml config/guardrails.example.md
 rules/rules.example.md rules/never-touch.example.md rules/unsubscribe.example.md
 tests/test_lists.py

@@ -44,68 +44,36 @@ class MatcherTests(unittest.TestCase):
         self.config['accounts'] = {'cedar': {}}
         self.rules = [dict(id='r' + str(i), accounts=['cedar'], sender='s' + str(i) + '@example.net', action=verb) for i in range(groups)]
 
-    def test_r179_send_tool_closed_paths(self):
-        for provider, tail in [('gmail', 'gmail.users.drafts.send'), ('outlook', 'meMessage.meMessagesMessageSend')]:
-            config = dict(allow_send=True, accounts={'cedar':dict(provider=provider, executor_app='cedar')})
-            for prefix in ('tools.cedar.', 'tools["cedar"].'):
-                path = prefix + tail
-                self.assertEqual(triage.checked_tool(config, 'cedar', 'send-draft', path), 'tools.cedar.' + tail)
-                for enabled in (False, None):
-                    with self.assertRaises(ValueError):
-                        triage.checked_tool(config | {'allow_send':enabled}, 'cedar', 'send-draft', path)
-                for bad in (tail.upper(), tail + '.send', 'gmail.users.messages.send', 'meMessage.meSendMail', 'meMessage.meMessagesMessageReply', 'meMessage.meMessagesMessageForward', 'gmail.users.messages.delete'):
-                    with self.assertRaises(ValueError):
-                        triage.checked_tool(config, 'cedar', 'send-draft', prefix + bad)
-                for kind in ('trash', 'create-draft', 'message-read'):
-                    with self.assertRaises(ValueError):
-                        triage.checked_tool(config, 'cedar', kind, path)
 
-    def test_r179_allow_send_boolean(self):
-        for value in (True, False):
-            triage.validate_inputs(self.listing, self.config | {'allow_send': value}, {})
-        for value in (None, 0, 1, 'true', [], {}):
-            with self.assertRaisesRegex(ValueError, '^config.allow_send: expected boolean$'):
+
+
+    def test_r179_send_tool_closed_paths(self):
+        for provider, paths in (
+            ('gmail', ('gmail.users.drafts.send', 'gmail.users.messages.send')),
+            ('outlook', ('meMessage.meMessagesMessageSend', 'meMessage.meSendMail',
+                         'meMessage.meMessagesMessageReply', 'meMessage.meMessagesMessageForward')),
+        ):
+            config = dict(accounts={'cedar': dict(provider=provider, executor_app='cedar')})
+            for prefix in ('tools.cedar.', 'tools["cedar"].'):
+                for tail in paths:
+                    for kind in triage.TOOL_KINDS | {'send-draft', 'create-draft', 'sent-read'}:
+                        with self.subTest(provider=provider, path=prefix + tail, kind=kind):
+                            with self.assertRaises(ValueError):
+                                triage.checked_tool(config, 'cedar', kind, prefix + tail)
+
+    def test_allow_send_refused(self):
+        for value in (True, False, 'true'):
+            with self.assertRaisesRegex(ValueError, r'^config.allow_send is no longer read; remove it$'):
                 triage.validate_inputs(self.listing, self.config | {'allow_send': value}, {})
 
     def test_r179_disabled_send_guard_randomized(self):
         import random
-        import hashlib
-        snapshots = []
         for seed in range(12):
             rng = random.Random(seed)
-            self.batch(rng.randint(1, 9), groups=rng.randint(1, 3), verb=rng.choice(['trash', 'archive', 'spam']))
-            plan = self.plan()
-            snapshots.append([plan, triage.render_report(plan, self.listing), triage.render_remaining(plan, self.listing), triage.parse_reply('1 leave')])
-            for setting in ({}, {'allow_send': False}):
-                candidate = triage.build_plan(self.listing, self.rules, [], self.config | setting)
-                self.assertEqual(json.dumps(candidate), json.dumps(plan))
-                self.assertEqual(triage.render_report(candidate, self.listing), triage.render_report(plan, self.listing))
-            # Freeze only the report clock; no repository/history dependency.
-            from datetime import datetime, timezone
-            from unittest.mock import patch
-            import execute
-            class Clock(datetime):
-                @classmethod
-                def fromtimestamp(cls, timestamp, tz=None):
-                    return datetime(2026, 1, 1, tzinfo=timezone.utc).astimezone(tz or timezone.utc)
-            with tempfile.TemporaryDirectory() as directory:
-                store = Path(directory)
-                token = triage.acquire(store)
-                execute.atomic(store/'inbox.json', self.listing)
-                execute.atomic(store/'plan.json', plan | {'run_token':token})
-                messages = []
-                for config_text in ('[accounts.cedar]\n', 'allow_send=false\n[accounts.cedar]\n'):
-                    (store/'config.toml').write_text(config_text)
-                    with patch.object(triage, 'datetime', Clock):
-                        messages.append(triage.render_message(store, token, store/'plan.json', None))
-                self.assertEqual(messages[0], messages[1])
-                self.assertNotIn('Run failed at message', messages[0])
-                snapshots[-1].append(messages[0])
-            for reply in ('1 send', '1 enviar'):
-                with self.assertRaises(ValueError) as error:
-                    triage.reply_plan(store, self.listing, [], self.config, {}, triage.parse_reply(reply))
-                self.assertEqual(len(str(error.exception).splitlines()), 1)
-        self.assertEqual(hashlib.sha256(json.dumps(snapshots, sort_keys=True).encode()).hexdigest(), '411f0eb8b466450009ea60dd2235979e6baea1c657385c466259365cee8f5c36')
+            self.batch(rng.randint(1, 9), groups=rng.randint(1, 3),
+                       verb=rng.choice(['trash', 'archive', 'spam']))
+            self.assertTrue(all(a['action'] in triage.PLAN_VERBS for a in self.plan()['actions']))
+            self.assertFalse(any('send' in verb or 'draft' in verb for verb in triage.PLAN_VERBS))
 
     def test_keep_latest_account_copies_and_approval(self):
         self.batch(13, verb='archive')
@@ -956,7 +924,7 @@ class CalendarTests(unittest.TestCase):
 
     def test_no_calls_or_replies(self):
         import execute
-        self.assertEqual(execute.CALL_KINDS, frozenset({'trash', 'archive', 'move', 'spam', 'unsubscribe', 'create-folder', 'create-draft', 'send-draft'}))
+        self.assertEqual(execute.CALL_KINDS, frozenset({'trash', 'archive', 'move', 'spam', 'unsubscribe', 'create-folder'}))
         for text in ('accept event a', 'calendar oak a', '1 decline', 'move event a'):
             with self.assertRaisesRegex(ValueError, 'owner answers invitations in the calendar itself'):
                 triage.parse_reply(text)

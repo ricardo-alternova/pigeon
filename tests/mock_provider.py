@@ -82,9 +82,6 @@ class MockGateway:
             if call['action'] == 'create-folder':
                 assert 'body' in inner
                 return {'id':'folder-example'}
-            if call['action'] == 'create-draft':
-                assert inner['draft_text'] == call['draft_text']
-                return {'id':'draft-example'}
             assert call['action'] in {'trash', 'archive', 'move', 'spam'}
             assert inner['path'].get('id', inner['path'].get('message-id')) == call['id']
             self.listing['messages'][:] = [m for m in self.listing['messages']

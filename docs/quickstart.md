@@ -1,6 +1,5 @@
 # Routine run
 
-pigeon never sends anything without the owner's approval. Sending is off by default. With allow_send=true, "N send" ("N enviar") sends an unchanged draft it created. "N forward HANDLE" ("N reenviar HANDLE") forwards one message to another configured account's address, with no added text, through the mailbox forward-draft operation. Both read the draft back before sending; at most five sends per reply. Only a numbered send or forward approval can authorize sending. It never composes mail or takes draft text or forward recipients from mail; replies use the mailbox reply operation. It never deletes permanently; the calendar stays read-only.
 
 Read config.toml and guardrails.md. Replace paths/TOKEN.
 
@@ -80,7 +79,7 @@ Pass calls unchanged once. Without path/input use [action recipes](hosted-setup.
 PIGEON_HOME=/absolute/private-store python3 scripts/execute.py result --token TOKEN --plan /absolute/private-store/plan.json --results /absolute/private-store/gateway-results.json
 ```
 
-Report each batch before next (at most 50 calls/account). Create drafts once, with a returned id; send only an issued owner-approved draft.
+Report each batch before next (at most 50 calls/account).
 
 For create-folder, return results, read verify’s folders, then confirm ID/full path:
 
@@ -88,7 +87,7 @@ For create-folder, return results, read verify’s folders, then confirm ID/full
 
 Issue dependent moves only after this confirmation. Use saved tool fields; for a missing or unknown path follow Unknown tool path below. If next returns run, execute that argument list once.
 
-Without a provider, carry call/verify. Trash → Trash, archive → outside Inbox, move → target, spam → Spam/Junk. Return --observation with outcome and in_inbox or complete inbox_ids; for a folder add folder_id. For a draft return outcome and draft_id.
+Without a provider, carry call/verify. Trash → Trash, archive → outside Inbox, move → target, spam → Spam/Junk. Return --observation with outcome and in_inbox or complete inbox_ids; for a folder add folder_id.
 
 On final_reads run `PIGEON_HOME=/absolute/private-store python3 scripts/execute.py final --token TOKEN --plan /absolute/private-store/plan.json`; carry its ids-only calls and resume with --results /absolute/private-store/gateway-results.json until done. Read each account's whole Inbox once, preserving inbox.json. For manual reads run `PIGEON_HOME=/absolute/private-store python3 scripts/execute.py final --token TOKEN --plan /absolute/private-store/plan.json --inbox /absolute/private-store/final-inbox.json`.
 
@@ -206,11 +205,11 @@ Use tool; if absent, search/describe the account’s operation. Unknown listing 
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py tool-save --token TOKEN --account ACCOUNT --kind move --tool 'tools["cedar-mail"].gmail.users.messages.modify'`
 
-Replace ACCOUNT/kind/tool with account/operation/discovered path. Continue only if unexecuted; never repeat an uncertain action. Paths: 200 characters max under executor_app; provider's allowed tool for kind. No segment containing send/delete or reply/forward outside create-draft. Keep tool-paths.json script-owned.
+Replace ACCOUNT/kind/tool with account/operation/discovered path. Continue only if unexecuted; never repeat an uncertain action. Paths: 200 characters max under executor_app; provider's allowed tool for kind. No segment may contain send, delete, reply or forward. Keep tool-paths.json script-owned.
 
 ## Numbered reply
 
-For numbered replies, acquire, fetch, validate and list afresh; omit quiet-check, position reads and --scheduled. Keep positions unchanged. Save the user's text verbatim in reply.txt. Verbs: trash, archive, spam, move to <existing folder>, leave, yes, no; with allow_send=true also send/enviar and forward HANDLE/reenviar HANDLE. Separate parts with commas, semicolons or line breaks. Shared numbers act on every saved member; send refuses missing members. Carry draft reads and single send calls once; An issued send or forward blocks repetition across hosts, even under a new number; check Sent and Drafts by hand.
+For numbered replies, acquire, fetch, validate and list afresh; omit quiet-check, position reads and --scheduled. Keep positions unchanged. Save the user's text verbatim in reply.txt. Verbs: trash, archive, spam, move to <existing folder>, leave, yes, no. Separate parts with commas, semicolons or line breaks. Shared numbers act on every saved member.
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py reply --token TOKEN --inbox /absolute/private-store/inbox.json --reply /absolute/private-store/reply.txt --plan-out /absolute/private-store/plan.json --report-out /absolute/private-store/report.md`
 
@@ -236,6 +235,5 @@ Read history position/Inbox arrivals or ten newest ordered IDs; use error/expire
 
 First installation/Gateway recipes: [Hosted setup](hosted-setup.md). Unsubscribe: [Advanced setup](setup.md); [Markdown rules](setup.md#rules).
 
-If plan returns draft-check calls, carry the array unchanged, save results, and repeat plan with `--draft-check-results FILE`. Remove the response afterward. This checks recorded after_send drafts and their conversations in Sent. Dry runs save responses under .dry-run.
 
 If next returns state_send_required, run its printed send-state command through the state-upload loop, then next again. No mail write runs before approval is saved.

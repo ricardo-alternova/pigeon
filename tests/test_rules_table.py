@@ -451,9 +451,10 @@ class RulesTableTests(unittest.TestCase):
         self.assertEqual(triage.ACTION_WORDS, {
             'trash': 'trash', 'archive': 'archive', 'spam': 'spam', 'move': 'move',
             'mover': 'move', 'unsubscribe': 'unsubscribe', 'baja': 'unsubscribe',
+            'draft': 'draft', 'borrador': 'draft', 'forward': 'forward', 'reenviar': 'forward',
         })
         message = dict(account='home', id='m', folder='Inbox', sender='billing@example.com', subject='Receipt')
-        for verb in ('delete', 'borrar', 'eliminar', 'vaciar', 'send', 'draft', 'trash_all'):
+        for verb in ('delete', 'borrar', 'eliminar', 'vaciar', 'send', 'trash_all'):
             with self.subTest(verb=verb):
                 rules = self.read(f'| A | billing@example.com | {verb} + trash | todas | |')
                 plan = triage.build_plan(dict(accounts={'home': 1}, messages=[message]), rules, [], self.config)
