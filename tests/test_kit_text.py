@@ -181,7 +181,7 @@ class KitTextTests(unittest.TestCase):
                      'may change executor', 'can change executor',
                      'may send', 'can send', 'send is allowed')
         for name in DOCS + ['config/config.example.toml',
-                            'rules/rules.example.md', 'rules/never-touch.example.toml',
+                            'rules/rules.example.md', 'rules/never-touch.example.md', 'rules/unsubscribe.example.md',
                             '.gitignore']:
             text = (ROOT / name).read_text().casefold()
             for phrase in forbidden:
@@ -499,7 +499,8 @@ class SetupValidationTests(unittest.TestCase):
             for source, target in [('config/config.example.toml', 'config.toml'),
                                    ('config/guardrails.example.md', 'guardrails.md'),
                                    ('rules/rules.example.md', 'rules.md'),
-                                   ('rules/never-touch.example.toml', 'never-touch.toml')]:
+                                   ('rules/never-touch.example.md', 'never-touch.md'),
+                                   ('rules/unsubscribe.example.md', 'unsubscribe.md')]:
                 shutil.copyfile(ROOT / source, store / target)
             env = dict(os.environ, PIGEON_HOME=folder)
             def validate():
@@ -508,7 +509,7 @@ class SetupValidationTests(unittest.TestCase):
             before = {p.name: p.read_bytes() for p in store.iterdir()}
             result = validate()
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('2 accounts, 0 rules, 1 never-touch', result.stdout)
+            self.assertIn('2 accounts, 0 rules, 0 never-touch', result.stdout)
             self.assertEqual(before, {p.name: p.read_bytes() for p in store.iterdir()})
             (store / 'config.toml').write_text('language="bad"\ninbox_limit=0\n[accounts.cedar]\n')
             (store / 'rules.md').write_bytes(b'\xff')
@@ -532,7 +533,7 @@ class SetupValidationTests(unittest.TestCase):
             for target in re.findall(r'\]\(([^)]+)\)', guardrails):
                 self.assertTrue(Path(target.split('#')[0]).is_file(), target)
             before = {p.name: p.read_bytes() for p in store.iterdir()}
-            self.assertEqual(set(before), {'config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md'})
+            self.assertEqual(set(before), {'config.toml', 'rules.md', 'never-touch.md', 'unsubscribe.md', 'guardrails.md'})
             self.assertEqual(subprocess.run(command, env=env, capture_output=True).returncode, 0)
             self.assertEqual(before, {p.name: p.read_bytes() for p in store.iterdir()})
             (store / 'rules.md').unlink()

@@ -1,4 +1,0 @@
-# Never-touch examples: docs/setup.md#rules
-[[rules]]
-accounts = ["cedar", "marble"]
-sender = "keeper@example.com"

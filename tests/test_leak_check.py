@@ -376,7 +376,8 @@ class Guards(unittest.TestCase):
     def test_wiring_and_allowlist_ignore(self):
         for name in ('hooks/pre-commit', 'hooks/pre-push', '.github/workflows/check.yml'):
             self.assertIn('scripts/leak_check.py', (ROOT / name).read_text())
-        self.write('tests/fixtures/.gitignore', (ROOT / 'tests/fixtures/.gitignore').read_text())
+        for name in ('rules/.gitignore', 'tests/.gitignore', 'tests/fixtures/.gitignore'):
+            self.write(name, (ROOT / name).read_text())
         for name in checker.ALLOWLIST:
             self.assertNotEqual(self.run_command('git', 'check-ignore', '--no-index', name).returncode, 0, name)
         self.assertIn('--staged', (ROOT / 'hooks/pre-commit').read_text())

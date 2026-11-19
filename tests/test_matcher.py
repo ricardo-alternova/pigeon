@@ -30,9 +30,9 @@ class MatcherTests(unittest.TestCase):
         ])
         self.rules = [dict(id='digest', accounts=['cedar', 'marble'], sender='digest@example.net',
                            subject='Weekly*', action='trash'),
-                      dict(id='receipts', accounts=['cedar'], domain='example.org', has_attachment=True,
+                      dict(id='receipts', accounts=['cedar'], sender='receipt@example.org',
                            action='archive')]
-        self.holds = tomllib.loads((ROOT / 'rules/never-touch.example.toml').read_text())['rules']
+        self.holds = triage.read_list('keeper@example.com', 'never-touch.md')
         self.config = tomllib.loads((ROOT / 'config/config.example.toml').read_text())
 
     def plan(self, **kw):
@@ -303,8 +303,8 @@ class MatcherTests(unittest.TestCase):
         self.batch(30)
         with tempfile.TemporaryDirectory() as directory:
             store = Path(directory)
-            names = ('config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md')
-            for name, content in zip(names, ('[accounts.cedar]\n', rules_table(), 'allow_empty=true\n',
+            names = ('config.toml', 'rules.md', 'never-touch.md', 'guardrails.md')
+            for name, content in zip(names, ('[accounts.cedar]\n', rules_table(), '',
                                              '- C1 max 25\n- C9 max 5\n')):
                 (store / name).write_text(content)
             for action, expected in [('trash', 25), ('trash, max 40', 25), ('trash, max 20', 20)]:
@@ -367,9 +367,9 @@ class MatcherTests(unittest.TestCase):
         self.batch(30)
         with tempfile.TemporaryDirectory() as directory:
             store = Path(directory)
-            names = ('config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md')
+            names = ('config.toml', 'rules.md', 'never-touch.md', 'guardrails.md')
             for name, content in zip(names, ('[accounts.cedar]\n', rules_table('| C1 | s0@example.net | trash, max 40 | todas | |'),
-                                             'allow_empty=true\n', '- C1 máx 25\n')):
+                                             '', '- C1 máx 25\n')):
                 (store / name).write_text(content)
             for guardrails, expected in (('- C1 máx 25\n', 25), ('- C1 max 25.\n', 25)):
                 with self.subTest(guardrails=guardrails):
@@ -473,14 +473,14 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(self.plan()['reasons'], reasons)
 
     def test_si10_safety_files_missing(self):
-        for name in ('guardrails.md', 'rules.md', 'never-touch.toml'):
+        for name in ('guardrails.md', 'rules.md', 'never-touch.md'):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 p = Path(tmp) / name
                 with self.assertRaises(OSError):
                     triage.load_inputs([p])
 
     def test_si10_safety_files_unreadable(self):
-        for name in ('guardrails.md', 'rules.md', 'never-touch.toml'):
+        for name in ('guardrails.md', 'rules.md', 'never-touch.md'):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 p = Path(tmp) / name
                 p.write_text('policy')
@@ -528,13 +528,6 @@ class MatcherTests(unittest.TestCase):
         self.holds = [dict(sender='s0@example.net')]
         self.assertEqual(self.plan()['actions'], [])
 
-    def test_f2_rule_file_schema(self):
-        for text in ('[[never_touch]]\nsender="keeper@example.com"', '[[rule]]\nsender="keeper@example.com"', '# empty'):
-            with self.subTest(text=text), self.assertRaises(ValueError):
-                triage.parse_holds(text)
-        self.assertEqual(triage.parse_holds('allow_empty = true'), [])
-
-
     def test_f4_sender_normalization(self):
         self.batch(1)
         self.holds = [dict(sender='s0@example.net')]
@@ -581,14 +574,6 @@ class MatcherTests(unittest.TestCase):
             self.assertEqual(triage.private_store(repo / 'private' / 'plan.json', output=True),
                              repo / 'private' / 'plan.json')
 
-    def test_scope_and_predicate_types(self):
-        for field, value in [('accounts', 'cedar'), ('accounts', []), ('accounts', ['unknown']),
-                             ('has_attachment', 'true'), ('sender', 3), ('domain', 3), ('subject', 3)]:
-            self.batch(1)
-            self.holds = [dict(sender='s0@example.net', accounts=['cedar']) | {field: value}]
-            with self.subTest(field=field), self.assertRaises(ValueError):
-                self.plan()
-
     def test_expected_counts_and_stopped_recovery(self):
         self.batch(3)
         result = self.plan()
@@ -611,13 +596,6 @@ class MatcherTests(unittest.TestCase):
         self.listing['messages'] *= 2
         with self.assertRaises(ValueError):
             self.plan()
-
-    def test_attachment_hold(self):
-        self.batch(1)
-        self.holds = [dict(sender='s0@example.net', has_attachment=True)]
-        self.assertEqual(len(self.plan()['actions']), 1)
-        self.listing['messages'][0]['has_attachment'] = True
-        self.assertEqual(self.plan()['actions'], [])
 
     def test_planner_validates_generated_actions(self):
         from unittest.mock import patch
@@ -647,9 +625,6 @@ class MatcherTests(unittest.TestCase):
         self.assertFalse(any(unicodedata.category(c) in {'Cc', 'Cf', 'Cs'} for c in text))
         text.encode('utf-8')
         self.assertIn('control', text)
-        self.holds = [dict(subject='(unclosed')]
-        with self.assertRaisesRegex(ValueError, 'Invalid subject regex'):
-            self.plan()
 
 
 class BodyQuestionTests(unittest.TestCase):
@@ -744,9 +719,6 @@ class TypoSafetyTests(unittest.TestCase):
         from unittest.mock import patch
         with patch.dict('os.environ', PIGEON_HOME=''), self.assertRaisesRegex(ValueError, 'PIGEON_HOME.*empty'):
             triage.private_store()
-        self.holds[0]['domain'] = 5
-        with self.assertRaisesRegex(ValueError, 'domain: expected a non-empty string'):
-            triage.validate_holds(self.holds)
 
 
     def test_home_and_output_paths(self):
@@ -897,7 +869,7 @@ class CalendarTests(unittest.TestCase):
             (store / 'guardrails.md').write_text('Fixture policy\n')
             (store / 'inbox.json').write_text(json.dumps(listing))
             (store / 'rules.md').write_text(rules_table())
-            (store / 'never-touch.toml').write_text('allow_empty=true\n')
+            (store / 'never-touch.md').write_text('')
             save_plan(store, token, store / 'plan.json', plan)
             self.assertIn(text, triage.render_message(store, token, store / 'plan.json', None))
         self.config['language'] = 'en'
@@ -1008,7 +980,7 @@ class ListingTests(unittest.TestCase):
                 self.listing['messages'].append(m)
         (self.store/'config.toml').write_text('\n'.join('[accounts.'+a+']\n'+'\n'.join(k+'='+json.dumps(v) for k,v in f.items()) for a,f in self.config['accounts'].items()))
         (self.store/'rules.md').write_text(rules_table())
-        (self.store/'never-touch.toml').write_text('allow_empty=true\n')
+        (self.store/'never-touch.md').write_text('')
         (self.store/'guardrails.md').write_text('Fixture guardrails\n')
         self.token = triage.acquire(self.store)
         self.gateway = MockGateway(self.listing,self.config)
@@ -1470,11 +1442,11 @@ class RuleCaseTests(unittest.TestCase):
             store = Path(tmp)
             (store / 'config.toml').write_text('[accounts.cedar]\n')
             (store / 'rules.md').write_text(rules_table('| M1 | billing@example.com | move `Bills/{year}/{month}` | cedar | |'))
-            (store / 'never-touch.toml').write_text('allow_empty=true\n')
+            (store / 'never-touch.md').write_text('')
             (store / 'guardrails.md').write_text('Fixture policy\n')
             (store / 'cases.toml').write_text('[[cases]]\nname="monthly"\naccount="cedar"\nsender="billing@example.com"\nsubject="Invoice"\nexpect="move"\nexpect_rule="M1"\n')
             notes = []
-            config, rules, holds = triage.load_safety([store / n for n in ('config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md')], notes)
+            config, rules, holds = triage.load_safety([store / n for n in ('config.toml', 'rules.md', 'never-touch.md', 'guardrails.md')], notes)
             self.assertIsNone(triage.run_month(store, config))
             self.assertEqual(triage.rule_cases(store, config, rules, holds), ([], 1))
 
@@ -1484,7 +1456,7 @@ class RuleCaseTests(unittest.TestCase):
             store=Path(tmp)
             (store/'config.toml').write_text('[accounts.cedar]\n')
             (store/'rules.md').write_text(rules_table())
-            (store/'never-touch.toml').write_text('allow_empty=true\n')
+            (store/'never-touch.md').write_text('')
             (store/'guardrails.md').write_text('Fixture guardrails')
             (store/'cases.toml').write_text('[[cases]]\nname="mismatch"\naccount="cedar"\nsender="reader@example.org"\nsubject="SECRET SAMPLE"\nexpect="archive"\n')
             before={p.name:p.read_bytes() for p in store.iterdir()}
@@ -1833,9 +1805,10 @@ class CrossAccountIdentityTests(unittest.TestCase):
                     else:
                         from datetime import datetime, timedelta
                         messages[1]['date'] = (datetime.fromisoformat(messages[0]['date']) + timedelta(seconds=delta)).isoformat()
-                    holds = [dict(accounts=['birch'], sender='a@example.com')] if protected else []
+                    holds = [dict(judgment='Family mail')] if protected else []
+                    rules = [dict(id='r', accounts=['birch'], sender='a@example.com', action='archive')] if protected else []
                     listing = dict(accounts={a: 1 for a in accounts}, messages=messages)
-                    plan = triage.build_plan(listing, [], holds, dict(accounts=accounts, language=language))
+                    plan = triage.build_plan(listing, rules, holds, dict(accounts=accounts, language=language))
                     for n, item in enumerate(plan['remaining']): item['number'] = n+1
                     outcomes = triage.message_outcomes(plan, listing, plan['remaining'], [], language)
                     self.assertEqual(len(outcomes), expected)

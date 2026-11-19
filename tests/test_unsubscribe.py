@@ -123,7 +123,7 @@ class FlowTests(unittest.TestCase):
         self.token = triage.acquire(self.store)
         (self.store / 'config.toml').write_text('[accounts.cedar]\n')
         (self.store / 'rules.md').write_text(rules_table('| leave | subject: Weekly | unsubscribe + trash | cedar | |'))
-        (self.store / 'never-touch.toml').write_text('allow_empty=true\n')
+        (self.store / 'never-touch.md').write_text('')
         self.message = dict(account='cedar', id='m1', folder='Inbox', sender='a@example.net', subject='Weekly', unsubscribe_url='https://example.net/', unsubscribe_one_click=True)
 
     def machine(self):

@@ -207,7 +207,7 @@ class Execution:
         guardrails = self.store / 'guardrails.md'
         rules = triage.read_rules(triage.load_inputs([self.store / 'rules.md'])[0], self.store / 'rules.md', config['accounts'],
                                   guardrails=triage.load_inputs([guardrails])[0] if guardrails.exists() else '')
-        holds = triage.parse_holds(triage.load_inputs([self.store / 'never-touch.toml'])[0])
+        holds = triage.load_never_touch(self.store / 'never-touch.md')
         previous = read(self.store / 'state.json') if (self.store / 'state.json').exists() else {}
         previous = triage.recover_drafts(self.store, previous, self.token)
         triage.validate_drafts(previous.get('_drafts', []), config)
@@ -441,7 +441,7 @@ class Execution:
         final = 'final_listing' in self.state
         items = triage.remaining_items(self.plan, listing, observed, final=final)
         if final:
-            holds = triage.parse_holds(triage.read_text(self.store / 'never-touch.toml'))
+            holds = triage.load_never_touch(self.store / 'never-touch.md')
             messages = {(m['account'], m['id']): m for m in listing['messages']}
             for item in items:
                 if any(triage.matches(messages[item['account'], item['id']], rule, protection=True) for rule in holds if 'judgment' not in rule):
@@ -451,7 +451,7 @@ class Execution:
         return items
 
     def protected_actions(self):
-        holds = triage.parse_holds(triage.read_text(self.store / 'never-touch.toml'))
+        holds = triage.load_never_touch(self.store / 'never-touch.md')
         messages = {(m['account'], m['id']): m for m in read(self.store / 'inbox.json')['messages']}
         return [a for a in self.plan['actions']
                 if (a['account'], a['id']) in messages
@@ -1079,7 +1079,7 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
     temporary = tempfile.TemporaryDirectory(prefix='simulation-', dir=folder)
     scratch = Path(temporary.name)
     try:
-        for name in ('config.toml', 'never-touch.toml', 'guardrails.md',
+        for name in ('config.toml', 'never-touch.md', 'guardrails.md',
                      'state.json', 'inbox.json', 'run.lock', 'state-exchange.json',
                      'quiet-check.json', 'tool-paths.json', 'numbers.json', 'decisions.jsonl',
                      'calls.jsonl', 'unsubscribe-failures.json', 'unsubscribe-secret'):

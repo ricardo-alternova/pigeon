@@ -25,7 +25,7 @@ cli('scripts/triage.py','setup')
 config={'accounts':{a:dict(provider=p,address='reader@example.org',quiet_kind=k,executor_app=a+'-mail',executor_account=a+'-example') for a,p,k in [('cedar','gmail','history'),('marble','outlook','ids')]}}
 (store/'config.toml').write_text('inbox_limit=200\n'+'\n'.join('[accounts.'+a+']\n'+'\n'.join(k+'='+json.dumps(v) for k,v in f.items()) for a,f in config['accounts'].items()))
 (store/'rules.md').write_text(rules_table('| file | subject: Weekly | archive | todas | |'))
-(store/'never-touch.toml').write_text('allow_empty=true\n')
+(store/'never-touch.md').write_text('')
 cli('scripts/triage.py','validate')
 text=Path('docs/quickstart.md').read_text()
 blocks=re.findall(r'```bash\n(.*?)\n```',text,re.S)
@@ -402,7 +402,7 @@ assert not (store/'run.lock').exists()
 # current documented commands in fresh shells, with a fake report channel.
 (store/'config.toml').write_text('timezone="UTC"\n[schedule]\nweekdays=["00:00"]\nweekends=["00:00"]\nalways_full=[]\n[accounts.cedar]\nquiet_kind="history"\n[accounts.marble]\nquiet_kind="ids"\n')
 (store/'rules.md').write_text('| ID | Patrón | Acción | Alcance | Fuente |\n')
-(store/'never-touch.toml').write_text('allow_empty=true\n')
+(store/'never-touch.md').write_text('')
 observation = {'cedar': dict(outcome='ok', position='100', arrivals=[]),
                'marble': dict(outcome='ok', ids=[])}
 listing = dict(accounts={'cedar': 10, 'marble': 10}, messages=[])
@@ -523,7 +523,7 @@ def prepare(label):
     store.mkdir()
     (store / 'config.toml').write_text('[lock]\nkind="onedrive"\naccount="drive-example"\nfolder="locks-example"\n[accounts.cedar]\n')
     (store / 'rules.md').write_text('| ID | Patrón | Acción | Alcance | Fuente |\n')
-    (store / 'never-touch.toml').write_text('allow_empty=true\n')
+    (store / 'never-touch.md').write_text('')
     (store / 'guardrails.md').write_text((root / 'config/guardrails.example.md').read_text())
     (store / 'inbox.json').write_text('{"accounts":{"cedar":10},"messages":[]}')
     (store / 'state.json').write_text('{"cedar":0}')
@@ -626,7 +626,7 @@ for iteration in (1, 2, 3, 4):
     (store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
     if iteration == 1:
         (store/'rules.md').write_text('| ID | Patrón | Acción | Alcance | Fuente |\n')
-        (store/'never-touch.toml').write_text('allow_empty=true\n')
+        (store/'never-touch.md').write_text('')
     print('run', iteration, 'create pigeon-run-lock conflict=fail -> guardrails.example.md:9 lock exchange')
     assert json.loads(run(store, blocks[0]))['call']['operation'] == 'create'
     assert json.loads(observed(store, lock_resume, dict(status='created', **(item | {'etag':'create-v1'})), name='lock-observation.json'))['call']['operation'] == 'read'
@@ -721,7 +721,7 @@ start = datetime.now(timezone.utc)
 event = dict(id='event-a', start=start.isoformat(), end=(start+timedelta(hours=1)).isoformat(), all_day=False, response='pending', cancelled=False, subject='Planning')
 (store/'calendar.json').write_text(json.dumps({'oak':[event], 'elm':[event]}))
 (store/'guardrails.md').write_text(Path('config/guardrails.example.md').read_text())
-(store/'never-touch.toml').write_text('allow_empty=true\n')
+(store/'never-touch.md').write_text('')
 (store/'rules.md').write_text('''| ID | Patrón | Acción | Alcance | Fuente |
 | --- | --- | --- | --- | --- |
 | a | subject: Question | archive | cedar | |

@@ -21,7 +21,7 @@ git config core.hooksPath hooks
 export PIGEON_HOME="$PWD/private/demo"
 python3 scripts/triage.py setup
 printf '[accounts.home]\n[accounts.work]\n' > "$PIGEON_HOME/config.toml"
-printf 'allow_empty=true\n' > "$PIGEON_HOME/never-touch.toml"
+touch "$PIGEON_HOME/never-touch.md" "$PIGEON_HOME/unsubscribe.md"
 cp tests/fixtures/rules.md "$PIGEON_HOME/rules.md"
 python3 scripts/triage.py validate
 token=$(python3 scripts/triage.py lock)

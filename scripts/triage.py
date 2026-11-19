@@ -429,9 +429,14 @@ def drive_lock(store, operation, token=None, observation=None, *, now=None):
 
 
 # Fixed download set and upload order. Only an open question carries its plan and listing.
+LIST_FILES = ('never-touch.md', 'unsubscribe.md')
+LEGACY_HOLDS = ('never-touch.toml is no longer read; put its addresses and domains in never-touch.md, '
+                'one per line, and its subject or attachment entries as exception text in rules.md; '
+                'then delete never-touch.toml')
+
 STATE_FILES = ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json',
                'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md',
-               'rules.md', 'never-touch.toml', 'tool-paths.json', 'plan.json', 'inbox.json', 'state.json')
+               'rules.md', *LIST_FILES, 'tool-paths.json', 'plan.json', 'inbox.json', 'state.json')
 STATE_LIMIT = 4 * 1024 * 1024
 LEGACY_RULES = 'rules.toml is no longer read; the rules belong in rules.md as a table'
 
@@ -499,13 +504,8 @@ def validate_state_file(name, raw, config, folder):
                 validate_inputs(data, config, {})
     elif name == 'rules.md':
         read_rules(text, folder / name, config['accounts'])
-    elif name == 'never-touch.toml':
-        try:
-            entries = parse_holds(text)
-        except ValueError as error:
-            raise ValueError(str(folder / name) + ': ' + str(error)) from None
-        if any(a not in config['accounts'] for r in entries for a in r.get('accounts', [])):
-            raise ValueError(str(folder / name) + ': unconfigured account')
+    elif name in LIST_FILES:
+        read_list(text, folder / name)
     elif name == 'tool-paths.json':
         data = parse_json(text, folder / name)
         validate_tool_paths(data, config, drop=True)
@@ -636,8 +636,11 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
             if {p.name for p in incoming.iterdir()} != expected:
                 raise ValueError('state incoming: unexpected or missing file; release lock')
             contents = {n: state_bytes(incoming / n) for n in STATE_FILES if n in expected}
+            refuse_legacy_holds(store)
             for n, raw in contents.items():
                 validate_state_file(n, raw, config, incoming)
+            if 'never-touch.md' not in contents and (contents or not (store / 'never-touch.md').is_file()):
+                raise ValueError(LEGACY_HOLDS)
             # Validate the entire batch before changing any destination; roll back I/O failures.
             original = {n: state_bytes(store / n) if (store / n).exists() else None for n in STATE_FILES}
             # Acquisition can record recovery before remote history is fetched.
@@ -655,7 +658,7 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
                 for n in STATE_FILES:
                     if n in contents and not (n in ('run-message.md', 'plan.json', 'inbox.json') and contents[n] == b''):
                         execute.atomic_text(store / n, contents[n].decode('utf-8'))
-                    elif n not in ('rules.md', 'never-touch.toml'):
+                    elif n not in ('rules.md', *LIST_FILES):
                         (store / n).unlink(missing_ok=True)
             except OSError:
                 for n, raw in original.items():
@@ -814,102 +817,6 @@ def finish_run(store, token, plan=None, observation=None, *, now=None):
     return {'calls': uploads + [released['call']]}
 
 
-RULE_KINDS = {'never-touch.toml': {'accounts': {'type': 'array',
-                                   'allowed_values': None,
-                                   'limits': {'min_items': 1},
-                                   'actions': ['protect'],
-                                   'meaning': 'Configured account handles to match.'},
-                      'sender': {'type': 'string',
-                                 'allowed_values': None,
-                                 'limits': {'min_length': 1},
-                                 'actions': ['protect'],
-                                 'meaning': 'Exact sender address, ignoring case.'},
-                      'domain': {'type': 'string',
-                                 'allowed_values': None,
-                                 'limits': {'min_length': 1},
-                                 'actions': ['protect'],
-                                 'meaning': 'Sender domain exactly. Use *.example.com for its subdomains only.'},
-                      'subject': {'type': 'string',
-                                  'allowed_values': None,
-                                  'limits': {'min_length': 1},
-                                  'actions': ['protect'],
-                                  'meaning': 'Case insensitive Python regex on subject; must not match empty text.'},
-                      'has_attachment': {'type': 'boolean',
-                                         'allowed_values': None,
-                                         'limits': {},
-                                         'actions': ['protect'],
-                                         'meaning': 'Match the attachment flag; absent means false. This condition needs sender, domain, subject or judgment beside it.'},
-                      'judgment': {'type': 'string',
-                                   'allowed_values': None,
-                                   'limits': {'min_length': 1, 'max_length': 500},
-                                   'actions': ['protect'],
-                                   'meaning': 'Never-touch category included in the matched message question.'}}}
-
-
-def validate_hold_fields(entry):
-    table = RULE_KINDS['never-touch.toml']
-    known_keys(entry, set(table), 'never-touch')
-    types = {'string': str, 'boolean': bool, 'integer': int, 'array': list}
-    for key, value in entry.items():
-        field = table[key]
-        if type(value) is not types[field['type']]:
-            raise ValueError(key + ': expected ' + ('a non-empty string' if key in ('sender', 'domain', 'subject', 'body') else field['type']))
-        if field['allowed_values'] is not None and value not in field['allowed_values']:
-            raise ValueError(key + ': expected one of ' + ', '.join(field['allowed_values']))
-        for bound, limit in field['limits'].items():
-            if ((bound == 'min' and value < limit) or (bound == 'max' and value > limit)
-                    or (bound in ('min_length', 'min_items') and len(value) < limit)
-                    or (bound in ('max_length', 'max_items') and len(value) > limit)):
-                raise ValueError(key + ': expected ' + bound + ' ' + str(limit))
-
-
-def validate_holds(holds):
-    for i, hold in enumerate(holds, 1):
-        try:
-            if not isinstance(hold, dict):
-                raise ValueError('Never-touch entry must be a table')
-            validate_hold_fields(hold)
-            if 'judgment' in hold and not hold['judgment'].strip():
-                raise ValueError('judgment: expected a non-blank category')
-            validate_predicate(hold, category='judgment' in hold)
-            if 'domain' in hold and not domain_pattern(hold['domain']):
-                raise ValueError('domain: expected example.com or *.example.com, got "' + chat_text(hold['domain']) + '"')
-        except ValueError as error:
-            raise ValueError(('never-touch entry ' + str(i)) + ': ' + str(error)) from error
-
-
-def validate_predicate(rule, *, category=False):
-    if 'accounts' in rule and (not isinstance(rule['accounts'], list) or not rule['accounts']
-                               or any(not isinstance(a, str) for a in rule['accounts'])):
-        raise ValueError('accounts: Accounts must be a non-empty list of configured account handles')
-    if 'has_attachment' in rule and not isinstance(rule['has_attachment'], bool):
-        raise ValueError('has_attachment must be boolean')
-    for key in ('sender', 'domain', 'subject', 'body'):
-        if key in rule and (not isinstance(rule[key], str) or not rule[key].strip()):
-            raise ValueError(key + ': expected a non-empty string')
-    if not category and not any(k in rule for k in ('sender', 'domain', 'subject', 'body')):
-        raise ValueError('Never-touch requires sender, domain, subject or a category')
-    for key in ('subject',):
-        try:
-            if key in rule and re.search(rule[key], '', re.IGNORECASE):
-                raise ValueError(key + ': Predicate matches empty text; expected a regex that does not match empty text')
-        except re.error as error:
-            raise ValueError(key + ': Invalid ' + key + ' regex; expected a valid Python regular expression') from error
-
-
-def parse_holds(text):
-    data = parse_toml(text, 'never-touch.toml')
-    known_keys(data, {'rules', 'allow_empty'}, 'rule file')
-    if 'allow_empty' in data and type(data['allow_empty']) is not bool:
-        raise ValueError('allow_empty: expected boolean')
-    entries = data.get('rules', [])
-    if not isinstance(entries, list) or (not entries and data.get('allow_empty') is not True):
-        raise ValueError('rules: expected an array of tables' if not isinstance(entries, list) else 'Never-touch requires entries or allow_empty = true')
-    validate_holds(entries)
-    return [dict(entry, domain=domain_pattern(entry['domain'])) if 'domain' in entry else entry
-            for entry in entries]
-
-
 def table_cells(line):
     """Split pipe rows while preserving code spans and escaped pipes."""
     line = line.strip()
@@ -973,13 +880,42 @@ def domain_pattern(text):
     return None
 
 
+def read_list(text, name):
+    entries = []
+    for number, raw in enumerate(text.replace('\r\n', '\n').split('\n'), 1):
+        line = raw.strip()
+        if not line or line.startswith('#') or line in ('-', '*'):
+            continue
+        if line.startswith(('- ', '* ')):
+            line = line[2:].strip()
+            if not line or line.startswith('#'):
+                continue
+        where = f'{name} line {number}: "{chat_text(line)}"'
+        if any(unicodedata.category(c) in {'Cc', 'Cf'} for c in raw) or len(line) > 500:
+            raise ValueError(f'{where} has control characters or exceeds 500 characters')
+        if any(c.isspace() for c in line) or not any(c in line for c in '@.*'):
+            entries.append({'judgment': line})
+        elif '@' in line and not line.startswith('@'):
+            sender = normalize_sender(line)
+            if (sender is None or not re.fullmatch(r"[^@<>;,()\"\\:*]+@[^@<>;,()\"\\:*]+", line)
+                    or not domain_pattern(sender.rsplit('@', 1)[1])):
+                raise ValueError(f'{where} is not an address or a domain')
+            entries.append({'sender': sender})
+        elif (domain := domain_pattern(line)) and not (domain.startswith('*.') and domain.count('.') == 1):
+            entries.append({'domain': domain})
+        else:
+            raise ValueError(f'{where} is not an address or a domain')
+    return entries
+
+
 def row_patterns(cell):
     text, warning, exception = cell.partition('⚠')
     spans = list(re.finditer(CODE_SPAN, text))
-    parts = spans or re.finditer(r'[^\s,]+', text)
+    span_or_list = CODE_SPAN + r'|(?<![^\s,])(?:never-touch\.md|unsubscribe\.md)(?=$|[\s,])'
+    parts = re.finditer(span_or_list, text, re.I) if spans else re.finditer(r'[^\s,]+', text)
     tokens, subject, note = [], None, ''
     for part in parts:
-        word = (part[2] if spans else part[0]).strip('_"\'()')
+        word = ((part[2] or part[0]) if spans else part[0]).strip('_"\'()')
         word = word.removeprefix('**').removesuffix('**').strip('_"\'()')
         mold = re.match(r'(?:subject|asunto):', word, re.I)
         if mold:
@@ -991,7 +927,9 @@ def row_patterns(cell):
         token = word.casefold().rstrip(';:')
         if token in {'y', 'o', 'and', 'or', '/', ',', '+'}:
             continue
-        if re.fullmatch(r'[^\s@<>;,`*]+@' + DOMAIN_TOKEN, token) and '.' in token.rsplit('@', 1)[1]:
+        if token in LIST_FILES:
+            tokens.append(('list', token))
+        elif re.fullmatch(r'[^\s@<>;,`*]+@' + DOMAIN_TOKEN, token) and '.' in token.rsplit('@', 1)[1]:
             tokens.append(('sender', token))
         elif domain := domain_pattern(token):
             tokens.append(('domain', domain))
@@ -1003,7 +941,7 @@ def row_patterns(cell):
         else:
             raise ValueError('unrecognised backticked token')
     if spans:
-        note = re.sub(CODE_SPAN, '', text).strip(' ,;-—')
+        note = re.sub(span_or_list, '', text, flags=re.I).strip(' ,;-—')
     return tokens, subject, ' '.join(filter(None, [note, warning + exception])).strip()
 
 
@@ -1077,6 +1015,7 @@ def action_cap(note):
 def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
     rules, seen, skipped, warnings, tables = [], set(), [], [], []
     directory = Path(path).resolve().parent
+    lists = {}
     caps, cap_errors, cap_lines, named = {}, {}, [], set()
     for number, line in enumerate(guardrails.splitlines(), 1):
         match = re.fullmatch(r'\s*-\s+(\S+)\s+' + CAP_PHRASE + r'(?:\s+(.*?))?\s*', line, re.I)
@@ -1131,7 +1070,33 @@ def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
             if len(cells) > 5:
                 raise ValueError('more than five cells')
             tokens, subject, note = row_patterns(pattern)
+            refs_to_lists = {value for kind, value in tokens if kind == 'list'}
+            expanded = []
+            for kind, value in tokens:
+                if kind != 'list':
+                    expanded.append((kind, value))
+                    continue
+                if value not in lists:
+                    list_path = directory / value
+                    try:
+                        if not list_path.resolve().is_relative_to(directory):
+                            raise ValueError('file reference outside the rules folder: ' + value)
+                        lists[value] = read_list(load_inputs([list_path], empty=True)[0], value)
+                    except (ValueError, OSError) as error:
+                        lists[value] = str(error)
+                entries = lists[value]
+                if isinstance(entries, str):
+                    raise ValueError(entries)
+                for entry in entries:
+                    field, content = next(iter(entry.items()))
+                    if field == 'judgment':
+                        note = ' '.join(filter(None, (note, content)))
+                    else:
+                        expanded.append((field, content))
+            tokens = expanded
             if not tokens and subject is None:
+                if refs_to_lists:
+                    continue
                 raise ValueError('no sender, domain or subject')
             if subject is not None and not subject.replace('*', '').strip():
                 raise ValueError('subject pattern has no literal text')
@@ -1148,7 +1113,7 @@ def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
                 raise ValueError('no configured account in scope')
             reference_text = re.sub(r'(?<!\]\()https?://\S+', '', pattern + ' ' + action, flags=re.I)
             refs = (a or b or c for a, b, c in FILE_REFERENCE.findall(reference_text))
-            non_files = {value for _, value in tokens} | {step['target'].casefold() for step in steps if 'target' in step}
+            non_files = refs_to_lists | {value for _, value in tokens} | {step['target'].casefold() for step in steps if 'target' in step}
             files = []
             for ref in dict.fromkeys(refs):
                 if ref.casefold() in non_files:
@@ -1229,7 +1194,7 @@ def folder_path(value, *, template=False):
 
 
 def matches(message, rule, protection=False):
-    if (not protection or 'accounts' in rule) and message['account'] not in rule.get('accounts', []):
+    if not protection and message['account'] not in rule.get('accounts', []):
         return False
     sender = (normalize_sender(message['sender']) or message['sender']) if protection else message['sender']
     sender = sender.casefold()
@@ -1244,12 +1209,8 @@ def matches(message, rule, protection=False):
         domain_matches = domain.endswith(wanted[1:]) if wanted.startswith('*.') else domain == wanted
         if not domain_matches or '' in domain.split('.'):
             return False
-    if 'subject' in rule:
-        if protection:
-            if not re.search(rule['subject'], message['subject'], re.IGNORECASE):
-                return False
-        elif not subject_matches(rule['subject'], message['subject']):
-            return False
+    if 'subject' in rule and not subject_matches(rule['subject'], message['subject']):
+        return False
     if 'body' in rule:
         if 'body' not in message:
             return False
@@ -1264,8 +1225,6 @@ def matches(message, rule, protection=False):
         count = len({a.casefold() for a in message['recipients']})
         if not rule.get('recipients_min', 1) <= count <= rule.get('recipients_max', 1000):
             return False
-    if 'has_attachment' in rule and message.get('has_attachment', False) != rule['has_attachment']:
-        return False
     return True
 
 
@@ -1878,12 +1837,13 @@ def answer_problem(entry):
     return ''
 
 
-def same_question(question, rule):
-    """An answer authorizes the row the question showed, not whatever the table says now."""
+def same_question(question, rule, categories):
+    """Bind an answer to the row and never-touch categories shown in the question."""
     if rule is None:
         return False
     then = [step['verb'] for step in rule['steps'] if 'verb' in step] if 'steps' in rule else [rule['action']]
-    return (question.get('row'), question.get('then'), question.get('text')) == (rule['id'], then, rule.get('note', ''))
+    return (question.get('row'), question.get('then'), question.get('text'), question.get('never_touch')) == (
+        rule['id'], then, rule.get('note', ''), categories)
 
 
 def read_asked(store, token, dry_run=False):
@@ -1899,10 +1859,12 @@ def read_asked(store, token, dry_run=False):
             if isinstance(q, dict) and isinstance(q.get('account'), str) and isinstance(q.get('id'), str)}
 
 
-def rule_signature(rule):
-    """Only what changes the action: row ID, patterns, steps, cap and scope."""
-    return hashlib.sha256(json.dumps({k: rule[k] for k in ('id', 'accounts', 'steps', 'cap', 'sender', 'domain', 'subject')
-                                      if k in rule}, sort_keys=True).encode()).hexdigest()
+def rule_signature(rule, categories):
+    """Bind cap proceed to the rule and the judgment its answers covered."""
+    fields = {k: rule[k] for k in ('id', 'accounts', 'steps', 'cap', 'sender', 'domain', 'subject') if k in rule}
+    if rule.get('note') or categories:
+        fields.update(note=rule.get('note', ''), never_touch=categories)
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
 
 def run_month(store, config):
@@ -1929,11 +1891,6 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
     if hand_sent is not None and hand_sent.get('failed'):
         listing = after_send_listing(listing, hand_sent['failed'])
         validate_inputs(listing, config, previous if previous is not None else {})
-    validate_holds(never_touch)
-    for index, hold in enumerate(never_touch, 1):
-        for account in hold.get('accounts', []):
-            if account not in config['accounts']:
-                raise ValueError(f'never-touch.toml: entry {index}: account {account!r} expected one of config.toml accounts: ' + ', '.join(config['accounts']))
     filing = {}
     if hand_sent is not None:
         known_keys(hand_sent, {'closed', 'filed', 'failed', 'unchecked'}, 'hand_sent')
@@ -1949,7 +1906,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                 raise ValueError('hand_sent: after_send rule required')
             filing[tuple(key)] = dict(id=rule['id'], action=rule['after_send'], reason='Owner sent the draft')
     exact_holds = [hold for hold in never_touch if 'judgment' not in hold]
-    categories = [hold for hold in never_touch if 'judgment' in hold]
+    category_text = [hold['judgment'] for hold in never_touch if 'judgment' in hold]
     answer_entries, answer_error, malformed = question_answers(answers, run_token)
     asked_any = False
     messages = listing['messages']
@@ -1996,7 +1953,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
         else:
             key = message['account'], message['id']
             selected = filing.get(key) or (select_rule(message, rules) if selections is None else selections.get(key))
-            changed = asked is not None and key in asked and not same_question(asked[key], selected)
+            changed = asked is not None and key in asked and not same_question(asked[key], selected, category_text)
             if changed:
                 asked_any = True
                 reason = 'the rule changed after the question'
@@ -2005,7 +1962,6 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                 agent = [step['agent'] for step in steps if 'agent' in step]
                 kit = [step for step in steps if 'verb' in step]
                 text = rule.get('note', '')
-                category_text = [hold['judgment'] for hold in categories if matches(message, hold, protection=True)]
                 if 'steps' in rule:
                     missing = next((file for file in rule['files'] if not Path(file['path']).is_file()), None)
                     if missing is not None:
@@ -2130,7 +2086,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                     per_row[row_id] = per_row.get(row_id, 0) + 1
                     if per_row[row_id] > cap:
                         hold = dict(account=action['account'], id=action['id'], rule=row_id,
-                                    cap=cap, signature=rule_signature(selected))
+                                    cap=cap, signature=rule_signature(selected, category_text))
                         if is_monthly:
                             hold['month'] = list(month)
                         held[(action['account'], action['id'])] = hold
@@ -2644,6 +2600,7 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
     numbers = {i['number']: i for i in source['items']}
     messages = {(m['account'], m['id']): m for m in listing['messages']}
     if parts and all(p['verb'] == 'cap-proceed' for p in parts):
+        categories = [hold['judgment'] for hold in holds if 'judgment' in hold]
         month = run_month(store, config)
         selections, changed = {}, set()
         for part in parts:
@@ -2656,14 +2613,14 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
             message = messages.get(key)
             sender = normalize_sender(message['sender']) if message else None
             rule = select_rule(dict(message, sender=sender), rules or []) if sender else None
-            if rule is not None and rule_signature(rule) == part['signature']:
+            if rule is not None and rule_signature(rule, categories) == part['signature']:
                 selections[key] = rule
             else:
                 changed.add(key)
         result = build_plan(listing, rules or [], holds, config, previous, stops, selections=selections,
                             answers=answers, run_token=run_token, questions=questions, asked=asked, month=month)
         for item in [*result['decisions'], *result.get('remaining', [])]:
-            if (item['account'], item['id']) in changed:
+            if (item['account'], item['id']) in changed and item['reason'] != 'Protected by never-touch':
                 item['reason'] = 'the rule changed after the question'
         if changed and not selections:
             result['proceed_note'] = 'Proceed did nothing: the rule changed after the question'
@@ -3771,7 +3728,7 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
     if plan.get('dry_run') is True:
         require_fetched(store, token)
         listing = plan['dry_listing'] if 'dry_listing' in plan else execute.read(store / 'inbox.json')
-        config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md')])
+        config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.md', 'never-touch.md', 'guardrails.md')])
         previous = execute.read(store / 'state.json') if (store / 'state.json').exists() else {}
         stops = ['Missing state; prior run records exist'] if not (store / 'state.json').exists() and not plan.get('first_run') else []
         if 'reply_source' in plan:
@@ -3914,8 +3871,8 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
     return '\n'.join(lines) + '\n'
 
 
-def load_inputs(paths):
-    # Missing, empty, unreadable or malformed safety files abort before planning.
+def load_inputs(paths, *, empty=False):
+    # Missing or unreadable safety files abort before planning.
     result = []
     for path in paths:
         p = Path(path)
@@ -3924,29 +3881,45 @@ def load_inputs(paths):
                 raise FileNotFoundError(str(p) + ': expected an existing readable file')
             if not p.is_file() or not p.stat().st_mode & 0o444:
                 raise ValueError(str(p) + ': expected a readable file')
-            content = p.read_text(encoding='utf-8')
+            with p.open(encoding='utf-8', newline='' if empty else None) as stream:
+                content = stream.read()
         except UnicodeError as error:
             raise ValueError(str(p) + ': expected UTF-8 text') from error
         except OSError as error:
             raise OSError(str(p) + ': expected a readable file') from error
-        if not content.strip():
+        if not empty and not content.strip():
             raise ValueError(str(p) + ': expected a non-empty safety file')
         result.append(content)
     return result
 
 
+def refuse_legacy_holds(store):
+    legacy = Path(store) / 'never-touch.toml'
+    if legacy.exists() or legacy.is_symlink():
+        raise ValueError(LEGACY_HOLDS)
+
+
+def load_never_touch(path):
+    refuse_legacy_holds(Path(path).parent)
+    return read_list(load_inputs([path], empty=True)[0], path)
+
+
 def load_safety(sources, diagnostics=None):
     """Read safety files, collecting independent errors before refusing."""
+    refuse_legacy_holds(Path(sources[2]).parent)
     problems, values = [], []
     for index, path in enumerate(sources):
         try:
-            text = load_inputs([path])[0]
-            value = parse_toml(text, path) if index == 0 else text
+            if index == 2:
+                value = read_list(load_inputs([path], empty=True)[0], path)
+            else:
+                text = load_inputs([path])[0]
+                value = parse_toml(text, path) if index == 0 else text
             values.append(value)
         except (ValueError, OSError) as error:
             problems.append(str(error))
             values.append(None)
-    config, rules_text, holds_text, guardrails = values
+    config, rules_text, holds, guardrails = values
     if config is not None:
         # Validate independent top-level settings and each account separately.
         accounts = config.get('accounts')
@@ -3959,19 +3932,9 @@ def load_safety(sources, diagnostics=None):
                 validate_inputs({'accounts': {}, 'messages': []}, probe, {})
             except ValueError as error:
                 problems.append(str(sources[0]) + ': ' + str(error))
-    rules, holds = [], []
+    rules = []
     if rules_text is not None and config is not None and isinstance(config.get('accounts'), dict):
         rules = read_rules(rules_text, sources[1], config['accounts'], diagnostics, guardrails=guardrails or '')
-    if holds_text is not None:
-        try:
-            holds = parse_holds(holds_text)
-            if isinstance(config, dict) and isinstance(config.get('accounts'), dict):
-                for number, hold in enumerate(holds, 1):
-                    for account in hold.get('accounts', []):
-                        if account not in config['accounts']:
-                            problems.append(f"{sources[2]}: entry {number}: account {account!r} expected one of config.toml accounts: " + ', '.join(config['accounts']))
-        except ValueError as error:
-            problems.append(str(sources[2]) + ': ' + str(error))
     if problems:
         raise ValueError('\n'.join(dict.fromkeys(problems)))
     return config, rules, holds
@@ -4397,7 +4360,7 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
     with lock_gate(store):
         require_lock(store, token)
         require_fetched(store, token)
-        config, rules, holds = load_safety([store / n for n in ('config.toml','rules.md','never-touch.toml','guardrails.md')])
+        config, rules, holds = load_safety([store / n for n in ('config.toml','rules.md','never-touch.md','guardrails.md')])
         if dry_run and (ids_only or approval):
             raise ValueError('listing --dry-run: expected a full rehearsal listing')
         target = store / SIMULATION_DIR if dry_run else store
@@ -4829,7 +4792,7 @@ def _main(argv=None, *, now=None):
         examples = {'config.toml': 'config/config.example.toml',
                     'guardrails.md': 'config/guardrails.example.md',
                     'rules.md': 'rules/rules.example.md',
-                    'never-touch.toml': 'rules/never-touch.example.toml'}
+                    **{name: f'rules/{Path(name).stem}.example.md' for name in LIST_FILES}}
         root = Path(__file__).resolve().parents[1]
         contents = {name: read_text(root / source) for name, source in examples.items()}
         contents['guardrails.md'] = re.sub(r'\]\(\.\./([^)]*)\)', lambda m: '](' + str(root) + '/' + m[1] + ')', contents['guardrails.md'])
@@ -4866,7 +4829,7 @@ def _main(argv=None, *, now=None):
             print(json.dumps(data, sort_keys=True))
     elif args.command == 'validate':
         diagnostics = []
-        config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md')], diagnostics)
+        config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.md', 'never-touch.md', 'guardrails.md')], diagnostics)
         if (store / 'rules.toml').exists():
             diagnostics.append(LEGACY_RULES)
         print('\n'.join(diagnostics))
@@ -4971,8 +4934,9 @@ def _main(argv=None, *, now=None):
             else:
                 print(json.dumps(quiet_check(store, config, previous, args.observation, args.scheduled, now, dry_run=args.dry_run), sort_keys=True))
     else:
-        sources = [getattr(args, n.replace('-', '_')) or store / (n + ('.md' if n in {'rules', 'guardrails'} else '.toml')) for n in ('config', 'rules', 'never-touch', 'guardrails')]
-        protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'numbers.json', 'reply.json', 'reply.txt', 'decisions.jsonl', 'history.log', 'run-message.md', 'quiet-observation.json', 'positions-observation.json', 'quiet-check.json', 'lock-exchange.json', 'lock-observation.json', 'lock-commit-observation.json', 'state-exchange.json', 'finish-exchange.json', 'final-inbox.json', 'state-incoming', 'state-outgoing', 'state-observation.json', 'upload-observation.json', 'state-lock-observation.json', 'tool-paths.json', 'cases.toml', 'run-refusal.json', 'inbox.json', 'config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md')}
+        sources = [getattr(args, n.replace('-', '_')) or store / (n + ('.md' if n in {'rules', 'never-touch', 'guardrails'} else '.toml')) for n in ('config', 'rules', 'never-touch', 'guardrails')]
+        protected = {Path(p).resolve() for p in sources + [args.inbox]} | {store / n for n in ('state.json', 'run.lock', '.lock-gate', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'numbers.json', 'reply.json', 'reply.txt', 'decisions.jsonl', 'history.log', 'run-message.md', 'quiet-observation.json', 'positions-observation.json', 'quiet-check.json', 'lock-exchange.json', 'lock-observation.json', 'lock-commit-observation.json', 'state-exchange.json', 'finish-exchange.json', 'final-inbox.json', 'state-incoming', 'state-outgoing', 'state-observation.json', 'upload-observation.json', 'state-lock-observation.json', 'tool-paths.json', 'cases.toml', 'run-refusal.json', 'inbox.json', 'config.toml', 'rules.md', *LIST_FILES, 'never-touch.toml', 'guardrails.md')}
+        protected.update(Path(sources[1]).resolve().parent / name for name in LIST_FILES)
         if args.command == 'reply':
             protected.add(Path(args.reply).resolve())
         if args.answers:
@@ -5009,6 +4973,7 @@ def _main(argv=None, *, now=None):
                             protected.add(destination)
                             raise ValueError('dry run: real approval plan at --plan-out; use a separate rehearsal file')
                 diagnostics = []
+                refuse_legacy_holds(store)
                 config, rules, holds = load_safety(sources, diagnostics)
                 if (store / 'rules.toml').exists():
                     diagnostics.append(LEGACY_RULES)
@@ -5081,9 +5046,9 @@ def _main(argv=None, *, now=None):
                                         questions=questions if args.command == 'plan' else None, asked=asked, hand_sent=hand_sent, store=store, month=run_month(store, config))
                 except ValueError as error:
                     message = str(error)
-                    if message.startswith('rules.md:') or message.startswith('never-touch.toml:'):
-                        name, message = message.split(':', 1)
-                        source = (args.rules or store / name) if name == 'rules.md' else (args.never_touch or store / name)
+                    if message.startswith('rules.md:'):
+                        _, message = message.split(':', 1)
+                        source = args.rules or store / 'rules.md'
                     elif message.startswith('config'):
                         source = args.config or store / 'config.toml'
                     elif message.startswith('state.json'):
