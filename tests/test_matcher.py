@@ -356,7 +356,9 @@ class MatcherTests(unittest.TestCase):
         for action, cap, note in [('trash, the max is 3 days', 10, 'the max is 3 days'),
                                   ('trash, max 25', 25, ''),
                                   ('trash, max 25.', 25, ''),
-                                  ('trash, max 25, except invoices', 25, 'except invoices')]:
+                                  ('trash, max 25, except invoices', 25, 'except invoices'),
+                                  ('trash + max 25', 25, ''),
+                                  ('trash + máx 25.', 25, '')]:
             with self.subTest(action=action):
                 self.rules = triage.read_rules(rules_table(f'| C1 | s0@example.net | {action} | todas | |'),
                                                ROOT / 'rules.md', self.config['accounts'])
@@ -571,6 +573,8 @@ class MatcherTests(unittest.TestCase):
             (repo / '.gitignore').write_text('private/\n')
             with self.assertRaises(ValueError):
                 triage.private_store(repo / 'README.md', output=True)
+            with self.assertRaises(ValueError):
+                triage.private_store(repo, output=True)
             self.assertEqual(triage.private_store(repo / 'private' / 'plan.json', output=True),
                              repo / 'private' / 'plan.json')
 

@@ -105,7 +105,7 @@ def private_store(path=None, *, output=False):
     store = Path(path or os.environ.get('PIGEON_HOME', Path.home() / '.config/pigeon')).expanduser().resolve()
     if not output and path is None and not store.is_dir():
         raise ValueError('Private store ' + str(store) + ': expected an existing folder. Create it, or set PIGEON_HOME to an existing folder.')
-    parent = store.parent if output else store
+    parent = store if store.is_dir() else store.parent
     while not parent.exists():
         parent = parent.parent
     git_env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
@@ -986,6 +986,9 @@ def row_steps(cell):
     parts.append(cell[start:])
     for part in parts:
         part = part.strip()
+        if re.fullmatch(CAP_PHRASE + r'\s*[0-9]+\.?', part, re.I):
+            notes.append(part)
+            continue
         leading = re.match(r'[\w-]+', part)
         verb = ACTION_WORDS.get(leading[0].rstrip('-').casefold()) if leading else None
         if not verb:

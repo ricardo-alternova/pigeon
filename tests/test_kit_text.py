@@ -3,18 +3,101 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 from mock_provider import rules_table
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts'))
+
+import leak_check
+import triage
+
 DOCS = ['README.md', 'AGENTS.md', 'CLAUDE.md',
         '.agents/skills/email-triage/SKILL.md', 'docs/setup.md', 'docs/hosted-setup.md',
         'config/guardrails.example.md', 'docs/quickstart.md']
+
+RESERVED_DOMAINS = ('example.com', 'example.org', 'example.net', 'example.info')
+RESERVED_SUFFIXES = ('.test', '.example', '.invalid', '.localhost')
+FILE_EXTENSIONS = ('md', 'txt', 'csv', 'toml', 'json', 'jsonl', 'py', 'sh', 'yml', 'yaml', 'html', 'lock')
+ACTION = re.compile(r'(?:' + '|'.join(triage.ACTION_WORDS) + r')\b', re.I)
+PATTERN = re.compile(r'@|asunto:|subject:|\b[\w*-]+\.[a-z]{2,}\b', re.I)
+CAP = re.compile(r'(?:^|`)\s*- +[^\s`]+ +m[aá]x(?![\w-])(?:\s+[0-9]+\.?)?\s*(?:`|$)', re.I)
+ADDRESS_OR_DOMAIN = re.compile(
+    r'(?<![\w@.-])(?:[\w.+-]+@)?(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?![\w-])', re.I)
+
+
+def reserved(domain):
+    domain = domain.casefold().rstrip('.')
+    return (domain in RESERVED_DOMAINS or domain.endswith(RESERVED_SUFFIXES)
+            or domain in leak_check.FIXTURE_DOMAINS)
+
+
+def row_domains(row):
+    for match in ADDRESS_OR_DOMAIN.finditer(row):
+        if match[0].rsplit('.', 1)[-1].casefold() in FILE_EXTENSIONS:
+            continue
+        yield match[0].rsplit('@', 1)[-1].removeprefix('*.')
+
+
+def list_entry(line):
+    text = line.strip()
+    if text.startswith(('- ', '* ')):
+        text = text[2:].strip()
+    if not text or any(c.isspace() for c in text) or text.rsplit('.', 1)[-1].casefold() in FILE_EXTENSIONS:
+        return None
+    if '@' in text and not text.startswith('@'):
+        return text if re.fullmatch(r'[^\s@<>;,]+@[a-z0-9.-]+\.[a-z]{2,}', text, re.I) else None
+    return triage.domain_pattern(text)
+
+
+def tracked_files(root):
+    try:
+        listed = subprocess.check_output(['git', 'ls-files', '-z', '--', '.'], cwd=root, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return sorted(str(path.relative_to(root)) for path in root.rglob('*')
+                      if path.is_file() and not {'.git', '__pycache__'} & set(path.relative_to(root).parts))
+    return [os.fsdecode(name) for name in listed.split(b'\0')[:-1]]
+
+
+def scan_hits(root):
+    hits = []
+    for name in tracked_files(root):
+        path = root / name
+        if path.is_symlink() or not path.is_file():
+            continue
+        in_tests = name.split('/')[0] == 'tests'
+        for number, line in enumerate(path.read_text(encoding='utf-8', errors='replace').splitlines(), 1):
+            for candidate in [line, *(content for _, content in re.findall(triage.CODE_SPAN, line))]:
+                row = candidate.strip()
+                if not row.startswith('|'):
+                    continue
+                cells = triage.table_cells(row)
+                if not cells or not 4 <= len(cells) <= 5:
+                    continue
+                if not (ACTION.match(cells[2].strip('` ')) or PATTERN.search(cells[1])):
+                    continue
+                if in_tests:
+                    hits.extend(f'{name}:{number}: fixture domain {domain}'
+                                for domain in row_domains(row) if not reserved(domain))
+                else:
+                    hits.append(f'{name}:{number}: rule row')
+            entry = list_entry(line)
+            if entry:
+                domain = entry.rsplit('@', 1)[-1].removeprefix('*.')
+                if in_tests:
+                    if not reserved(domain):
+                        hits.append(f'{name}:{number}: fixture domain {domain}')
+                else:
+                    hits.append(f'{name}:{number}: list line')
+            hits.extend(f'{name}:{number}: cap line' for _ in CAP.finditer(line))
+    return hits
 
 
 def setup_text():
@@ -43,31 +126,38 @@ class KitTextTests(unittest.TestCase):
             self.assertEqual(before, {path.name: path.read_bytes() for path in store.iterdir()})
 
     def test_no_rule_rows_outside_tests(self):
-        sys.path.insert(0, str(ROOT / 'scripts'))
-        from triage import ACTION_WORDS, CODE_SPAN, table_cells
+        self.assertEqual(scan_hits(ROOT), [])
 
-        action = re.compile(r'(?:' + '|'.join(ACTION_WORDS) + r')\b', re.I)
-        pattern = re.compile(r'@|asunto:|subject:|\b[\w*-]+\.[a-z]{2,}\b', re.I)
-        cap = re.compile(r'(?:^|`)\s*- +[^\s`]+ +m[aá]x +\d+', re.I)
-        tracked = subprocess.check_output(
-            ['git', 'ls-files', '-z', '--', '.', ':(exclude)tests/'], cwd=ROOT)
-        hits = []
-        for name in os.fsdecode(tracked).split('\0')[:-1]:
-            path = ROOT / name
-            if path.is_symlink():
-                continue
-            for number, line in enumerate(path.read_text(encoding='utf-8', errors='replace').splitlines(), 1):
-                candidates = [line, *(content for _, content in re.findall(CODE_SPAN, line))]
-                for candidate in candidates:
-                    row = candidate.strip()
-                    if not row.startswith('|'):
-                        continue
-                    cells = table_cells(row)
-                    if len(cells) == 5 and (action.match(cells[2].strip('` ')) or pattern.search(cells[1])):
-                        hits.append(f'{name}:{number}: rule row')
-                for _ in cap.finditer(line):
-                    hits.append(f'{name}:{number}: numeric cap')
-        self.assertFalse(hits, '\n' + '\n'.join(hits))
+    def test_scan_catches_rule_rows_list_lines_and_caps(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'docs').mkdir()
+            (root / 'tests/fixtures').mkdir(parents=True)
+            (root / 'docs/setup.md').write_text(
+                '| X1 | acme@example.com | trash | todas |\n'
+                '- spam@example.com\n'
+                '- C1 max\n'
+                '| R0 | acmecorp-internal.com | trash | todas | own |\n')
+            (root / 'tests/fixtures/rules.md').write_text(
+                '| R0 | acmecorp-internal.com | trash | todas | own |\n')
+            (root / 'tests/fixtures/never-touch.md').write_text('- acmecorp-internal.com\n')
+            with patch.dict(os.environ, {'GIT_CEILING_DIRECTORIES': folder}):
+                self.assertEqual(scan_hits(root), [
+                    'docs/setup.md:1: rule row',
+                    'docs/setup.md:2: list line',
+                    'docs/setup.md:3: cap line',
+                    'docs/setup.md:4: rule row',
+                    'tests/fixtures/never-touch.md:1: fixture domain acmecorp-internal.com',
+                    'tests/fixtures/rules.md:1: fixture domain acmecorp-internal.com'])
+
+    def test_scan_works_without_git(self):
+        with tempfile.TemporaryDirectory() as folder:
+            export = Path(folder) / 'export'
+            shutil.copytree(ROOT, export, ignore=shutil.ignore_patterns('.git', '__pycache__'))
+            with patch.dict(os.environ, {'GIT_CEILING_DIRECTORIES': folder}):
+                self.assertEqual(scan_hits(export), [])
+                (export / 'docs/exported.md').write_text('| X1 | acme@example.com | trash | todas |\n')
+                self.assertEqual(scan_hits(export), ['docs/exported.md:1: rule row'])
 
     def test_r184_send_documents_match_behavior(self):
         setup = (ROOT/'docs/setup.md').read_text()
