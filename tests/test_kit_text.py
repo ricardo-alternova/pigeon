@@ -340,8 +340,42 @@ class KitTextTests(unittest.TestCase):
             path = ROOT / relative
             if relative in ('docs/' + name, 'scripts/leak_check.py', '.gitignore') or path.is_symlink() or not path.is_file():
                 continue
-            self.assertEqual(path.read_text().count(name),
-                             2 if relative == 'scripts/triage.py' else 0, relative)
+            if relative == 'scripts/triage.py':
+                self.assertEqual(path.read_text().count(name), 3, relative)
+            elif relative in ('README.md', 'AGENTS.md') or relative.startswith('scripts/'):
+                self.assertEqual(path.read_text().count(name), 0, relative)
+
+    def test_quickstart_has_no_retired_send_step(self):
+        quick = (ROOT/'docs/quickstart.md').read_text()
+        self.assertNotIn('state_send_required', quick)
+        self.assertNotIn('No mail write runs before approval is saved', quick)
+        self.assertIn('Sending is documented in [Drafts and forwards](sending.md)', quick)
+        self.assertIn("it holds only the user's own words, never text copied from a message", quick)
+
+    def test_sending_documents_name_the_structured_approval(self):
+        sending = (ROOT/'docs/sending.md').read_text()
+        for phrase in ('send_approved', "only the owner's own words", 'create none and send nothing',
+                       'text after `draft` in the row', "separate chat message under the item's number",
+                       'Send only the draft you created'):
+            self.assertIn(phrase, sending)
+        setup = (ROOT/'docs/setup.md').read_text()
+        for phrase in ('draft (or borrador)', 'forward (or reenviar)', '`+` starts another step',
+                       'separate recipients with a comma'):
+            self.assertIn(phrase, setup)
+        guardrails = (ROOT/'config/guardrails.example.md').read_text()
+        for phrase in ('draft (or borrador)', 'forward (or reenviar)', 'the send [docs/sending.md]'):
+            self.assertIn(phrase, guardrails)
+
+    def test_changelog_drops_retired_send_entries(self):
+        changelog = (ROOT/'CHANGELOG.md').read_text()
+        for phrase in ('Preserve send/forward decisions', 'Create reply and forward drafts',
+                       'Retain draft IDs'):
+            self.assertNotIn(phrase, changelog)
+
+    def test_hosted_setup_documents_state_upload(self):
+        hosted = (ROOT/'docs/hosted-setup.md').read_text()
+        self.assertIn('Upload each issued changed-file snapshot from state-outgoing', hosted)
+        self.assertIn('Return upload-observation.json', hosted)
 
     def test_si6_no_send_setting(self):
         config = tomllib.loads((ROOT / 'config/config.example.toml').read_text())

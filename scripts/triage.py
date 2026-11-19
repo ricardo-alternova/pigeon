@@ -27,11 +27,25 @@ import time
 import tomllib
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERBS = frozenset({'trash', 'archive', 'move', 'spam', 'unsubscribe', 'report', 'draft'})
+VERBS = frozenset({'trash', 'archive', 'move', 'spam', 'unsubscribe', 'report'})
 SENDING_ROWS = {'draft', 'forward'}
 LEGACY_STATE_RECORDS = '_' + 'drafts'  # Read only until the next state commit.
 OLDER_PLAN = 'this plan was made by an older version; plan again'
-PLAN_VERBS = (VERBS - {'draft', 'report'}) | {'create-folder'}
+PLAN_VERBS = (VERBS - {'report'}) | {'create-folder'}
+SEND_REFUSALS = {
+    'en': {'inbox': "Number {number} is not in this run's Inbox; nothing sent",
+           'changed': "Number {number}'s rule is no longer a draft or forward rule; nothing sent",
+           'none': 'Number {number} has no draft or forward rule; nothing sent',
+           'by_hand': 'Number {number}: forward this one by hand; nothing to approve',
+           'protected': 'Number {number} is protected by never-touch',
+           'approved': 'Number {number} was already approved for sending on {date}; nothing sent'},
+    'es': {'inbox': 'El número {number} no está en Recibidos de esta ejecución; no se envió nada',
+           'changed': 'La regla del número {number} ya no es una regla de borrador o reenvío; no se envió nada',
+           'none': 'El número {number} no tiene una regla de borrador o reenvío; no se envió nada',
+           'by_hand': 'Número {number}: reenvía este correo a mano; no hay nada que aprobar',
+           'protected': 'El número {number} está protegido por never-touch',
+           'approved': 'El número {number} ya se aprobó para envío el {date}; no se envió nada'},
+}
 BRAKE_FLOOR = 10
 BODY_LIMIT = 2000
 STALE_SECONDS = 45 * 60
@@ -541,6 +555,8 @@ def validate_state_file(name, raw, config, folder):
                 if stamp.utcoffset() != timedelta(0) or not isinstance(data['parts'], list):
                     raise ValueError(name + ': expected UTC time and parts')
                 for part in data['parts']:
+                    # send-draft and forward are read only: a log written before Task 7 must
+                    # still validate after updating. Nothing writes them now.
                     if (not isinstance(part, dict) or set(part) != {'number', 'account', 'id', 'verb', 'target', 'outcome'}
                             or type(part['number']) is not int or part['number'] < 1
                             or part['account'] not in config['accounts'] or not isinstance(part['id'], str)
@@ -1162,17 +1178,22 @@ def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
             steps, action_note = row_steps(action)
             if not steps:
                 raise ValueError('no action step')
+            if any(step.get('verb') == 'forward' and not step.get('content') for step in steps):
+                raise ValueError('forward without recipients')
             table_cap, action_note = action_cap(action_note)
             if ident in cap_errors:
                 raise ValueError(cap_errors[ident][0][1])
             cap = min([*([table_cap] if table_cap else []), *(value for _, value in caps.get(ident, []))] or [10])
+            if any(step.get('verb') in SENDING_ROWS for step in steps) and (table_cap or caps.get(ident)):
+                warnings.append(f'Rule {chat_text(name)} (line {number}): a cap does not apply to a draft or forward row')
             handles = list(accounts) if scope.casefold() == 'todas' else list(dict.fromkeys(scope.replace(',', ' ').split()))
             known = [handle for handle in handles if handle in accounts]
             if not known:
                 raise ValueError('no configured account in scope')
             reference_action = action
             if any(step.get('verb') in SENDING_ROWS for step in steps):
-                reference_action = ' '.join([action_note, *(step['agent'] for step in steps if 'agent' in step)])
+                reference_action = ' '.join([action_note, *(step.get('content') or step.get('agent', '')
+                                                            for step in steps if 'agent' in step or step.get('verb') in SENDING_ROWS)])
             reference_text = re.sub(r'(?<!\]\()https?://\S+', '', pattern + ' ' + reference_action, flags=re.I)
             refs = (a or b or c for a, b, c in FILE_REFERENCE.findall(reference_text))
             non_files = refs_to_lists | {value for _, value in tokens} | {step['target'].casefold() for step in steps if 'target' in step}
@@ -1857,9 +1878,10 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                 if kit and kit[0]['verb'] in SENDING_ROWS:
                     kind = kit[0]['verb']
                     reason = f"{rule['id']} {kind}: {kit[0]['content']}"
-                    if kind == 'forward' and config['accounts'][key[0]].get('provider') == 'gmail':
-                        reason += ' · forward by hand'
-                    question = {'send_row': rule['id'], 'send_kind': kind}
+                    by_hand = kind == 'forward' and config['accounts'][key[0]].get('provider') == 'gmail'
+                    if by_hand:
+                        reason += ' · forward by hand; no draft is created, so nothing to approve'
+                    question = {'send_row': rule['id'], 'send_kind': kind, 'send_by_hand': by_hand}
                     break
                 if 'steps' in rule:
                     rule = rule | dict(action=kit[-1]['verb'], target=kit[-1].get('target'))
@@ -2381,18 +2403,22 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
         result.update(reply=[], reply_source=dict(numbers=source, parts=parts))
         return result
     selections, entries, send_numbers = {}, [], {}
+    language = config.get('language', 'en')
+
+    def send_refusal(number, cause, date=''):
+        return SEND_REFUSALS[language][cause].format(number=number, date=date)
+
     for part in parts:
         item = numbers.get(part['number'])
-        refusal = f"Number {part['number']} has no draft or forward row; nothing sent"
         if item is None:
-            raise ValueError(refusal if part['verb'] == 'send' else 'Unknown number')
+            raise ValueError(send_refusal(part['number'], 'none') if part['verb'] == 'send' else 'Unknown number')
         members = item.get('members', [item])
         if part['verb'] == 'send' and len(members) != 1:
-            raise ValueError(refusal)
+            raise ValueError(send_refusal(part['number'], 'none'))
         for member in members:
             key = (member['account'], member['id'])
             if part['verb'] == 'send' and key not in messages:
-                raise ValueError(refusal)
+                raise ValueError(send_refusal(part['number'], 'inbox'))
             if key not in messages:
                 if len(members) == 1:
                     raise ValueError('Number is not in the fresh Inbox for its saved account')
@@ -2401,13 +2427,18 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
             if message['sender'] is None:
                 raise ValueError('Number ' + str(part['number']) + ' has an invalid sender')
             if any(matches(message, h, protection=True) for h in holds if 'judgment' not in h):
-                raise ValueError('Number ' + str(part['number']) + ' is protected by never-touch')
+                raise ValueError(send_refusal(part['number'], 'protected'))
             entry = dict(part, account=key[0], id=key[1])
             entries.append(entry)
             if part['verb'] == 'send':
                 row = select_rule(message, rules or []) if message['sender'] else None
-                if row is None or not any(step.get('verb') in SENDING_ROWS for step in row.get('steps', [])):
-                    raise ValueError(refusal)
+                sending = next((step for step in (row or {}).get('steps', []) if step.get('verb') in SENDING_ROWS), None)
+                if row is None:
+                    raise ValueError(send_refusal(part['number'], 'none'))
+                if sending is None:
+                    raise ValueError(send_refusal(part['number'], 'changed'))
+                if sending['verb'] == 'forward' and config['accounts'][key[0]].get('provider') == 'gmail':
+                    raise ValueError(send_refusal(part['number'], 'by_hand'))
                 selections[key] = row
                 send_numbers[key] = part['number']
                 continue
@@ -2421,15 +2452,26 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
     if questions:
         return result
     approvals = []
+    earlier = {}
+    log = store / 'decisions.jsonl'
+    for line in read_text(log).splitlines() if log.exists() else []:
+        batch = decision_batch(line)
+        for part in batch.get('parts', []):
+            if part.get('verb') == 'send' and part.get('outcome') == 'approved':
+                earlier.setdefault((part['account'], part['id']), str(batch.get('time') or '')[:10])
     for decision in result['decisions']:
         key = decision['account'], decision['id']
         if key not in send_numbers:
             continue
         if 'send_kind' not in decision:
-            raise ValueError(f"Number {send_numbers[key]} has no draft or forward row; nothing sent ({decision['reason']})")
+            if decision['reason'] == 'Protected by never-touch':
+                raise ValueError(send_refusal(send_numbers[key], 'protected'))
+            raise ValueError(send_refusal(send_numbers[key], 'changed'))
+        if key in earlier:
+            raise ValueError(send_refusal(send_numbers[key], 'approved', earlier[key]))
         approvals.append(dict(account=key[0], id=key[1], row=decision['send_row'], kind=decision['send_kind']))
     if approvals:
-        result['send'] = approvals
+        result['send_approved'] = approvals
     planned = {(a['account'], a['id']) for a in result['actions']}
     planned |= {(d['account'], d['id']) for d in result['decisions']
                 if d['reason'] == 'Protected by never-touch'
@@ -2533,6 +2575,9 @@ def reply_hint(items, language, listing=None, held=False):
             target = name
             break
     examples = ', '.join(n + ' ' + action for action in (['trash', 'archive', 'spam'] + (['move to ' + target] if target else []) + ['leave', 'yes', 'no']))
+    send = next((i for i in numbered if i.get('send_kind') and not i.get('send_by_hand')), None)
+    if send is not None:
+        examples += ', ' + str(send['number']) + ' send'
     if held:
         examples += ', or proceed for the mail held above a cap' if language == 'en' else ', o proceder para el correo retenido por encima de un límite'
     return [('Reply with a number and action, for example: ' if language == 'en' else 'Responde con un número y una acción, por ejemplo: ') + examples]
@@ -2598,7 +2643,7 @@ def message_outcomes(plan, listing, items, observed=None, language='en', *, know
             item['reason'] = 'Kept by owner reply'
         item['previously_listed'] = marks.get(key, {}).get('previously_listed', item.get('previously_listed', False))
         hidden = (plan.get('relist_inbox') == 'new_plus_count' and item['previously_listed']
-                  and key not in decision_notes and not item['reason'].startswith(('A send was issued;', 'A forward was issued;')))
+                  and key not in decision_notes)
         kind = ('handled' if key in handled else 'protected' if item['reason'] == 'Protected by never-touch'
                 else 'previously listed' if hidden else 'kept by owner reply' if kept
                 else 'numbered for owner' if owner_items(plan, [item], numbered=observed is not None) else 'not answerable')
@@ -2639,6 +2684,11 @@ def message_outcomes(plan, listing, items, observed=None, language='en', *, know
         if language == 'es':
             for source, target in {'Protected by never-touch': 'Protegido por never-touch', 'Invalid sender: not one valid address': 'Remitente no válido: no es una dirección válida', 'Run stopped': 'Ejecución detenida', 'action not confirmed': 'acción no confirmada', 'rule refused by brake': 'regla rechazada por el freno', 'failed': 'falló', 'unexecuted': 'sin ejecutar', 'issued_unknown': 'resultado desconocido'}.items():
                 reason = reason.replace(source, target)
+            if item.get('send_kind'):
+                reason = re.sub(r'^(\S+) draft: ', r'\1 borrador: ', reason)
+                reason = re.sub(r'^(\S+) forward: ', r'\1 reenvío: ', reason)
+                reason = reason.replace(' · forward by hand; no draft is created, so nothing to approve',
+                                        ' · reenvía a mano; no se crea ningún borrador, así que no hay nada que aprobar')
             reason = re.sub(r'^(\S+): held above its cap of (\d+) for this run$', r'\1: retenido por encima de su límite de \2 en esta ejecución', reason)
             reason = re.sub(r'^Parent folder (.+) is missing; create it by hand$', r'Falta la carpeta padre \1; créala a mano', reason)
         if section == 'handled':
@@ -2661,8 +2711,9 @@ def message_outcomes(plan, listing, items, observed=None, language='en', *, know
                 tag += ('; ' if tag else '') + protection
         if item.get('send_kind'):
             visible, hidden = True, False
-            tag += ' · ' + ('reply N send after checking the draft' if language == 'en'
-                            else 'responde N enviar después de revisar el borrador')
+            if not item.get('send_by_hand'):
+                tag += ' · ' + ('reply N send after checking the draft' if language == 'en'
+                                else 'responde N enviar después de revisar el borrador')
         if key in decision_notes and decision_notes[key] not in tag:
             tag += ('; ' if tag else '') + safe_text(decision_notes[key])
         outcomes.append(dict(item=item, kind=kind, actions=handled.get(key, []), failure=failure,
@@ -3645,7 +3696,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         require_plan_token(plan, token)
         if plan.get('dry_run'):
             raise ValueError('dry-run plan: commit-state is refused')
-        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'answers_error', 'answers_used', 'ignored_answers', 'rule_diagnostics', 'cap_holds', 'move_month', 'proceed_note', 'send'}, str(plan_path))
+        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'answers_error', 'answers_used', 'ignored_answers', 'rule_diagnostics', 'cap_holds', 'move_month', 'proceed_note', 'send_approved'}, str(plan_path))
         for key in ('actions', 'reasons', 'not_listed'):
             if not isinstance(plan.get(key), list):
                 raise ValueError(str(plan_path) + '.' + key + ': expected an array')
@@ -4735,11 +4786,11 @@ def _main(argv=None, *, now=None):
                         report = 'Late start: slot ' + slot.strftime('%Y-%m-%d %H:%M %Z') + ', delay ' + str(delay) + ' minutes\n' + report
                 sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
                 if args.command == 'reply':
+                    language = config.get('language', 'en')
                     if result['reasons'] and result.get('approval_state') != 'awaiting approval':
-                        print(chat_text(result['reasons'][0]).rstrip('.') + '. Type each listed number once followed by trash, archive, spam, move to <existing folder>, leave, yes or no' + '; separate parts with commas. For a stale, protected or unavailable item, request a fresh run and use an eligible listed number.' + (' Dry run: render the rehearsal message and simulate it; no reply is acted on.' if args.dry_run else ' Next: execute.py next, commit-state, message, send-state and release under this lock.'))
+                        print(chat_text(result['reasons'][0]).rstrip('.') + '. Type each listed number once followed by trash, archive, spam, move to <existing folder>, leave, yes, no or send; separate parts with commas. For a stale, protected or unavailable item, request a fresh run and use an eligible listed number.' + (' Dry run: render the rehearsal message and simulate it; no reply is acted on.' if args.dry_run else ' Next: execute.py next, commit-state, message, send-state and release under this lock.'))
                     source = result.get('reply_source')
                     if source:
-                        language = config.get('language', 'en')
                         for part in source['parts']:
                             if part['verb'] in {'cap-proceed', 'send'}:
                                 continue
@@ -4803,15 +4854,20 @@ def _main(argv=None, *, now=None):
                         print('question_id: ' + result['run_id'])
                     if pointers:
                         print(json.dumps(pointers))
-                    for approval in result.get('send', []):
+                    if result.get('send_approved'):
+                        print(json.dumps({'send_approved': result['send_approved']}))
+                    for approval in result.get('send_approved', []):
                         entry = next(e for e in result['reply'] if e['verb'] == 'send'
                                      and (e['account'], e['id']) == (approval['account'], approval['id']))
-                        label = f"{entry['number']} ({chat_text(approval['row'])} {approval['kind']})"
+                        kind = approval['kind'] if language == 'en' else ('borrador' if approval['kind'] == 'draft' else 'reenvío')
+                        label = f"{entry['number']} ({chat_text(approval['row'])} {kind})"
                         if args.dry_run:
-                            print(f"Dry run: would approve send for {label}")
+                            print(f"Dry run: would approve send for {label}" if language == 'en'
+                                  else f"Simulación: aprobaría el envío de {label}")
                         else:
-                            print(f"Send approved for {label}: follow docs/sending.md")
-                    print(('' if args.plan_out else payload) + ('' if args.report_out else report), end='', flush=True)
+                            print(f"Send approved for {label}: follow docs/sending.md" if language == 'en'
+                                  else f"Envío aprobado para {label}: sigue docs/sending.md")
+                    print(('' if args.plan_out else payload) + ('' if args.report_out or args.command == 'reply' else report), end='', flush=True)
                 except Exception:
                     for destination, _ in outputs:
                         if destination != state and destination.is_file():

@@ -369,10 +369,10 @@ class RulesTableTests(unittest.TestCase):
         self.assertEqual([(q['id'], q['row'], q['then'], q['never_touch']) for q in questions],
                          [('19', 'numbered-reply', ['archive'], ['Bills', 'Personal mail'])])
         for proceed in (False, True):
-            plan, report = self.answer([dict(account='home', id='19', proceed=proceed, note='Checked for bills')],
-                                       *args, command='reply')
+            plan, _ = self.answer([dict(account='home', id='19', proceed=proceed, note='Checked for bills')],
+                                  *args, command='reply')
             self.assertEqual([a['action'] for a in plan['actions']], ['archive'] if proceed else [])
-            self.assertIn('Checked for bills', report)
+            self.assertIn('Checked for bills', json.dumps(plan))
 
     def test_execute_rebuilds_plan_with_stored_answers(self):
         self.start_questions()
@@ -906,9 +906,8 @@ class RulesTableTests(unittest.TestCase):
         self.addCleanup(triage.release, self.store, token)
         (self.store / 'reply.txt').write_text('1 archive')
         path = self.store / 'rehearsal.json'
-        output = self.cli('reply', '--dry-run', '--token', token, '--inbox', str(FIXTURES / 'inbox.json'),
-                          '--reply', str(self.store / 'reply.txt'), '--plan-out', str(path))
-        self.assertIn('Rule X (line 3) not used: no sender, domain or subject', output)
+        self.cli('reply', '--dry-run', '--token', token, '--inbox', str(FIXTURES / 'inbox.json'),
+                 '--reply', str(self.store / 'reply.txt'), '--plan-out', str(path))
         self.assertIn('Rule X (line 3) not used: no sender, domain or subject',
                       json.loads(path.read_text())['rule_diagnostics'])
 

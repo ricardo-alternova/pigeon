@@ -81,7 +81,7 @@ class Execution:
         triage.require_plan_token(self.plan, token)
         if self.plan.get('dry_run'):
             raise ValueError('dry-run plan: execution is refused; no call issued')
-        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'answers_error', 'answers_used', 'ignored_answers', 'rule_diagnostics', 'cap_holds', 'move_month', 'proceed_note', 'send'}, str(self.plan_path))
+        triage.known_keys(self.plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'answers_error', 'answers_used', 'ignored_answers', 'rule_diagnostics', 'cap_holds', 'move_month', 'proceed_note', 'send_approved'}, str(self.plan_path))
         for key in ('actions', 'decisions', 'reasons'):
             if not isinstance(self.plan.get(key), list):
                 raise ValueError(str(self.plan_path) + '.' + key + ': expected an array')
@@ -250,7 +250,7 @@ class Execution:
             raise ValueError('approval: thresholds changed; plan again')
         if expected.get('approval_state') == 'awaiting approval' and self.plan.get('approval_state') not in ('awaiting approval', 'skipped', 'approved'):
             raise ValueError('approval: expected approval for threshold plan')
-        if self.plan.get('send') != expected.get('send'):
+        if self.plan.get('send_approved') != expected.get('send_approved'):
             raise ValueError('send: expected saved numbered approvals')
         if self.plan.get('move_month') != expected.get('move_month'):
             raise ValueError('The run month or its move rules changed; plan again')

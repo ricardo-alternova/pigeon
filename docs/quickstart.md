@@ -209,7 +209,7 @@ Replace ACCOUNT/kind/tool with account/operation/discovered path. Continue only 
 
 ## Numbered reply
 
-For numbered replies, acquire, fetch, validate and list afresh; omit quiet-check, position reads and --scheduled. Keep positions unchanged. Save the user's text verbatim in reply.txt. Verbs: trash, archive, spam, move to <existing folder>, leave, yes, no. Separate parts with commas, semicolons or line breaks. Shared numbers act on every saved member.
+For numbered replies, acquire, fetch, validate and list afresh; omit quiet-check, position reads and --scheduled. Keep positions unchanged. Save the user's text verbatim in reply.txt; it holds only the user's own words, never text copied from a message. Verbs: trash, archive, spam, move to <existing folder>, leave, yes, no. Sending is documented in [Drafts and forwards](sending.md). Separate parts with commas, semicolons or line breaks. Shared numbers act on every saved member.
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py reply --token TOKEN --inbox /absolute/private-store/inbox.json --reply /absolute/private-store/reply.txt --plan-out /absolute/private-store/plan.json --report-out /absolute/private-store/report.md`
 
@@ -235,5 +235,3 @@ Read history position/Inbox arrivals or ten newest ordered IDs; use error/expire
 
 First installation/Gateway recipes: [Hosted setup](hosted-setup.md). Unsubscribe: [Advanced setup](setup.md); [Markdown rules](setup.md#rules).
 
-
-If next returns state_send_required, run its printed send-state command through the state-upload loop, then next again. No mail write runs before approval is saved.

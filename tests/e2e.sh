@@ -805,10 +805,12 @@ list_inbox(token)
 doc = Path('docs', 'sending' + '.md').read_text()
 real, dry = re.findall(r'```sh\n(.*?)\n```', doc, re.S)
 output = run('sh', '-eu', '-c', dry, token=token)
-assert output.startswith('Dry run: would approve send for 1 (D1 draft)') and 'Send approved' not in output
+assert output.splitlines()[0] == '{"send_approved": [{"account": "cedar", "id": "m1", "row": "D1", "kind": "draft"}]}'
+assert 'Dry run: would approve send for 1 (D1 draft)' in output and 'Send approved' not in output
 output = run('sh', '-eu', '-c', real, token=token)
-assert output.startswith('Send approved for 1 (D1 draft): follow docs/')
-assert json.loads(Path(plan).read_text())['send'] == [
+assert output.splitlines()[0] == '{"send_approved": [{"account": "cedar", "id": "m1", "row": "D1", "kind": "draft"}]}'
+assert 'Send approved for 1 (D1 draft): follow docs/' in output
+assert json.loads(Path(plan).read_text())['send_approved'] == [
     {'account': 'cedar', 'id': 'm1', 'row': 'D1', 'kind': 'draft'}]
 assert json.loads(run('python3', 'scripts/execute.py', 'next', '--token', token, '--plan', plan)) == {'done': True}
 triage('commit-state', '--token', token, '--plan', plan)
