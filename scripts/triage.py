@@ -437,6 +437,7 @@ LEGACY_HOLDS = ('never-touch.toml is no longer read; put its addresses and domai
 STATE_FILES = ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json',
                'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md',
                'rules.md', *LIST_FILES, 'tool-paths.json', 'plan.json', 'inbox.json', 'state.json')
+FETCH_FILES = (*STATE_FILES, 'never-touch.toml')
 STATE_LIMIT = 4 * 1024 * 1024
 LEGACY_RULES = 'rules.toml is no longer read; the rules belong in rules.md as a table'
 
@@ -617,7 +618,7 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
                 p.unlink()
             data = dict(token=token, setting=setting, phase='fetch')
             save()
-            return {'calls': [issue(n, 'download') for n in STATE_FILES]}
+            return {'calls': [issue(n, 'download') for n in FETCH_FILES]}
         if data.get('token') != token or data.get('setting') != setting:
             raise ValueError('state exchange: expected matching token and settings; release lock')
         if operation == 'fetch':
@@ -626,10 +627,12 @@ def drive_state(store, operation, token, observation=None, *, lock_observation=N
             data['phase'] = 'refused'
             save()
             observed = state_observation(observation)
-            if set(observed) != set(STATE_FILES):
+            if set(observed) != set(FETCH_FILES):
                 raise ValueError('state fetch: expected exactly the fixed names; release lock')
             if any(v not in ('fetched', 'absent') for v in observed.values()):
                 raise ValueError('state fetch: failed or uncertain download; release lock')
+            if observed['never-touch.toml'] == 'fetched':
+                raise ValueError(LEGACY_HOLDS)
             if all(v == 'absent' for v in observed.values()) and any((store / n).exists() for n in ('state.json', 'numbers.json', *LOG_NAMES)):
                 raise ValueError('drive store empty but local records exist')
             expected = {n for n in STATE_FILES if observed[n] == 'fetched'}
@@ -861,6 +864,7 @@ ACTION_WORDS = {'trash': 'trash', 'archive': 'archive', 'spam': 'spam',
 DOMAIN_TOKEN = r'(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?'
 CODE_SPAN = r'(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)'
 FILE_REFERENCE = re.compile(r"\]\(<?(?!\w+://)([^<>\n)]+)>?\)|`([^`]+\.(?:md|txt|csv))`|(?<![\w/@.])([\w./-]+\.(?:md|txt|csv))\b", re.I)
+TOML_LINE = re.compile(r"""\s*(?:\[\[[^\]]+\]\]|[A-Za-z_][\w-]*\s*=\s*(?:"|'|\[|\{|true\b|false\b|\d))""")
 
 
 def idna_domain(domain):
@@ -880,7 +884,25 @@ def domain_pattern(text):
     return None
 
 
-def read_list(text, name):
+def idna_written(domain):
+    """The written domain when IDNA only re-encodes it, else None."""
+    ascii_form = idna_domain(domain)
+    try:
+        return ascii_form.encode('ascii').decode('idna') if ascii_form else None
+    except UnicodeError:
+        return None
+
+
+def written_forms(normalized):
+    """The written forms that normalize to this address or domain."""
+    local, at, domain = normalized.rpartition('@')
+    decoded = idna_written(domain or normalized)
+    return {normalized, local + at + decoded} if decoded else {normalized}
+
+
+def read_list(text, name, diagnostics=None):
+    if any(TOML_LINE.match(line) for line in text.splitlines()):
+        raise ValueError(LEGACY_HOLDS)
     entries = []
     for number, raw in enumerate(text.replace('\r\n', '\n').split('\n'), 1):
         line = raw.strip()
@@ -893,15 +915,23 @@ def read_list(text, name):
         where = f'{name} line {number}: "{chat_text(line)}"'
         if any(unicodedata.category(c) in {'Cc', 'Cf'} for c in raw) or len(line) > 500:
             raise ValueError(f'{where} has control characters or exceeds 500 characters')
+        if line.casefold() in LIST_FILES:
+            raise ValueError(f'{where} is a reserved list name')
         if any(c.isspace() for c in line) or not any(c in line for c in '@.*'):
+            if diagnostics is not None and any('@' in word or ('.' in word and re.fullmatch(DOMAIN_TOKEN, word.casefold()))
+                                               for word in line.split()):
+                diagnostics.append(f'{name} line {number} reads as a category, not an address: "{chat_text(line)}"')
             entries.append({'judgment': line})
         elif '@' in line and not line.startswith('@'):
             sender = normalize_sender(line)
             if (sender is None or not re.fullmatch(r"[^@<>;,()\"\\:*]+@[^@<>;,()\"\\:*]+", line)
-                    or not domain_pattern(sender.rsplit('@', 1)[1])):
+                    or not domain_pattern(sender.rsplit('@', 1)[1])
+                    or line.casefold() not in written_forms(sender)):
                 raise ValueError(f'{where} is not an address or a domain')
             entries.append({'sender': sender})
         elif (domain := domain_pattern(line)) and not (domain.startswith('*.') and domain.count('.') == 1):
+            if line.casefold().removeprefix('@').removeprefix('*.') not in written_forms(domain.removeprefix('*.')):
+                raise ValueError(f'{where} is not an address or a domain')
             entries.append({'domain': domain})
         else:
             raise ValueError(f'{where} is not an address or a domain')
@@ -1081,7 +1111,7 @@ def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
                     try:
                         if not list_path.resolve().is_relative_to(directory):
                             raise ValueError('file reference outside the rules folder: ' + value)
-                        lists[value] = read_list(load_inputs([list_path], empty=True)[0], value)
+                        lists[value] = read_list(load_inputs([list_path], empty=True)[0], value, diagnostics)
                     except (ValueError, OSError) as error:
                         lists[value] = str(error)
                 entries = lists[value]
@@ -1096,7 +1126,7 @@ def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
             tokens = expanded
             if not tokens and subject is None:
                 if refs_to_lists:
-                    continue
+                    raise ValueError(', '.join(sorted(refs_to_lists)) + ' has no address or domain')
                 raise ValueError('no sender, domain or subject')
             if subject is not None and not subject.replace('*', '').strip():
                 raise ValueError('subject pattern has no literal text')
@@ -1859,12 +1889,20 @@ def read_asked(store, token, dry_run=False):
             if isinstance(q, dict) and isinstance(q.get('account'), str) and isinstance(q.get('id'), str)}
 
 
+SIGNATURE_FIELDS = ('id', 'accounts', 'steps', 'cap', 'sender', 'domain', 'subject')
+
+
 def rule_signature(rule, categories):
     """Bind cap proceed to the rule and the judgment its answers covered."""
-    fields = {k: rule[k] for k in ('id', 'accounts', 'steps', 'cap', 'sender', 'domain', 'subject') if k in rule}
+    fields = {k: rule[k] for k in SIGNATURE_FIELDS if k in rule}
     if rule.get('note') or categories:
         fields.update(note=rule.get('note', ''), never_touch=categories)
     return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+
+def legacy_signature(rule):
+    """The signature the published version saved, before note text and categories were bound."""
+    return hashlib.sha256(json.dumps({k: rule[k] for k in SIGNATURE_FIELDS if k in rule}, sort_keys=True).encode()).hexdigest()
 
 
 def run_month(store, config):
@@ -2615,6 +2653,8 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
             rule = select_rule(dict(message, sender=sender), rules or []) if sender else None
             if rule is not None and rule_signature(rule, categories) == part['signature']:
                 selections[key] = rule
+            elif rule is not None and legacy_signature(rule) == part['signature']:
+                raise ValueError('this plan was made by an older version; plan again')
             else:
                 changed.add(key)
         result = build_plan(listing, rules or [], holds, config, previous, stops, selections=selections,
@@ -3911,7 +3951,7 @@ def load_safety(sources, diagnostics=None):
     for index, path in enumerate(sources):
         try:
             if index == 2:
-                value = read_list(load_inputs([path], empty=True)[0], path)
+                value = read_list(load_inputs([path], empty=True)[0], path, diagnostics)
             else:
                 text = load_inputs([path])[0]
                 value = parse_toml(text, path) if index == 0 else text

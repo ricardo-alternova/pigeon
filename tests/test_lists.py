@@ -185,6 +185,69 @@ class ListTests(unittest.TestCase):
                 self.assertIn('never-touch.md line 2:', result.stderr)
                 self.assertIn(triage.chat_text(line)[:30], result.stderr)
 
+    def test_row_naming_an_empty_list_is_reported(self):
+        self.rules.write_text(rules_table('| U1 | unsubscribe.md | baja + trash | todas | own |'))
+        for text in ('', '# nothing yet\n', 'family mail\n'):
+            with self.subTest(text=text):
+                self.unsubscribe.write_text(text)
+                plan = self.plan_data()
+                self.assertEqual(plan['actions'], [])
+                self.assertTrue(any('Rule U1' in line and 'unsubscribe.md has no address or domain' in line
+                                    for line in plan['rule_diagnostics']), plan['rule_diagnostics'])
+
+    def test_answer_cannot_authorize_filing_after_a_category_is_added(self):
+        questions = self.ask()
+        self.assertEqual([(q['id'], q['never_touch']) for q in questions], [('7', []), ('12', [])])
+        answers = self.store / 'answers.json'
+        execute.atomic(answers, dict(run=self.token, answers=[
+            dict(account=q['account'], id=q['id'], proceed=True, note='Not family mail') for q in questions]))
+        self.holds.write_text('family mail\n')
+        plan = self.plan_data('--answers', str(answers))
+        self.assertEqual(plan['actions'], [])
+        reasons = {d['id']: d['reason'] for d in plan['decisions']}
+        self.assertEqual(reasons['7'], 'the rule changed after the question')
+        self.assertEqual(reasons['12'], 'the rule changed after the question')
+
+    def test_category_line_that_reads_as_an_address_is_reported(self):
+        self.holds.write_text('promo@example.com # promo\n')
+        result = self.cli('validate')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('never-touch.md line 1 reads as a category, not an address: "promo@example.com # promo"',
+                      result.stdout)
+        self.rules.write_text(rules_table('| R1 | nobody@example.com | trash | todas | own |'))
+        plan = self.plan_data()
+        self.assertTrue(any('never-touch.md line 1 reads as a category, not an address' in line
+                            for line in plan['rule_diagnostics']), plan['rule_diagnostics'])
+
+    def test_reserved_list_names_are_refused(self):
+        for line in ('never-touch.md', 'unsubscribe.md'):
+            with self.subTest(line=line):
+                self.holds.write_text(line + '\n')
+                result = self.cli('validate')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('never-touch.md line 1: "' + line + '" is a reserved list name', result.stderr)
+
+    def test_a_line_that_normalizes_to_another_address_is_refused(self):
+        for line in ('promo@example.com\u034fextra', 'example.com\u034fextra'):
+            with self.subTest(line=line):
+                self.holds.write_text(line + '\n')
+                result = self.cli('validate')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('never-touch.md line 1:', result.stderr)
+        for line, entry in (('PROMO@EXAMPLE.COM', {'sender': 'promo@example.com'}),
+                            ('promo+deals@example.com', {'sender': 'promo+deals@example.com'}),
+                            ('exämple.net', {'domain': 'xn--exmple-cua.net'}),
+                            ('xn--exmple-cua.net', {'domain': 'xn--exmple-cua.net'})):
+            with self.subTest(line=line):
+                self.assertEqual(triage.read_list(line + '\n', 'never-touch.md'), [entry])
+
+    def test_a_legacy_toml_override_is_refused(self):
+        custom = self.store / 'protections.toml'
+        custom.write_text('[[rules]]\nsender = "a@example.net"\n')
+        result = self.plan('plan', '--never-touch', str(custom))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr.strip(), 'Refused: ' + triage.LEGACY_HOLDS)
+
     def test_legacy_never_touch_file_refuses(self):
         legacy = self.store / 'never-touch.toml'
         legacy.write_text('[[rules]]\nsender="promo@example.com"\n')

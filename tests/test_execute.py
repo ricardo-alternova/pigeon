@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import datetime, timezone
 import os
@@ -4495,6 +4496,22 @@ class ExecuteTests(unittest.TestCase):
         plan = execute.read(self.path)
         self.assertEqual([a['id'] for a in plan['actions']], [str(i) for i in range(25, 30)])
         self.assertEqual(plan['decisions'], [])
+
+    def test_proceed_refuses_a_published_cap_signature_as_an_older_version(self):
+        first = self.cap_run(['| C1 | bulk@example.com | trash, max 25, except invoices | todas | |'],
+                             answers=[dict(account='cedar', id=str(i), proceed=True, note='ok') for i in range(30)])
+        rule = triage.read_rules((self.store / 'rules.md').read_text(), self.store / 'rules.md', {'cedar': {}})[0]
+        published = hashlib.sha256(json.dumps({k: rule[k] for k in ('id', 'accounts', 'steps', 'cap', 'sender', 'domain', 'subject')
+                                               if k in rule}, sort_keys=True).encode()).hexdigest()
+        saved = execute.read(self.store / 'numbers.json')
+        for hold in saved['cap_question']['holds']:
+            hold['signature'] = published
+        execute.atomic(self.store / 'numbers.json', saved)
+        result = self.proceed(first['run_id'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = execute.read(self.path)
+        self.assertIn('Reply refused: this plan was made by an older version; plan again', plan['reasons'])
+        self.assertNotIn('the rule changed after the question', json.dumps(plan))
 
     def test_proceed_refuses_answers_that_predate_a_never_touch_category(self):
         first = self.cap_run(['| C1 | bulk@example.com | trash, max 25, except invoices | todas | |'],

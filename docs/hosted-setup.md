@@ -60,7 +60,7 @@ Require config.toml before locking. Use these keys:
 | accounts.HANDLE.address | Mailbox address for identity verification; required on a requested forward’s target account. |
 | accounts.HANDLE.quiet_kind | history or ids; ids. |
 
-Refuse invalid rules or list lines as described in the rule reference, and unknown keys and wrong types in config, listings and state.
+Refuse invalid rules or list lines as described in the [rule reference](setup.md#rules) (a bad never-touch.md line stops the run and names the line; a bad unsubscribe.md line disables the row that names it), and unknown keys and wrong types in config, listings and state.
 
 ## Drive lock
 
@@ -86,7 +86,7 @@ After uncertain acquisition wait 45 minutes from script start, then start fresh 
 
 Keep state and lock folders readable/writable only by the owner's own account, never shared or in a shared folder.
 
-After locking, fetch before reading state or mail. Download printed names to state-incoming: numbers.json, unsubscribe-secret, unsubscribe-failures.json, decisions.jsonl, calls.jsonl, history.log, run-message.md, rules.md, never-touch.md, unsubscribe.md, tool-paths.json, plan.json, inbox.json, state.json. Before fetching an existing drive store, migrate its never-touch entries by hand and place never-touch.md there. Open questions carry plan and listing; closing clears both with zero-byte uploads. Keep checkpoints, observations, config.toml and guardrails.md local. Follow [storage guardrails](../config/guardrails.example.md).
+After locking, fetch before reading state or mail. Download printed names to state-incoming: numbers.json, unsubscribe-secret, unsubscribe-failures.json, decisions.jsonl, calls.jsonl, history.log, run-message.md, rules.md, never-touch.md, unsubscribe.md, tool-paths.json, plan.json, inbox.json, state.json, never-touch.toml. Before fetching an existing drive store, migrate its never-touch entries by hand and place never-touch.md there; a drive folder that still holds never-touch.toml is refused. Open questions carry plan and listing; closing clears both with zero-byte uploads. Keep checkpoints, observations, config.toml and guardrails.md local. Follow [storage guardrails](../config/guardrails.example.md).
 
 Return fetched, absent or failed per issued filename. Confirm absence through the gateway; classify uncertainty as failed; preserve local rules when absent remotely. Refuse an empty drive store when local records exist; correct state.folder or restore local records to that folder.
 

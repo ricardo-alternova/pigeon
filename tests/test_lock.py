@@ -500,7 +500,7 @@ class LockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
             self.prepare(store)
-            for name in ('config.toml', 'rules.md', 'never-touch.md', 'guardrails.md', 'upload-observation.json', 'state.json', 'run.lock', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'execution-probe.json'):
+            for name in ('config.toml', 'rules.md', 'never-touch.md', 'unsubscribe.md', 'guardrails.md', 'upload-observation.json', 'state.json', 'run.lock', 'calls.jsonl', 'results.json', 'execution-report.md', 'unsubscribe-failures.json', 'unsubscribe-secret', 'execution-probe.json'):
                 for flag in ('--plan-out', '--report-out'):
                     token = triage.acquire(store)
                     if not (store / name).exists():
@@ -2324,7 +2324,7 @@ class DriveStateTests(unittest.TestCase):
         call = self.start('release', self.token)['call']
         self.observe(self.drive.perform(call), 'release', self.token)
         self.token = self.acquire()
-        self.assertEqual(len(self.exchange('fetch')['calls']), len(triage.STATE_FILES))
+        self.assertEqual(len(self.exchange('fetch')['calls']), len(triage.FETCH_FILES))
         self.assertEqual(list(incoming.iterdir()), [])
 
     def test_fetch_reports_legacy_rules_toml(self):
@@ -2340,6 +2340,15 @@ class DriveStateTests(unittest.TestCase):
         del self.drive.files['never-touch.md']
         issued = self.exchange('fetch')
         observed = {call['name']: self.drive.file_call(call)['status'] for call in issued['calls']}
+        with self.assertRaisesRegex(ValueError, 'never-touch.toml is no longer read'):
+            self.exchange('fetch', observed)
+
+    def test_fetch_refuses_a_drive_store_that_keeps_the_legacy_never_touch_file(self):
+        self.configured()
+        self.drive.files['never-touch.toml'] = b'[[rules]]\nsender="promo@example.com"\n'
+        issued = self.exchange('fetch')
+        observed = {call['name']: self.drive.file_call(call)['status'] for call in issued['calls']}
+        self.assertEqual(observed['never-touch.toml'], 'fetched')
         with self.assertRaisesRegex(ValueError, 'never-touch.toml is no longer read'):
             self.exchange('fetch', observed)
 
@@ -2417,7 +2426,7 @@ class DriveStateTests(unittest.TestCase):
         self.configured()
         result = self.exchange('fetch')
         self.assertTrue(all(c['kind'] == 'gdrive' for c in result['calls']))
-        self.assertEqual(tuple(c['name'] for c in result['calls']), ('numbers.json', 'unsubscribe-secret', 'unsubscribe-failures.json', 'decisions.jsonl', 'calls.jsonl', 'history.log', 'run-message.md', 'rules.md', 'never-touch.md', 'unsubscribe.md', 'tool-paths.json', 'plan.json', 'inbox.json', 'state.json'))
+        self.assertEqual(tuple(c['name'] for c in result['calls']), triage.FETCH_FILES)
 
     def test_state_config_refusals(self):
         for value in (None, [], {}, {'kind': 'typo'}, {'kind': 'local', 'account': 'a'},
@@ -2434,7 +2443,7 @@ class DriveStateTests(unittest.TestCase):
         for change in ({'state.json': 'failed'}, {'state.json': 'unknown'}, {'../x': 'absent'}, {'state.json': []}):
             (self.store / 'state-exchange.json').unlink(missing_ok=True)
             self.exchange('fetch')
-            observed = dict.fromkeys(triage.STATE_FILES, 'absent') | change
+            observed = dict.fromkeys(triage.FETCH_FILES, 'absent') | change
             before = (self.store / 'state.json').read_bytes()
             with self.assertRaises(ValueError): self.exchange('fetch', observed)
             self.assertEqual((self.store / 'state.json').read_bytes(), before)
@@ -2449,7 +2458,7 @@ class DriveStateTests(unittest.TestCase):
         elif content is not None: path.write_bytes(content)
         if mode == 'unreadable': path.chmod(0)
         before = (self.store / 'state.json').read_bytes()
-        observed = dict.fromkeys(triage.STATE_FILES, 'absent')
+        observed = dict.fromkeys(triage.FETCH_FILES, 'absent')
         observed[filename] = 'fetched'
         if mode == 'pipe':
             from unittest.mock import patch
@@ -2495,7 +2504,7 @@ class DriveStateTests(unittest.TestCase):
         (self.store / 'state-exchange.json').unlink()
         self.exchange('fetch')
         (self.store / 'state-incoming' / 'extra').write_text('x')
-        with self.assertRaises(ValueError): self.exchange('fetch', dict.fromkeys(triage.STATE_FILES, 'absent'))
+        with self.assertRaises(ValueError): self.exchange('fetch', dict.fromkeys(triage.FETCH_FILES, 'absent'))
 
     def test_send_requires_fetch_and_fresh_matching_read(self):
         self.configured()
@@ -2635,8 +2644,8 @@ class DriveStateTests(unittest.TestCase):
         self.exchange('fetch')
         self.assertFalse((self.store / 'state-incoming' / 'unexpected').exists())
         (self.store / 'state.json').unlink(missing_ok=True)
-        self.exchange('fetch', dict.fromkeys(triage.STATE_FILES, 'absent'))
-        with self.assertRaises(ValueError): self.exchange('fetch', dict.fromkeys(triage.STATE_FILES, 'absent'))
+        self.exchange('fetch', dict.fromkeys(triage.FETCH_FILES, 'absent'))
+        with self.assertRaises(ValueError): self.exchange('fetch', dict.fromkeys(triage.FETCH_FILES, 'absent'))
         for value in ('[]', '{', '{}' + ' ' * 4097):
             path = self.store / 'state-observation.json'
             path.write_text(value)
@@ -2659,7 +2668,7 @@ class DriveStateTests(unittest.TestCase):
         (incoming / 'numbers.json').write_text('{"next":1,"items":[]}')
         (incoming / 'state.json').write_text('{"cedar":-1}')
         before = (self.store / 'state.json').read_bytes()
-        observed = dict.fromkeys(triage.STATE_FILES, 'absent')
+        observed = dict.fromkeys(triage.FETCH_FILES, 'absent')
         observed.update({'numbers.json': 'fetched', 'state.json': 'fetched'})
         with self.assertRaises(ValueError): self.exchange('fetch', observed)
         self.assertFalse((self.store / 'numbers.json').exists())
@@ -2767,7 +2776,7 @@ class DriveStateTests(unittest.TestCase):
         (incoming / 'numbers.json').write_text('{"next":1,"items":[]}')
         (incoming / 'state.json').write_text('{"cedar":2}')
         before = (self.store / 'state.json').read_bytes()
-        observed = dict.fromkeys(triage.STATE_FILES, 'absent')
+        observed = dict.fromkeys(triage.FETCH_FILES, 'absent')
         (incoming / 'never-touch.md').touch()
         observed.update({'numbers.json':'fetched', 'state.json':'fetched', 'never-touch.md':'fetched'})
         atomic = execute.atomic_text
@@ -2795,7 +2804,7 @@ class DriveStateTests(unittest.TestCase):
         data = json.loads(path.read_text())
         for change in ({'token': 'wrong'}, {'setting': {'kind':'gdrive','account':'wrong','folder':'f'}}):
             path.write_text(json.dumps(data | change))
-            with self.assertRaises(ValueError): self.exchange('fetch', dict.fromkeys(triage.STATE_FILES, 'absent'))
+            with self.assertRaises(ValueError): self.exchange('fetch', dict.fromkeys(triage.FETCH_FILES, 'absent'))
 
     def test_failure_memory_unknown_fields(self):
         with self.assertRaises(ValueError):

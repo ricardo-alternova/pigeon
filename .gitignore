@@ -42,7 +42,8 @@ tests/fixtures/*
 !config/config.example.toml
 !config/guardrails.example.md
 !rules/rules.example.md
-!rules/never-touch.example.toml
+!rules/never-touch.example.md
+!rules/unsubscribe.example.md
 !scripts/triage.py
 !scripts/leak_check.py
 !hooks/pre-commit
@@ -53,6 +54,7 @@ tests/fixtures/*
 !tests/test_lock.py
 !tests/test_kit_text.py
 !tests/test_rules_table.py
+!tests/test_lists.py
 !tests/e2e.sh
 !tests/fixtures/inbox.json
 !tests/fixtures/rules.md
