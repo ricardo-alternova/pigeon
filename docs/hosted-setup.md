@@ -111,6 +111,7 @@ Use path {userId:"me"} for every Gmail call; add id for message/label reads. Pag
 | Inbox IDs | messages.list | {labelIds:["INBOX"],maxResults,pageToken}; save messages[].id. |
 | Attachments | messages.list | Add q:"has:attachment"; mark returned IDs true, other Inbox IDs false. |
 | Headers/date | messages.get | {format:"metadata",metadataHeaders:["From","Subject","Message-ID","List-Unsubscribe","List-Unsubscribe-Post"]}; Map From, Subject, Message-ID and List-Unsubscribe headers to sender, subject, internet_message_id and unsubscribe fields; threadId → conversation_id; internalDate milliseconds → UTC ISO 8601 date. |
+| Asked message | messages.get | {format:"full"}; read-only, only for a message plan asked about; To, Cc and In-Reply-To headers and the body text answer the note. |
 | Folders | labels.list | No query; save user labels' id/full name in folders.HANDLE. |
 | Inbox count | labels.get | id:"INBOX"; messagesTotal is Inbox count, never inbox.json accounts.HANDLE. |
 
@@ -133,6 +134,7 @@ For post-action verification call gmail.users.messages.get with `{path:{userId:"
 | Inbox count | meMailFolder.meGetMailFolders | path:{"mailFolder-id":"inbox"},query:{$select:["totalItemCount"]}; save Inbox count. |
 | All folders | meMailFolder.meListMailFolders | query:{$select:["id","displayName","totalItemCount","childFolderCount"],$top,$skip,includeHiddenFolders: "true"}; page until short, sum every totalItemCount into inbox.json accounts.HANDLE. For children use meMailFolder.meMailFoldersListChildFolders with path:{"mailFolder-id":ID} and the same query; recurse childFolderCount and join full paths. |
 | Quiet IDs | meMailFolder.meMailFoldersListMessages | Inbox path; query:{$select:["id"],$orderby:["receivedDateTime desc"],$top:10,$skip:0}; save ten newest IDs in order. |
+| Asked message | meMessage.meGetMessages | path:{"message-id":ID},query:{$select:["toRecipients","ccRecipients","internetMessageHeaders","body"]}; read-only, only for a message plan asked about; the recipients, In-Reply-To header and body text answer the note. |
 
 For post-action verification read the issued message by ID with the gateway’s discovered message-read tool. Compare parentFolderId with the Inbox folder ID from meGetMailFolders (select id). Set in_inbox to that comparison. If the ID does not exist after removal,report in_inbox=false. Treat any other failure as a failed reading. The final whole Inbox reading still decides. Report the boolean,not the folder ID.
 
@@ -165,7 +167,7 @@ Page each Inbox into private UTF-8 JSON inbox.json, even above inbox_limit. Neve
 | messages[].unsubscribe_url | First HTTPS URI in List-Unsubscribe angle brackets, stripped; omit if absent. Leave unsafe/missing links as decisions. |
 | messages[].unsubscribe_one_click | List-Unsubscribe-Post boolean, default false; true selects RFC 8058 POST, otherwise GET. |
 | messages[].body | Optional plain text for matched-rule notes, max 2000 characters. Request truncation or keep the first 2000. No HTML, attachments or links. Omit absent text. |
-| messages[].date | Optional ISO 8601 provider received/internal date; never sender Date/body. |
+| messages[].date | ISO 8601 provider received/internal date; never sender Date/body. Required when a note compares messages (keep the newest). |
 | messages[].conversation_id, messages[].internet_message_id | Optional strings: Gmail threadId/Message-ID; Outlook conversationId/internetMessageId. |
 | messages[].sender_name | Do not collect. |
 | skipped | Omitted account to reason map: {"cedar":"provider error (503)"} or {"cedar":"pigeon error (listing answer)"}; keep the account and its messages absent. |

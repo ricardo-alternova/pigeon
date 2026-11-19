@@ -944,6 +944,73 @@ class ExecuteTests(unittest.TestCase):
         self.assertFalse((self.store/'numbers.json').exists())
         self.assertFalse((self.store/'state.json').exists())
 
+    def test_saved_rehearsal_with_retired_fields_renders_and_simulates(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        (self.store/'rules.md').write_text(rules_table())
+        dry_inbox = self.store/'dry-inbox.json'
+        execute.atomic(dry_inbox, dict(accounts={'cedar':100}, messages=[
+            dict(account='cedar',id='dry',folder='Inbox',sender='peer@example.net',subject='Rehearsal only')]))
+        rehearsal = self.store/'rehearsal.json'
+        planned = self.run_cli('triage.py','plan','--token',self.token,'--dry-run','--inbox',str(dry_inbox),'--plan-out',str(rehearsal))
+        self.assertEqual(planned.returncode,0,planned.stderr)
+        saved = execute.read(rehearsal)
+        for field, value in (('recipients',['reader@example.org']),('is_reply',True)):
+            with self.subTest(field=field):
+                execute.atomic(rehearsal, dict(saved, dry_listing=dict(saved['dry_listing'], messages=[
+                    saved['dry_listing']['messages'][0] | {field:value}])))
+                message = self.run_cli('triage.py','message','--token',self.token,'--plan',str(rehearsal))
+                self.assertEqual(message.returncode,0,message.stderr)
+                self.assertIn('Rehearsal only',message.stdout)
+                simulated = self.run_cli('execute.py','dry-run','--plan',str(rehearsal))
+                self.assertEqual(simulated.returncode,0,simulated.stderr)
+
+    def test_saved_checkpoint_with_retired_fields_finishes(self):
+        for field, value in (('recipients',['reader@example.org']),('is_reply',True)):
+            with self.subTest(field=field):
+                self.setUp()
+                (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+                self.listing = dict(accounts={'cedar':100}, messages=[
+                    dict(account='cedar',id='gone',folder='Inbox',sender='a@example.net',subject='trash'),
+                    dict(account='cedar',id='left',folder='Inbox',sender='a@example.net',subject='other')])
+                execute.atomic(self.store/'inbox.json', self.listing)
+                self.plan = triage.build_plan(self.listing, self.read_rules(), [], {'accounts':{'cedar':{}}})
+                self.plan['first_run'] = True
+                save_plan(self.store, self.token, self.path, self.plan)
+                args = ['--token',self.token,'--plan',str(self.path)]
+                while 'final_reads' not in self.run_cli('execute.py','next',*args).stdout:
+                    self.assertEqual(self.run_cli('execute.py','result',*args,'--observation','{"outcome":"ok","in_inbox":false}').returncode,0)
+                final = self.store/'final-inbox.json'
+                left = dict(account='cedar',id='left',folder='Inbox',sender='a@example.net',subject='other')
+                execute.atomic(final, dict(accounts={'cedar':100}, messages=[left | {field:value}]))
+                refused = self.run_cli('execute.py','final',*args,'--inbox',str(final))
+                self.assertNotEqual(refused.returncode,0)
+                self.assertIn(f'Inbox.messages.0.{field}:',refused.stderr)
+                execute.atomic(final, dict(accounts={'cedar':100}, messages=[left]))
+                self.assertEqual(self.run_cli('execute.py','final',*args,'--inbox',str(final)).returncode,0)
+                checkpoint = self.store/('execution-'+hashlib.sha256(self.token.encode()).hexdigest()+'.json')
+                saved = execute.read(checkpoint)
+                execute.atomic(checkpoint, dict(saved, final_listing=dict(saved['final_listing'], messages=[
+                    saved['final_listing']['messages'][0] | {field:value}])))
+                self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+                self.assertEqual(self.run_cli('triage.py','commit-state',*args).returncode,0)
+                message = self.run_cli('triage.py','message',*args)
+                self.assertEqual(message.returncode,0,message.stderr)
+                self.assertIn('handled',message.stdout)
+                self.assertNotIn('run data refused',message.stdout)
+
+    def test_message_names_the_refused_field(self):
+        (self.store/'guardrails.md').write_text('Fixture guardrails\n')
+        args = ['--token',self.token,'--plan',str(self.path)]
+        self.assertEqual(self.run_cli('execute.py','next',*args).returncode,0)
+        checkpoint = self.store/('execution-'+hashlib.sha256(self.token.encode()).hexdigest()+'.json')
+        saved = execute.read(checkpoint)
+        execute.atomic(checkpoint, dict(saved, final_listing=dict(accounts={'cedar':0}, messages=[
+            dict(account='cedar',id='0',folder='Inbox',subject='move')])))
+        message = self.run_cli('triage.py','message',*args)
+        self.assertEqual(message.returncode,0,message.stderr)
+        self.assertIn('Inbox.messages.0.sender',message.stdout)
+        self.assertNotIn('run data refused',message.stdout)
+
     def test_r139_refused_reply_never_numbers_protected_sender(self):
         (self.store/'guardrails.md').write_text('Fixture guardrails\n')
         (self.store/'rules.md').write_text(rules_table())

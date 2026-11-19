@@ -55,7 +55,7 @@ Add read-only calendar invitations, overlaps and a winning calendar to reports a
 - Dated move targets and folder creation.
 - Per-rule action limits.
 - Full folder paths in listings.
-- Message dates and body matching.
+- Message dates.
 - Questions on report rules.
 
 ## 2026-11-11 — execution

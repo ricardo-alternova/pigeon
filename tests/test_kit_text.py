@@ -372,6 +372,24 @@ class KitTextTests(unittest.TestCase):
                        'Retain draft IDs'):
             self.assertNotIn(phrase, changelog)
 
+    def test_task8_documents_name_the_single_message_read(self):
+        setup = (ROOT/'docs/setup.md').read_text()
+        for phrase in ('answer false for the newest and true for the rest',
+                       "mailbox's single-message read", 'To, Cc and In-Reply-To',
+                       'its recipients, its body or whether it is a reply',
+                       'write the number when it counts recipients',
+                       'answer false when the needed part cannot be read'):
+            self.assertIn(phrase, setup)
+        hosted = (ROOT/'docs/hosted-setup.md').read_text()
+        for phrase in ('{format:"full"}', 'read-only, only for a message plan asked about',
+                       '$select:["toRecipients","ccRecipients","internetMessageHeaders","body"]',
+                       'Required when a note compares messages'):
+            self.assertIn(phrase, hosted)
+        self.assertIn("if the row's text says the action should not go ahead", (ROOT/'AGENTS.md').read_text())
+
+    def test_changelog_drops_body_matching(self):
+        self.assertNotIn('body matching', (ROOT/'CHANGELOG.md').read_text())
+
     def test_hosted_setup_documents_state_upload(self):
         hosted = (ROOT/'docs/hosted-setup.md').read_text()
         self.assertIn('Upload each issued changed-file snapshot from state-outgoing', hosted)

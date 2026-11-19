@@ -115,6 +115,8 @@ class Execution:
 
     def validate_checkpoint(self):
         label = str(self.path)
+        if 'final_listing' in self.state:
+            self.state['final_listing'] = triage.saved_listing(self.state['final_listing'])
         triage.refuse_old_plan(self.state)
         triage.known_keys(self.state, {'signature', 'pending', 'results', 'failures', 'outside_change', 'single_reads', 'final_listing', 'batches', 'folder_outcome'}, label)
         if self.state.get('signature') != self.signature:
@@ -862,7 +864,7 @@ def simulate(store, plan_path, fail=None, positions_path=None, approve=None):
         if positions is not None:
             atomic(scratch / 'quiet-check.json', dict(token=simulated_token, decision={}, positions=positions))
         if 'dry_listing' in plan:
-            atomic(scratch / 'inbox.json', plan['dry_listing'])
+            atomic(scratch / 'inbox.json', triage.saved_listing(plan['dry_listing']))
         real_plan = {k: v for k, v in plan.items() if k not in ('dry_run', 'dry_listing', 'ungrouped_run')}
         real_plan['run_token'] = simulated_token
         answers = real_plan.get('answers')

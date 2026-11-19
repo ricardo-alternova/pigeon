@@ -48,6 +48,9 @@ SEND_REFUSALS = {
 }
 BRAKE_FLOOR = 10
 BODY_LIMIT = 2000
+MESSAGE_REQUIRED = {'account', 'id', 'folder', 'sender', 'subject'}
+MESSAGE_FLAGS = {'has_attachment', 'spam', 'phishing', 'unsubscribe_one_click'}
+MESSAGE_FIELDS = MESSAGE_REQUIRED | MESSAGE_FLAGS | {'body', 'sender_name', 'unsubscribe_url', 'date', 'conversation_id', 'internet_message_id'}
 STALE_SECONDS = 45 * 60
 TAKEOVER_MARGIN = 10 * 60
 REFRESH_MARGIN = 5 * 60
@@ -1649,13 +1652,10 @@ def validate_inputs(listing, config, previous):
         raise ValueError('Inbox.messages: expected an array')
     for i, message in enumerate(listing['messages']):
         label = 'Inbox.messages.' + str(i)
-        required = {'account', 'id', 'folder', 'sender', 'subject'}
-        flags = {'has_attachment', 'spam', 'phishing', 'unsubscribe_one_click'}
-        strings = required | {'body', 'sender_name', 'unsubscribe_url', 'date', 'conversation_id', 'internet_message_id'}
-        known_keys(message, strings | flags, label)
-        for key in required | set(message):
-            if key not in message or (type(message[key]) is not bool if key in flags else not isinstance(message[key], str)):
-                raise ValueError(label + '.' + key + ': expected ' + ('boolean' if key in flags else 'string'))
+        known_keys(message, MESSAGE_FIELDS, label)
+        for key in MESSAGE_REQUIRED | set(message):
+            if key not in message or (type(message[key]) is not bool if key in MESSAGE_FLAGS else not isinstance(message[key], str)):
+                raise ValueError(label + '.' + key + ': expected ' + ('boolean' if key in MESSAGE_FLAGS else 'string'))
         if 'body' in message and len(message['body']) > BODY_LIMIT:
             raise ValueError(label + '.body: expected at most 2000 characters')
     folders = listing.get('folders', {})
@@ -3322,6 +3322,14 @@ def refuse_old_plan(document):
         raise ValueError(OLDER_PLAN)
 
 
+def saved_listing(listing):
+    """Keep only current message fields in run data saved before Task 8; fresh inputs are refused by name."""
+    if not isinstance(listing, dict) or not isinstance(listing.get('messages'), list):
+        return listing
+    return dict(listing, messages=[{k: v for k, v in m.items() if k in MESSAGE_FIELDS}
+                                   if isinstance(m, dict) else m for m in listing['messages']])
+
+
 def require_plan_token(plan, token):
     refuse_old_plan(plan)
     if plan.get('run_token') != token:
@@ -3340,14 +3348,15 @@ def render_message(store, token, plan_path, results_path, *, now=None):
             lines.insert(1, 'Saved numbers were out of date; nothing is grouped in this run.' if language == 'en' else 'Los números guardados estaban desactualizados; no se agrupa nada en esta ejecución.')
             text = '\n'.join(lines) + '\n'
         return text
-    except (ValueError, OSError, KeyError, TypeError, AttributeError, IndexError):
+    except (ValueError, OSError, KeyError, TypeError, AttributeError, IndexError) as error:
         try:
             failure = parse_json(read_text(store/'run-refusal.json'), 'run-refusal.json')
             if failure.get('token') == token:
                 return message_opening(store, failed=True) + 'Run failed at ' + chat_text(failure['stage']) + ': ' + chat_text(failure['refusal']) + '\n'
         except (ValueError, OSError, KeyError, TypeError, AttributeError):
             pass
-        return message_opening(store) + 'Run failed at message: pigeon error (run data refused)\n'
+        detail = str(error) if isinstance(error, ValueError) and str(error) else 'pigeon error (run data refused)'
+        return message_opening(store) + 'Run failed at message: ' + chat_text(detail) + '\n'
 
 
 def owner_count(outcomes):
@@ -3392,7 +3401,7 @@ def _render_message(store, token, plan_path, results_path, *, now=None):
         return message_opening(store, plan, outcomes, failed=True) + reason + '\n' + '\n'.join(lines) + '\n'
     if plan.get('dry_run') is True:
         require_fetched(store, token)
-        listing = plan['dry_listing'] if 'dry_listing' in plan else execute.read(store / 'inbox.json')
+        listing = saved_listing(plan['dry_listing']) if 'dry_listing' in plan else execute.read(store / 'inbox.json')
         config, rules, holds = load_safety([store / n for n in ('config.toml', 'rules.md', 'never-touch.md', 'guardrails.md')])
         previous = execute.read(store / 'state.json') if (store / 'state.json').exists() else {}
         stops = ['Missing state; prior run records exist'] if not (store / 'state.json').exists() and not plan.get('first_run') else []
@@ -4002,6 +4011,7 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
     with lock_gate(store):
         require_lock(store, token)
         require_fetched(store, token)
+        # Refuse a store whose safety files are broken before issuing reads; only config is used here.
         config, _, _ = load_safety([store / n for n in ('config.toml','rules.md','never-touch.md','guardrails.md')])
         if dry_run and (ids_only or approval):
             raise ValueError('listing --dry-run: expected a full rehearsal listing')
