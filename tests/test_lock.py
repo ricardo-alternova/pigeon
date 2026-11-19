@@ -388,6 +388,20 @@ class LockTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     triage.require_lock(store, token)
 
+    def test_malformed_lock_started_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            shutil.copyfile(ROOT / 'config/config.example.toml', store / 'config.toml')
+            token = triage.acquire(store)
+            held = triage.read_lock(store)
+            for value in (-1, 0, True, None, held['created'] + 60):
+                with self.subTest(started=value):
+                    (store / 'run.lock').write_text(json.dumps(dict(held, started=value)))
+                    with self.assertRaises(ValueError):
+                        triage.read_lock(store)
+            (store / 'run.lock').write_text(json.dumps(held))
+            self.assertEqual(triage.read_lock(store)['token'], token)
+
     def test_acquire_obeys_gate(self):
         # Hold the actual POSIX gate: an ungated acquire completes before release.
         import fcntl

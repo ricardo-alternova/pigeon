@@ -42,8 +42,8 @@ Follow [the routine sequence](docs/quickstart.md). For exceptions use these numb
 
 Follow [Numbered reply](docs/quickstart.md#numbered-reply).
 
+When the report asks to proceed on mail held above a row cap, pass the asking plan’s run_id as `--question` to the reply command with a fresh Inbox listing.
+
 ## Writing a rule
 
 A numbered reply, including N yes or N no to a report rule, never writes a rule. Propose a rule in a separate chat message containing the exact row as it would appear in the rules table, proposing one row and nothing else. Only a plain yes answering that message authorizes writing; any other answer writes nothing. Holding the run lock, after fetch-state, the assistant appends exactly that row to rules.md. The next plan command validates the rules before any mailbox action. Complete send-state to send the saved files back before releasing the lock, following Release.
-
-When the report asks to proceed on mail held above a row cap, pass the asking plan’s run_id as `--question` to the reply command with a fresh Inbox listing.

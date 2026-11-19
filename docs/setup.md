@@ -34,11 +34,11 @@ Put the UTF-8 Markdown table in `rules.md` in your private store. Setup copies a
 | --- | --- | --- | --- | --- |
 
 - **Patrón** accepts an exact sender, an exact domain, `*.domain` for its subdomains, or a subject after `asunto:` or `subject:`. Plain subject text matches anywhere. With `*`, the pattern covers the whole subject and each star can match any text. Matching ignores case. Separate sender and domain alternatives with a space, comma, `y`, `o`, `and`, `or`, `/` or `+`, or set each in backticks. If a subject is also present, it must match too. The assistant reads text after the pattern, including after ⚠, only for mail that row wins.
-- **Acción** starts with trash, archive, spam, move (or mover), or unsubscribe (or baja). The kit only recognizes these action words. Treat other steps as requests for read-only review. Put the move folder next and use backticks for spaces; the listing must carry the account's folder list, or the message stays in Inbox. Write `max N` or `máx N` after the action to set its per-run message cap from 1 to 50. Other trailing text is a note. Put the filing step last: `unsubscribe + trash`. A read-only assistant step requires an answer before any kit action. A row with only assistant steps leaves the message in Inbox. If an unsubscribe cannot run or fails, any following filing step stays unexecuted.
+- **Acción** starts with trash, archive, spam, move (or mover), or unsubscribe (or baja). The kit only recognizes these action words. Treat other steps as requests for read-only review. Put the move folder next and use backticks for spaces; the listing must carry the account's folder list, or the message stays in Inbox. Write `max N` or `máx N` as its own step after the action to set its per-run message cap from 1 to 50. Other trailing text is a note. Put the filing step last: `unsubscribe + trash`. A read-only assistant step requires an answer before any kit action. A row with only assistant steps leaves the message in Inbox. If an unsubscribe cannot run or fails, any following filing step stays unexecuted.
 
-Each row can act on 10 messages per run by default. A line such as `- C1 max 25` in guardrails.md can set a cap for row C1. When both files set a cap, the lower number applies. An unreadable cap skips the row. The cap counts qualifying messages in Inbox listing order across the row’s accounts. Any overflow stays in Inbox and the report asks once per row for `proceed` for that run. Whole-run limits still pause the entire batch.
+Each row can act on 10 messages per run by default. A line such as `- C1 max 25` or `- C1 máx 25` in guardrails.md can set a cap for row C1; a trailing period is allowed. When both files set a cap, the lower number applies. An unreadable cap skips the row and the report shows the value written and the file it came from. The cap counts qualifying messages in Inbox listing order across the row’s accounts. Any overflow stays in Inbox and the report asks once for `proceed` for that run; without a reply the next run takes the held mail under its own cap. Whole-run limits still pause the entire batch.
 
-A move to `Reports/{year}/{month}` uses the run’s start time in the configured time zone, including for old or undated mail. If the month folder is missing, the planner creates only that folder. If its parent is missing, the message stays and the report names the parent.
+A move to `Reports/{year}/{month}` uses the run’s start time in the configured time zone, including for old or undated mail. If the month folder is not in the account’s folder list, the planner creates only that folder. If its parent is not in the account’s folder list, the message stays and the report names the parent.
 
 - **Alcance** is `todas` or a comma- or space-separated list of account handles. A blank Alcance is not `todas`; the row is not used. Validate reports unknown handles and rows it could not use.
 - **Fuente** is informational. If Patrón or Acción refers to a file, the planner checks for it inside the rules folder before planning actions. If the file is missing, the message stays in Inbox and the report says why.
@@ -87,6 +87,7 @@ Follow [Commit and message](quickstart.md#commit-and-message). Keep plan.json, i
 | rules | New rules | Reglas nuevas |
 | handled | Handled automatically | Gestionado automáticamente |
 | notes | Run notes | Notas de ejecución |
+| reply | Needs your reply | Necesita tu respuesta |
 | drafts | Drafts | Drafts |
 | calendar | Calendar | Calendar |
 
@@ -138,7 +139,7 @@ Refuse the whole reply for empty, malformed, oversized or control-bearing text, 
 
 Keep every file in the private store. Keep the original inbox.json and plan inputs unchanged. Use final-inbox.json only for the final complete reading. Keep script-owned files unedited: numbers.json, reply.json, decisions.jsonl, state.json, results.json, calls.jsonl, execution checkpoints, finish-exchange.json, quiet-check.json, unsubscribe-failures.json and unsubscribe-secret. Keep the last two private. Keep final-inbox.json and finish-exchange.json local.
 
-- numbers.json: reply counter, exact group members, committed line records and durable owner answers while mail remains in Inbox; unknown upgrade entries stay separate until answered.
+- numbers.json: reply counter, exact group members, committed line records, the open cap question and durable owner answers while mail remains in Inbox; unknown upgrade entries stay separate until answered.
 - reply.txt: verbatim user text, never a call template.
 - plan.json: proposals and stop reasons; dry_run=true marks rehearsal.
 - report.md: plain-text proposals, refreshed at commit from confirmed results. Leave New rules empty; write rules only through the owner-confirmation procedure.

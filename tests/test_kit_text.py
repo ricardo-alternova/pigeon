@@ -192,7 +192,7 @@ class KitTextTests(unittest.TestCase):
         sys.path.insert(0, str(ROOT / 'scripts'))
         import triage
         setup = setup_text()
-        rows = re.findall(r'^\| (inbox|planned|rules|handled|notes) \| (.*?) \| (.*?) \|$', setup, re.M)
+        rows = re.findall(r'^\| (inbox|planned|rules|handled|notes|reply) \| (.*?) \| (.*?) \|$', setup, re.M)
         self.assertEqual({k: en for k, en, es in rows}, triage.SECTION_LABELS['en'])
         self.assertEqual({k: es for k, en, es in rows}, triage.SECTION_LABELS['es'])
         for name in ('docs/quickstart.md',):

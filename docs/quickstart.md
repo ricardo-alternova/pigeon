@@ -141,6 +141,8 @@ On proceed or skip, acquire and fetch only; keep inbox.json unchanged; save the 
 
 `PIGEON_HOME=/absolute/private-store python3 scripts/triage.py reply --token TOKEN --inbox /absolute/private-store/inbox.json --reply /absolute/private-store/reply.txt --plan-out /absolute/private-store/plan.json --question RUN_ID`
 
+For mail held above a row cap, reply proceed with the asking plan's run_id as --question and a fresh Inbox listing; the held messages keep their numbers.
+
 After proceed, run only the printed command. Both hosts read Inbox first. While round appears, carry reads whole; save approval-results.json; resume:
 
 ```bash

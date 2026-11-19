@@ -122,6 +122,10 @@ class MatcherTests(unittest.TestCase):
         self.assertNotIn('m12', [a['id'] for a in plan['actions']])
         self.assertNotIn('approval_state', plan)
         self.assertEqual({a['account'] for a in plan['actions']}, {'cedar', 'birch'})
+        self.rules[0]['cap'] = 1
+        plan = self.plan()
+        self.assertEqual(len(plan['actions']), 1)
+        self.assertEqual(len(plan['cap_holds']), 23)
 
 
 
@@ -179,6 +183,14 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(plan['approval_state'], 'awaiting approval')
         self.assertEqual(len(plan['actions']), 51)
         self.assertTrue(any(t['kind'] == 'destructive' for t in plan['approval_thresholds']))
+        self.batch(51, groups=1, verb='unsubscribe')
+        self.rules[0]['unsubscribe_fallback'] = 'archive'
+        for message in self.listing['messages']: message.pop('unsubscribe_url')
+        self.listing['accounts']['cedar'] = 100
+        plan = self.plan()
+        self.assertEqual(plan['approval_state'], 'awaiting approval')
+        self.assertEqual(len(plan['actions']), 51)
+        self.assertEqual({t['kind'] for t in plan['approval_thresholds']}, {'destructive', 'brake'})
 
 
     def test_configured_accounts(self):
@@ -283,7 +295,9 @@ class MatcherTests(unittest.TestCase):
                 self.assertEqual({m['reason'] for m in plan['decisions']},
                                  {f'C1: held above its cap of {expected} for this run'})
                 report = triage.render_report(plan, self.listing)
-                self.assertEqual(report.count(f'C1 held {30 - expected} above its cap of {expected} · reply proceed'), 1)
+                self.assertEqual(report.count(f'C1 held {30 - expected} above its cap of {expected}'), 1)
+                self.assertEqual(report.count('reply proceed once to file all held mail now'), 1)
+                self.assertIn('Needs your reply', report)
 
     def test_rule_cap_from_guardrails(self):
         self.batch(30)
@@ -336,6 +350,76 @@ class MatcherTests(unittest.TestCase):
         plan = self.plan()
         self.assertEqual([a['action'] for a in plan['actions']], ['unsubscribe', 'trash'] * 6)
         self.assertNotIn('approval_state', plan)
+
+    def test_cap_phrase_is_a_whole_step(self):
+        self.batch(3)
+        for action, cap, note in [('trash, the max is 3 days', 10, 'the max is 3 days'),
+                                  ('trash, max 25', 25, ''),
+                                  ('trash, max 25.', 25, ''),
+                                  ('trash, max 25, except invoices', 25, 'except invoices')]:
+            with self.subTest(action=action):
+                self.rules = triage.read_rules(rules_table(f'| C1 | s0@example.net | {action} | todas | |'),
+                                               ROOT / 'rules.md', self.config['accounts'])
+                self.assertEqual(self.rules[0]['cap'], cap)
+                self.assertEqual(self.rules[0]['note'], note)
+
+    def test_guardrails_cap_uses_the_table_phrase(self):
+        self.batch(30)
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory)
+            names = ('config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md')
+            for name, content in zip(names, ('[accounts.cedar]\n', rules_table('| C1 | s0@example.net | trash, max 40 | todas | |'),
+                                             'allow_empty=true\n', '- C1 máx 25\n')):
+                (store / name).write_text(content)
+            for guardrails, expected in (('- C1 máx 25\n', 25), ('- C1 max 25.\n', 25)):
+                with self.subTest(guardrails=guardrails):
+                    (store / 'guardrails.md').write_text(guardrails)
+                    notes = []
+                    self.config, self.rules, self.holds = triage.load_safety([store / name for name in names], notes)
+                    plan = self.plan()
+                    self.assertEqual(len(plan['actions']), expected)
+                    self.assertEqual(len(plan['cap_holds']), 30 - expected)
+                    self.assertEqual(plan['cap_holds'][0]['cap'], expected)
+            (store / 'guardrails.md').write_text('- C1 max 25 # note\n')
+            notes = []
+            self.config, self.rules, self.holds = triage.load_safety([store / name for name in names], notes)
+            self.assertIn("Rule C1 (line 3) not used: cap '25 # note' must be 1 to 50 in guardrails.md line 1", notes)
+            self.assertEqual(self.plan()['actions'], [])
+
+    def test_unreadable_cap_names_the_value_and_the_file(self):
+        self.batch(1)
+        notes = []
+        self.rules = triage.read_rules(rules_table('| C1 | s0@example.net | trash, max 2.5 | todas | |'),
+                                       ROOT / 'rules.md', self.config['accounts'], notes)
+        self.assertEqual(notes[2], "Rule C1 (line 3) not used: cap '2.5' must be 1 to 50 in the rules table")
+
+    def test_unsubscribe_limit_counts_only_acting_messages(self):
+        self.batch(22, verb='unsubscribe')
+        self.rules[0]['after_unsubscribe'] = 'trash'
+        plan = self.plan()
+        self.assertEqual(sum(a['action'] == 'unsubscribe' for a in plan['actions']), 10)
+        self.assertEqual(len(plan['cap_holds']), 12)
+        self.assertNotIn('approval_state', plan)
+        self.listing['accounts']['cedar'] = 100
+        plan = self.plan()
+        self.assertEqual(plan['approval_state'], 'awaiting approval')
+        self.assertIn('Rule exceeds twenty percent of account total: r0, cedar (22 matches, total 100, allowed 20)', plan['reasons'])
+
+    def test_spanish_held_and_parent_reasons(self):
+        self.batch(11)
+        self.config['language'] = 'es'
+        report = triage.render_report(self.plan(), self.listing, 'es')
+        self.assertIn('r0: retenido por encima de su límite de 10 en esta ejecución', report)
+        self.assertIn('Necesita tu respuesta', report)
+        self.assertIn('responde proceder una vez para aplicar todo el correo retenido ahora', report)
+        self.assertNotIn('archivarlos', report)
+        self.batch(1)
+        self.config['language'] = 'es'
+        self.listing['folders'] = {'cedar': []}
+        self.rules = triage.read_rules(rules_table('| M1 | s0@example.net | move `Bills/{year}/{month}` | todas | |'),
+                                       ROOT / 'rules.md', self.config['accounts'])
+        report = triage.render_report(self.plan(month=('2026', '03')), self.listing, 'es')
+        self.assertIn('Falta la carpeta padre Bills/2026; créala a mano', report)
 
     def test_si9_rule_ceiling(self):
         self.batch(11)
@@ -1380,6 +1464,19 @@ class RuleCaseTests(unittest.TestCase):
             self.assertNotIn('Weekly',str(failures))
             self.assertEqual(before,{p.name:p.read_bytes() for p in store.iterdir()})
 
+
+    def test_rule_cases_resolve_the_month_without_a_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            (store / 'config.toml').write_text('[accounts.cedar]\n')
+            (store / 'rules.md').write_text(rules_table('| M1 | billing@example.com | move `Bills/{year}/{month}` | cedar | |'))
+            (store / 'never-touch.toml').write_text('allow_empty=true\n')
+            (store / 'guardrails.md').write_text('Fixture policy\n')
+            (store / 'cases.toml').write_text('[[cases]]\nname="monthly"\naccount="cedar"\nsender="billing@example.com"\nsubject="Invoice"\nexpect="move"\nexpect_rule="M1"\n')
+            notes = []
+            config, rules, holds = triage.load_safety([store / n for n in ('config.toml', 'rules.md', 'never-touch.toml', 'guardrails.md')], notes)
+            self.assertIsNone(triage.run_month(store, config))
+            self.assertEqual(triage.rule_cases(store, config, rules, holds), ([], 1))
 
     def test_validate_cli_failure_and_no_store_changes(self):
         import os

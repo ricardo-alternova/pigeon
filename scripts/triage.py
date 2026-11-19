@@ -148,6 +148,10 @@ def read_lock(store, *, now=None):
                 or type(held['created']) not in (int, float)
                 or not math.isfinite(held['created']) or held['created'] > clock):
             raise ValueError('Run lock is invalid and held')
+        if 'started' in held and (type(held['started']) not in (int, float)
+                                  or not math.isfinite(held['started'])
+                                  or not 0 < held['started'] <= held['created']):
+            raise ValueError('Run lock is invalid and held')
         return held
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(str(store / 'run.lock') + ': expected token string and finite non-future created timestamp; lock held') from error
@@ -1048,24 +1052,42 @@ def row_steps(cell):
 
 
 CAP_PHRASE = r'(?:max|máx)(?![\w-])'
-CAP_ERROR = 'cap must be 1 to 50'
 
 
-def read_cap(value):
+def read_cap(value, where):
     if not re.fullmatch(r'[0-9]{1,2}', value) or not 1 <= int(value) <= 50:
-        raise ValueError(CAP_ERROR)
+        raise ValueError((f'cap {value!r} must be 1 to 50' if value else 'cap must be 1 to 50') + ' in ' + where)
     return int(value)
+
+
+def action_cap(note):
+    """The cap is a whole step of the Acción cell: `max N` or `máx N`, N digits, optional trailing period."""
+    caps, kept = [], []
+    for segment in note.split(','):
+        match = re.fullmatch(CAP_PHRASE + r'\s*(.*)', segment.strip(), re.I)
+        if match:
+            caps.append(read_cap(match[1].removesuffix('.').strip(), 'the rules table'))
+        else:
+            kept.append(segment)
+    if len(set(caps)) > 1:
+        raise ValueError('conflicting caps in Acción')
+    return (caps[0] if caps else None), ','.join(kept).strip(' ,;')
 
 
 def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
     rules, seen, skipped, warnings, tables = [], set(), [], [], []
     directory = Path(path).resolve().parent
-    caps, named = {}, set()
+    caps, cap_errors, cap_lines, named = {}, {}, [], set()
     for number, line in enumerate(guardrails.splitlines(), 1):
-        match = re.fullmatch(r'\s*-\s+(\S+)\s+max(?:\s+(.*?))?\s*', line, re.I)
-        if match:
-            ident, value = match.groups()
-            caps.setdefault(ident, []).append((number, value or ''))
+        match = re.fullmatch(r'\s*-\s+(\S+)\s+' + CAP_PHRASE + r'(?:\s+(.*?))?\s*', line, re.I)
+        if not match:
+            continue
+        ident, value = match.groups()
+        cap_lines.append((ident, number))
+        try:
+            caps.setdefault(ident, []).append((number, read_cap((value or '').removesuffix('.').strip(), f'guardrails.md line {number}')))
+        except ValueError as error:
+            cap_errors.setdefault(ident, []).append((number, str(error)))
     state, header_line, fence = '', 0, ''
     for number, line in enumerate(text.splitlines(), 1):
         stripped = line.strip()
@@ -1116,14 +1138,10 @@ def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
             if any(kind == 'domain' and value.startswith('*.') and value.count('.') == 1 for kind, value in tokens):
                 raise ValueError('wildcard covers a top-level domain')
             steps, action_note = row_steps(action)
-            phrase = re.compile(CODE_SPAN + r'|(?<![\w-])' + CAP_PHRASE +
-                                r'(?:[ \t]+([^\s,;!?⚠]+))?', re.I)
-            table_caps = {read_cap((match[3] or '').removesuffix('.')) for match in phrase.finditer(action_note)
-                          if not match[1]}
-            if len(table_caps) > 1:
-                raise ValueError('conflicting caps in Acción')
-            action_note = phrase.sub(lambda match: match[0] if match[1] else '', action_note).strip(' ,;')
-            cap = min([*table_caps, *(read_cap(value) for _, value in caps.get(ident, []))] or [10])
+            table_cap, action_note = action_cap(action_note)
+            if ident in cap_errors:
+                raise ValueError(cap_errors[ident][0][1])
+            cap = min([*([table_cap] if table_cap else []), *(value for _, value in caps.get(ident, []))] or [10])
             handles = list(accounts) if scope.casefold() == 'todas' else list(dict.fromkeys(scope.replace(',', ' ').split()))
             known = [handle for handle in handles if handle in accounts]
             if not known:
@@ -1154,7 +1172,7 @@ def read_rules(text, path, accounts, diagnostics=None, *, guardrails=''):
         rules.extend(base | ({kind: value} if kind else {}) for kind, value in (tokens or [(None, None)]))
     if diagnostics is not None:
         warnings.extend(f'guardrails: line {number} names no row {chat_text(ident)}'
-                        for ident in caps if ident not in named for number, _ in caps[ident])
+                        for ident, number in cap_lines if ident not in named)
         diagnostics.extend([f'rules: {len({r["line"] for r in rules})} rows read, {len(skipped)} not used',
                             *[f'rules: table at line {n}' for n in tables], *skipped, *warnings])
     return rules
@@ -1882,8 +1900,9 @@ def read_asked(store, token, dry_run=False):
 
 
 def rule_signature(rule):
-    portable = rule | {'files': [file['ref'] for file in rule.get('files', [])]}
-    return hashlib.sha256(json.dumps(portable, sort_keys=True).encode()).hexdigest()
+    """Only what changes the action: row ID, patterns, steps, cap and scope."""
+    return hashlib.sha256(json.dumps({k: rule[k] for k in ('id', 'accounts', 'steps', 'cap', 'sender', 'domain', 'subject')
+                                      if k in rule}, sort_keys=True).encode()).hexdigest()
 
 
 def run_month(store, config):
@@ -1891,6 +1910,11 @@ def run_month(store, config):
         return None
     held = read_lock(store)
     date = datetime.fromtimestamp(held.get('started', held['created']), ZoneInfo(config.get('timezone', 'UTC')))
+    return date.strftime('%Y'), date.strftime('%m')
+
+
+def current_month(config):
+    date = datetime.now(ZoneInfo(config.get('timezone', 'UTC')))
     return date.strftime('%Y'), date.strftime('%m')
 
 
@@ -2075,7 +2099,7 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                         parent = target.rpartition('/')[0]
                         parents = [f for f in entries if f['name'].casefold() == parent.casefold()]
                         if parent and len(parents) != 1:
-                            reason = (f'Move folder {parent} is missing; create it by hand' if not parents
+                            reason = (f'Parent folder {parent} is missing; create it by hand' if not parents
                                       else 'Move target is ambiguous or missing')
                             break
                         action['target_path'] = folder_path(target)
@@ -2621,7 +2645,7 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
     messages = {(m['account'], m['id']): m for m in listing['messages']}
     if parts and all(p['verb'] == 'cap-proceed' for p in parts):
         month = run_month(store, config)
-        selections = {}
+        selections, changed = {}, set()
         for part in parts:
             key = part['account'], part['id']
             item = numbers.get(part['number'])
@@ -2634,8 +2658,15 @@ def reply_plan(store, listing, holds, config, previous, parts, stops=(), *, numb
             rule = select_rule(dict(message, sender=sender), rules or []) if sender else None
             if rule is not None and rule_signature(rule) == part['signature']:
                 selections[key] = rule
+            else:
+                changed.add(key)
         result = build_plan(listing, rules or [], holds, config, previous, stops, selections=selections,
                             answers=answers, run_token=run_token, questions=questions, asked=asked, month=month)
+        for item in [*result['decisions'], *result.get('remaining', [])]:
+            if (item['account'], item['id']) in changed:
+                item['reason'] = 'the rule changed after the question'
+        if changed and not selections:
+            result['proceed_note'] = 'Proceed did nothing: the rule changed after the question'
         result.update(reply=[], reply_source=dict(numbers=source, parts=parts))
         return result
     sending = any(p['verb'] in {'send-draft', 'forward'} for p in parts)
@@ -2754,9 +2785,11 @@ STRINGS = {
 
 SECTION_LABELS = {
     'en': {'inbox': 'Still in Inbox (by account)', 'planned': 'Planned actions',
-           'rules': 'New rules', 'handled': 'Handled automatically', 'notes': 'Run notes'},
+           'rules': 'New rules', 'handled': 'Handled automatically', 'notes': 'Run notes',
+           'reply': 'Needs your reply'},
     'es': {'inbox': 'Todavía en Recibidos (por cuenta)', 'planned': 'Acciones previstas',
-           'rules': 'Reglas nuevas', 'handled': 'Gestionado automáticamente', 'notes': 'Notas de ejecución'},
+           'rules': 'Reglas nuevas', 'handled': 'Gestionado automáticamente', 'notes': 'Notas de ejecución',
+           'reply': 'Necesita tu respuesta'},
 }
 
 
@@ -2810,7 +2843,7 @@ def account_reason(plan, value):
     return re.sub(r'(?<![\w.-])(' + '|'.join(re.escape(a) for a in names) + r')(?![\w.-])', lambda m: names[m[0]], chat_text(value)) if names else chat_text(value)
 
 
-def reply_hint(items, language, listing=None, allow_send=False):
+def reply_hint(items, language, listing=None, allow_send=False, held=False):
     numbered = [i for i in items if 'number' in i]
     if not numbered:
         return []
@@ -2830,6 +2863,8 @@ def reply_hint(items, language, listing=None, allow_send=False):
     examples = ', '.join(n + ' ' + action for action in (['trash', 'archive', 'spam'] + (['move to ' + target] if target else []) + ['leave', 'yes', 'no']))
     if allow_send:
         examples += ', ' + n + (' send, ' if language == 'en' else ' enviar, ') + n + (' forward HANDLE' if language == 'en' else ' reenviar HANDLE')
+    if held:
+        examples += ', or proceed for the mail held above a cap' if language == 'en' else ', o proceder para el correo retenido por encima de un límite'
     return [('Reply with a number and action, for example: ' if language == 'en' else 'Responde con un número y una acción, por ejemplo: ') + examples]
 
 
@@ -2963,6 +2998,8 @@ def message_outcomes(plan, listing, items, observed=None, language='en', *, know
         if language == 'es':
             for source, target in {'A send was issued; the result is unknown; check Sent and Drafts by hand': 'Se emitió un envío; el resultado es desconocido; comprueba Sent y Drafts a mano', 'A forward was issued; the result is unknown; check Sent and Drafts by hand': 'Se emitió un reenvío; el resultado es desconocido; comprueba Sent y Drafts a mano', 'Protected by never-touch': 'Protegido por never-touch', 'Invalid sender: not one valid address': 'Remitente no válido: no es una dirección válida', 'Run stopped': 'Ejecución detenida', 'action not confirmed': 'acción no confirmada', 'rule refused by brake': 'regla rechazada por el freno', 'failed': 'falló', 'unexecuted': 'sin ejecutar', 'issued_unknown': 'resultado desconocido'}.items():
                 reason = reason.replace(source, target)
+            reason = re.sub(r'^(\S+): held above its cap of (\d+) for this run$', r'\1: retenido por encima de su límite de \2 en esta ejecución', reason)
+            reason = re.sub(r'^Parent folder (.+) is missing; create it by hand$', r'Falta la carpeta padre \1; créala a mano', reason)
         if section == 'handled':
             completed = handled.get(key, []) or planned
             tag = ', '.join(action_label(a, listing, language) for a in completed)
@@ -3132,7 +3169,8 @@ def render_remaining(plan, listing, language='en', *, outcomes=None, store=None)
     if empty_accounts:
         lines.append(', '.join(empty_accounts) + (': empty' if language == 'en' else ': vacío'))
     if plan.get('approval_state') != 'awaiting approval':
-        lines += reply_hint(shown, language, listing, bool(store is not None and state_config(store).get('allow_send', False)))
+        lines += reply_hint(shown, language, listing, bool(store is not None and state_config(store).get('allow_send', False)),
+                            bool(plan.get('cap_holds')))
     return lines
 
 
@@ -3243,13 +3281,18 @@ def cap_asks(plan, language):
     for hold in plan.get('cap_holds', []):
         key = hold['rule'], hold['cap']
         counts[key] = counts.get(key, 0) + 1
-    if plan.get('reasons'):
+    if plan.get('reasons') or not counts:
         return []
-    ending = ('would ask you to reply proceed' if plan.get('dry_run') else 'reply proceed to file them now') if language == 'en' else (
-        'pediría responder proceder' if plan.get('dry_run') else 'responde proceder para archivarlos ahora')
-    return [(f'{chat_text(rule)} held {count} above its cap of {cap}' if language == 'en'
-             else f'{chat_text(rule)} retuvo {count} por encima de su límite de {cap}') + ' · ' + ending
-            for (rule, cap), count in counts.items()]
+    lines = [(f'{chat_text(rule)} held {count} above its cap of {cap}' if language == 'en'
+              else f'{chat_text(rule)} retuvo {count} por encima de su límite de {cap}')
+             for (rule, cap), count in counts.items()]
+    if language == 'en':
+        lines.append('would ask you to reply proceed once to file all held mail now' if plan.get('dry_run')
+                     else 'reply proceed once to file all held mail now')
+    else:
+        lines.append('pediría responder proceder una vez para aplicar todo el correo retenido ahora' if plan.get('dry_run')
+                     else 'responde proceder una vez para aplicar todo el correo retenido ahora')
+    return lines
 
 
 def render_report(plan, listing, language='en', store=None, *, new_question=False, outcomes=None, draft_records=None):
@@ -3274,6 +3317,8 @@ def render_report(plan, listing, language='en', store=None, *, new_question=Fals
     if not any(o.get('saved_number') for o in outcomes if o.get('owner')):
         outcomes = [dict(o, item={k:v for k,v in o['item'].items() if k != 'number'}) for o in outcomes]
     if listing['accounts']: lines += ['', SECTION_LABELS[language]['inbox'], ''] + render_remaining(dict(plan, dry_run=True) if plan.get('approval_state') == 'awaiting approval' else plan, listing, language, outcomes=outcomes, store=store)
+    if plan.get('proceed_note'):
+        lines += ['', plan['proceed_note']]
     lines += plan.get('calendar_section', [])
     completed = [o for o in outcomes or [] if o['section'] == 'handled'] if not plan['actions'] else []
     if completed:
@@ -3300,7 +3345,9 @@ def render_report(plan, listing, language='en', store=None, *, new_question=Fals
             lines.append('- ' + action_label(action, listing, language) + ': ' + text + (' · ' + chat_text(action['target_path']) if 'target_path' in action else '') + (' · ' + chat_text(hosts.get((account, action['id']), '')) if 'url' in action else ''))
     if not plan['actions']: lines.append(empty)
     lines += ['', new, '', empty, '']
-    lines += cap_asks(plan, language)
+    asks = cap_asks(plan, language)
+    if asks:
+        lines += [SECTION_LABELS[language]['reply'], ''] + asks
     if plan.get('approval_state') == 'awaiting approval':
         lines.append(approval_question(plan, language))
     return '\n'.join(lines)
@@ -3479,8 +3526,13 @@ def approval_reply(store, args):
         if args.scheduled:
             raise ValueError('Replies require a user-initiated run')
         if not waiting:
-            if text in ('proceed', 'proceder') and read_numbers(store).get('cap_question', {}).get('id') == args.question and args.question:
-                return False
+            if text in ('proceed', 'proceder'):
+                if args.question and read_numbers(store).get('cap_question', {}).get('id') == args.question:
+                    return False
+                history = store / 'history.log'
+                asked = [line for line in read_text(history).splitlines() if ' approval asked: ' + str(args.question) in line] if history.exists() else []
+                if args.question and not asked:
+                    raise ValueError('Reply refused: this proceed expired; a later run took the held mail under its own cap')
             raise ValueError('Reply refused: no plan awaits approval')
         if text not in words:
             raise ValueError('Reply refused: answer proceed or skip (proceder or omitir); the plan is still waiting')
@@ -3600,8 +3652,15 @@ def approve_plan(store, token, path, run_id, *, validate_only=False, reading=Non
         answers = plan.get('answers')
         if plan.get('answers_used') and isinstance(answers, dict) and answers.get('run') == plan.get('run_token') and plan['run_token'] != token:
             raise ValueError('approval: answers are from another run; plan again')
-        if 'move_month' in plan and list(run_month(store, state_config(store)) or ()) != plan['move_month']:
-            raise ValueError('approval: the run month changed; plan again')
+        checkpoint = store / ('execution-' + hashlib.sha256(token.encode()).hexdigest() + '.json')
+        if checkpoint.exists():
+            prior = execute.Execution(store, token, path)
+            if prior.state['results'] or prior.state['pending'] is not None:
+                raise ValueError('approval: execution already began; plan again')
+        # A plan saved by an older version no longer matches the current thresholds or month.
+        expected, _ = execute.Execution(store, token, path, dict(plan, run_token=token)).expected_plan()
+        if expected['reasons'] != plan['reasons'] or expected.get('move_month') != plan.get('move_month'):
+            raise ValueError('this plan was made by an older version; plan again')
         if validate_only:
             return plan
         if reading is None:
@@ -3636,11 +3695,6 @@ def approve_plan(store, token, path, run_id, *, validate_only=False, reading=Non
             return dict(done=True, status='stale', message='Inbox changed since the question; the next run plans and asks again.')
         candidate = dict(plan, run_token=token, approval_state='approved',
                          approved_thresholds=plan['reasons'], reasons=[])
-        checkpoint = store / ('execution-' + hashlib.sha256(token.encode()).hexdigest() + '.json')
-        if checkpoint.exists():
-            prior = execute.Execution(store, token, path)
-            if prior.state['results'] or prior.state['pending'] is not None:
-                raise ValueError('approval: execution already began; plan again')
         execute.atomic(path, candidate)
         if checkpoint.exists():
             checkpoint.unlink()
@@ -3949,14 +4003,21 @@ def rule_cases(store, config, rules, holds):
         message['sender'] = sender
         found, rule_id = 'none', None
         if sender is not None:
-            plan = build_plan(dict(accounts={case['account']: 1}, messages=[message]), rules, holds, config, month=run_month(store, config))
+            month = run_month(store, config) or current_month(config)
+            rule = select_rule(message, rules)
+            steps = [step for step in (rule or {}).get('steps', []) if 'verb' in step]
+            target = steps[-1].get('target') if steps else (rule or {}).get('target')
+            if target and ('{year}' in target or '{month}' in target):
+                target = target.replace('{year}', month[0]).replace('{month}', month[1])
+            # A case checks rule selection, so its listing carries the destination the rule names.
+            folders = {case['account']: [dict(id='case-folder', name=target)]} if target else {}
+            plan = build_plan(dict(accounts={case['account']: 1}, messages=[message], folders=folders), rules, holds, config, month=month)
             actions = [a for a in plan['actions'] if (a['account'], a['id']) == (case['account'], 'case')]
             if actions:
                 found, rule_id = actions[-1]['action'], actions[0]['rule']
             elif plan['decisions'] and plan['decisions'][0]['reason'] == 'Protected by never-touch':
                 found = 'never-touch'
             else:
-                rule = select_rule(message, rules)
                 rule_id = rule['id'] if rule is not None else None
         if found != case['expect'] or ('expect_rule' in case and case['expect_rule'] != rule_id):
             expected_rule = case.get('expect_rule')
@@ -3978,7 +4039,7 @@ def commit_state(store, token, plan_path, results_path=None, *, now=None, lock_v
         require_plan_token(plan, token)
         if plan.get('dry_run'):
             raise ValueError('dry-run plan: commit-state is refused')
-        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'answers_error', 'answers_used', 'ignored_answers', 'hand_sent', 'rule_diagnostics', 'cap_holds', 'move_month'}, str(plan_path))
+        known_keys(plan, {'actions', 'decisions', 'reasons', 'counts', 'expected_counts', 'not_listed', 'skip_reasons', 'first_run', 'reply', 'reply_source', 'remaining', 'relist_inbox', 'calendar_section', 'scheduled', 'account_names', 'run_token', 'run_id', 'approval_state', 'approval_created', 'approved_thresholds', 'approval_thresholds', 'answers', 'answers_error', 'answers_used', 'ignored_answers', 'hand_sent', 'rule_diagnostics', 'cap_holds', 'move_month', 'proceed_note'}, str(plan_path))
         for key in ('actions', 'reasons', 'not_listed'):
             if not isinstance(plan.get(key), list):
                 raise ValueError(str(plan_path) + '.' + key + ': expected an array')
@@ -5050,6 +5111,15 @@ def _main(argv=None, *, now=None):
                                      for h in question['holds'] if (h['account'], h['id']) in lookup]
                             if not parts:
                                 raise ValueError('Question has no live Inbox numbers')
+                            # The held messages were answered in the asking run; reuse those answers.
+                            questions = None
+                            if answers is None and args.plan_out and Path(args.plan_out).is_file():
+                                try:
+                                    asking = parse_json(read_text(args.plan_out), args.plan_out)
+                                except (OSError, ValueError, RecursionError):
+                                    asking = {}
+                                if asking.get('run_id') == args.question and isinstance(asking.get('answers'), dict):
+                                    answers = dict(asking['answers'], run=args.token)
                         else:
                             parts = parse_reply(reply_text)
                         result = reply_plan(store, listing, holds, config, previous, parts, stops,

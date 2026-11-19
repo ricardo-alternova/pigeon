@@ -4366,7 +4366,7 @@ class ExecuteTests(unittest.TestCase):
         plan = self.rebuild()
         self.assertEqual(plan['actions'], [])
         self.assertEqual([d['reason'] for d in plan['decisions']],
-                         ['Move folder Bills/2026 is missing; create it by hand'] * 3)
+                         ['Parent folder Bills/2026 is missing; create it by hand'] * 3)
 
     def test_proceed_for_this_run_only(self):
         for case in ('proceed', 'protection added', 'new run'):
@@ -4396,7 +4396,9 @@ class ExecuteTests(unittest.TestCase):
 
                 self.assertEqual(run_actions(), [str(i) for i in range(25)])
                 message = triage.render_message(self.store, self.token, self.path, None)
-                self.assertEqual(message.count('C1 held 5 above its cap of 25 · reply proceed'), 1)
+                self.assertEqual(message.count('C1 held 5 above its cap of 25'), 1)
+                self.assertEqual(message.count('reply proceed once to file all held mail now'), 1)
+                self.assertIn('or proceed for the mail held above a cap', message)
                 triage.release(self.store, self.token)
                 self.token = triage.acquire(self.store)
                 self.listing['messages'] = self.listing['messages'][25:]
@@ -4417,7 +4419,7 @@ class ExecuteTests(unittest.TestCase):
                 result = self.run_cli('triage.py', *args)
                 if case == 'new run':
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn('no plan awaits approval', result.stderr)
+                    self.assertIn('this proceed expired; a later run took the held mail under its own cap', result.stderr)
                     continue
                 self.assertEqual(result.returncode, 0, result.stderr)
                 plan = execute.read(self.path)
@@ -4427,6 +4429,131 @@ class ExecuteTests(unittest.TestCase):
                     self.assertIn(dict(account='cedar', id='25', reason='Protected by never-touch'), plan['decisions'])
                 self.assertEqual(run_actions(), [str(i) for i in range(start, 30)])
                 self.assertNotEqual(self.run_cli('triage.py', *args).returncode, 0)
+
+    def cap_run(self, rows, count=30, answers=None):
+        (self.store / 'guardrails.md').write_text('Fixture policy')
+        (self.store / 'rules.md').write_text(rules_table(*rows))
+        self.listing = dict(accounts={'cedar': 1000}, messages=[
+            dict(account='cedar', id=str(i), folder='Inbox', sender='bulk@example.com', subject=f'Item {i}')
+            for i in range(count)])
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        extra = ('--answers', str(self.store / 'answers.json')) if answers else ()
+        if answers:
+            (self.store / 'answers.json').write_text(json.dumps(dict(run=self.token, answers=answers)))
+        planned = self.plan_cli(*extra)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        first = execute.read(self.path)
+        ids = [m['id'] for m in self.listing['messages']]
+        while not (call := self.machine().step()).get('done'):
+            ids.remove(call['id'])
+            self.machine().step(execute.AssistantProvider(dict(outcome='ok', inbox_ids=ids)))
+        triage.commit_state(self.store, self.token, self.path)
+        triage.release(self.store, self.token)
+        self.token = triage.acquire(self.store)
+        self.listing['messages'] = self.listing['messages'][len(first['actions']):]
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        return first
+
+    def proceed(self, run_id, *extra):
+        reply = self.store / 'reply.txt'
+        reply.write_text('proceed')
+        return self.run_cli('triage.py', 'reply', '--token', self.token, '--question', run_id,
+                            '--reply', str(reply), '--inbox', str(self.store / 'inbox.json'),
+                            '--plan-out', str(self.path), '--report-out', str(self.store / 'report.md'), *extra)
+
+    def test_proceed_ignores_the_line_number_and_reports_a_changed_rule(self):
+        for case in ('unrelated row', 'changed action'):
+            with self.subTest(case=case):
+                self.setUp()
+                first = self.cap_run(['| C1 | bulk@example.com | trash, max 25 | todas | |'])
+                self.assertEqual(len(first['cap_holds']), 5)
+                if case == 'unrelated row':
+                    (self.store / 'rules.md').write_text(rules_table(
+                        '| A0 | other@example.com | archive | todas | |',
+                        '| C1 | bulk@example.com | trash, max 25 | todas | |'))
+                else:
+                    (self.store / 'rules.md').write_text(rules_table('| C1 | bulk@example.com | archive, max 25 | todas | |'))
+                result = self.proceed(first['run_id'])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plan = execute.read(self.path)
+                if case == 'unrelated row':
+                    self.assertEqual([a['id'] for a in plan['actions']], [str(i) for i in range(25, 30)])
+                else:
+                    self.assertEqual(plan['actions'], [])
+                    self.assertEqual({d['reason'] for d in plan['decisions']}, {'the rule changed after the question'})
+                    self.assertIn('Proceed did nothing: the rule changed after the question',
+                                  (self.store / 'report.md').read_text())
+
+    def test_proceed_reuses_the_asking_run_answers(self):
+        first = self.cap_run(['| C1 | bulk@example.com | trash, max 25, except invoices | todas | |'],
+                             answers=[dict(account='cedar', id=str(i), proceed=True, note='ok') for i in range(30)])
+        self.assertEqual(len(first['actions']), 25)
+        self.assertEqual(len(first['cap_holds']), 5)
+        result = self.proceed(first['run_id'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('questions', result.stdout)
+        plan = execute.read(self.path)
+        self.assertEqual([a['id'] for a in plan['actions']], [str(i) for i in range(25, 30)])
+        self.assertEqual(plan['decisions'], [])
+
+    def test_documented_cap_proceed_reports_filed_mail(self):
+        first = self.cap_run(['| C1 | bulk@example.com | trash, max 25 | todas | |'])
+        result = self.proceed(first['run_id'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = (self.store / 'report.md').read_text()
+        self.assertIn('Inbox: 5 messages · cedar 5', report)
+        self.assertNotIn('Item 0', report)
+        self.assertIn('Item 25', report)
+
+    def test_failed_leaf_creation_stops_the_whole_row(self):
+        self.start_run_at()
+        (self.store / 'guardrails.md').write_text('Fixture policy')
+        (self.store / 'rules.md').write_text(rules_table('| R0 | row0@example.com | unsubscribe + move Bills/{year}/{month} | todas | |'))
+        self.listing = dict(accounts={'cedar': 1000}, folders={'cedar': [dict(id='parent', name='Bills/2026')]}, messages=[
+            dict(account='cedar', id='0-0', folder='Inbox', sender='row0@example.com', subject='Item 0',
+                 date='2026-03-01', unsubscribe_url='https://list.example.com/opt-out')])
+        execute.atomic(self.store / 'inbox.json', self.listing)
+        self.assertEqual(self.plan_cli().returncode, 0)
+        self.assertEqual([a['action'] for a in execute.read(self.path)['actions']], ['create-folder', 'unsubscribe', 'move'])
+        self.assertEqual(self.machine().step()['action'], 'create-folder')
+        self.machine().step(execute.AssistantProvider(dict(outcome='error', inbox_ids=['0-0'])))
+        self.assertEqual(self.machine().step(), {'done': True})
+        self.assertEqual([(r['action'], r['status']) for r in self.machine().state['results']],
+                         [('create-folder', 'failed'), ('unsubscribe', 'unexecuted'), ('move', 'unexecuted')])
+
+    def test_old_plan_is_refused_before_approval(self):
+        for case in ('brake', 'monthly'):
+            with self.subTest(case=case):
+                self.setUp()
+                (self.store / 'guardrails.md').write_text('Fixture policy')
+                if case == 'brake':
+                    (self.store / 'rules.md').write_text(rules_table('| R0 | row0@example.com | trash | todas | |'))
+                    self.listing = dict(accounts={'cedar': 40}, messages=[
+                        dict(account='cedar', id=str(i), folder='Inbox', sender='row0@example.com', subject=f'Item {i}')
+                        for i in range(11)])
+                else:
+                    self.start_run_at()
+                    (self.store / 'config.toml').write_text('inbox_limit=1\n[accounts.cedar]\n')
+                    (self.store / 'rules.md').write_text(rules_table('| R0 | row0@example.com | move Bills/{year}/{month} | todas | |'))
+                    self.listing = dict(accounts={'cedar': 40}, folders={'cedar': [dict(id='y', name='Bills/2026')]}, messages=[
+                        dict(account='cedar', id=str(i), folder='Inbox', sender='row0@example.com', subject=f'Item {i}')
+                        for i in range(2)])
+                execute.atomic(self.store / 'inbox.json', self.listing)
+                self.assertEqual(self.plan_cli().returncode, 0)
+                plan = execute.read(self.path)
+                self.assertEqual(plan['approval_state'], 'awaiting approval')
+                if case == 'brake':
+                    plan['reasons'] = ['Per-rule action limit exceeded: R0 (11 of 10)']
+                    plan['approval_thresholds'] = [dict(kind='rule', rule='R0', count=11, limit=10)]
+                else:
+                    plan.pop('move_month')
+                execute.atomic(self.path, plan)
+                result = self.run_cli('execute.py', 'next', '--token', self.token, '--plan', str(self.path),
+                                      '--approve', plan['run_id'])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('this plan was made by an older version; plan again', result.stderr)
+                self.assertEqual(execute.read(self.path)['approval_state'], 'awaiting approval')
+                self.assertFalse((self.store / 'calls.jsonl').exists())
 
     def test_dry_dated_move_folds_folder_creation(self):
         self.dated(count=1)
