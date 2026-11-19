@@ -164,7 +164,7 @@ Page each Inbox into private UTF-8 JSON inbox.json, even above inbox_limit. Neve
 | messages[].spam, messages[].phishing | Provider booleans, default false; refuse unsubscribe, never infer a spam action. |
 | messages[].unsubscribe_url | First HTTPS URI in List-Unsubscribe angle brackets, stripped; omit if absent. Leave unsafe/missing links as decisions. |
 | messages[].unsubscribe_one_click | List-Unsubscribe-Post boolean, default false; true selects RFC 8058 POST, otherwise GET. |
-| messages[].body | Optional plain text, max 2000 characters, for every message in body-rule accounts; request truncation or keep the first 2000. No HTML, attachments or links. Omit absent text (no body match). Matching only. |
+| messages[].body | Optional plain text for matched-rule notes, max 2000 characters. Request truncation or keep the first 2000. No HTML, attachments or links. Omit absent text. |
 | messages[].date | Optional ISO 8601 provider received/internal date; never sender Date/body. |
 | messages[].conversation_id, messages[].internet_message_id | Optional strings: Gmail threadId/Message-ID; Outlook conversationId/internetMessageId. |
 | messages[].sender_name | Do not collect. |

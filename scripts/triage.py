@@ -1299,29 +1299,7 @@ def matches(message, rule, protection=False):
             return False
     if 'subject' in rule and not subject_matches(rule['subject'], message['subject']):
         return False
-    if 'body' in rule:
-        if 'body' not in message:
-            return False
-        # Escaping every operator makes this a literal search without backtracking.
-        if not re.search(re.escape(rule['body']), message['body'], re.IGNORECASE):
-            return False
-    if 'is_reply' in rule and ('is_reply' not in message or message['is_reply'] != rule['is_reply']):
-        return False
-    if 'recipients_min' in rule or 'recipients_max' in rule:
-        if 'recipients' not in message:
-            return False
-        count = len({a.casefold() for a in message['recipients']})
-        if not rule.get('recipients_min', 1) <= count <= rule.get('recipients_max', 1000):
-            return False
     return True
-
-
-def received_date(message):
-    try:
-        date = datetime.fromisoformat(message.get('date', '').replace('Z', '+00:00'))
-        return date if date.tzinfo is not None else None
-    except ValueError:
-        return None
 
 
 def select_rule(message, rules):
@@ -1672,14 +1650,10 @@ def validate_inputs(listing, config, previous):
     for i, message in enumerate(listing['messages']):
         label = 'Inbox.messages.' + str(i)
         required = {'account', 'id', 'folder', 'sender', 'subject'}
-        flags = {'has_attachment', 'spam', 'phishing', 'unsubscribe_one_click', 'is_reply'}
+        flags = {'has_attachment', 'spam', 'phishing', 'unsubscribe_one_click'}
         strings = required | {'body', 'sender_name', 'unsubscribe_url', 'date', 'conversation_id', 'internet_message_id'}
-        known_keys(message, strings | flags | {'recipients'}, label)
-        if 'recipients' in message:
-            recipients = message['recipients']
-            if (not isinstance(recipients, list) or len(recipients) > 2000 or any(not isinstance(a, str) or len(a) > 254 or normalize_sender(a) != a.casefold() or any(unicodedata.category(c).startswith('C') for c in a) for a in recipients)):
-                raise ValueError(label + '.recipients: expected at most 2000 bare addresses, each at most 254 characters')
-        for key in required | (set(message) - {'recipients'}):
+        known_keys(message, strings | flags, label)
+        for key in required | set(message):
             if key not in message or (type(message[key]) is not bool if key in flags else not isinstance(message[key], str)):
                 raise ValueError(label + '.' + key + ': expected ' + ('boolean' if key in flags else 'string'))
         if 'body' in message and len(message['body']) > BODY_LIMIT:
@@ -1885,13 +1859,6 @@ def build_plan(listing, rules, never_touch, config, previous=None, stop_reasons=
                     break
                 if 'steps' in rule:
                     rule = rule | dict(action=kit[-1]['verb'], target=kit[-1].get('target'))
-                if rule.get('keep_latest'):
-                    date = received_date(message)
-                    peers = [dict(m, sender=normalize_sender(m['sender'])) for m in messages if m['account'] == message['account'] and normalize_sender(m['sender']) is not None]
-                    dates = [received_date(m) for m in peers if matches(m, rule)]
-                    valid = [d for d in dates if d is not None]
-                    if date is None or not valid or date == max(valid):
-                        break
                 key = (rule['id'], message['account'])
                 if 'question' not in rule and 'steps' not in rule:
                     hits[key] = hits.get(key, 0) + 1
@@ -3644,7 +3611,7 @@ def rule_cases(store, config, rules, holds):
     if not isinstance(cases, list): raise ValueError('cases.toml: expected cases array')
     failures, names = [], set()
     for case in cases:
-        known_keys(case, {'name', 'account', 'sender', 'subject', 'has_attachment', 'body', 'expect', 'expect_rule', 'date', 'recipients', 'is_reply'}, 'cases.toml case')
+        known_keys(case, {'name', 'account', 'sender', 'subject', 'has_attachment', 'body', 'expect', 'expect_rule', 'date'}, 'cases.toml case')
         name = case.get('name')
         if not isinstance(name, str) or not name.strip() or name in names:
             raise ValueError('cases.toml: expected unique nonempty case name')
@@ -3653,7 +3620,7 @@ def rule_cases(store, config, rules, holds):
             raise ValueError('cases.toml: expected configured account and supported expectation')
         if 'expect_rule' in case and (not isinstance(case['expect_rule'], str) or not case['expect_rule']):
             raise ValueError('cases.toml: expected rule id string')
-        message = {k:v for k,v in case.items() if k in {'account', 'sender', 'subject', 'has_attachment', 'body', 'date', 'recipients', 'is_reply'}}
+        message = {k:v for k,v in case.items() if k in {'account', 'sender', 'subject', 'has_attachment', 'body', 'date'}}
         message.update(id='case', folder='Inbox')
         validate_inputs(dict(accounts={case['account']:1},messages=[message]),config,{})
         sender = normalize_sender(message['sender'])
@@ -4029,13 +3996,13 @@ def gateway_results(path, count):
     return values
 
 
-def listing_exchange(store, token, results=None, *, ids_only=False, accounts=None, manual_part=None, skip=(), approval=None, dry_run=False):
+def listing_exchange(store, token, results=None, *, ids_only=False, accounts=None, skip=(), approval=None, dry_run=False):
     """Persist issued reads before returning them; mail values remain data."""
     import execute
     with lock_gate(store):
         require_lock(store, token)
         require_fetched(store, token)
-        config, rules, holds = load_safety([store / n for n in ('config.toml','rules.md','never-touch.md','guardrails.md')])
+        config, _, _ = load_safety([store / n for n in ('config.toml','rules.md','never-touch.md','guardrails.md')])
         if dry_run and (ids_only or approval):
             raise ValueError('listing --dry-run: expected a full rehearsal listing')
         target = store / SIMULATION_DIR if dry_run else store
@@ -4058,21 +4025,7 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
         quiet_path = store / 'quiet-check.json'
         quiet_cache = parse_json(read_text(quiet_path), quiet_path) if quiet_path.exists() and not dry_run else {}
         quiet_names = quiet_cache.get('decision', {}).get('quiet_accounts', []) if quiet_cache.get('token') == token and not ids_only else []
-        manual = [a for a in names if a not in skip and a not in quiet_names and not ids_only and any(any(k in r for k in ('body', 'recipients_min', 'recipients_max', 'is_reply')) and a in r.get('accounts', [a]) for r in rules + holds)]
-        part = None
-        if manual:
-            if manual_part is None:
-                kinds = [label for keys, label in [(('body',), 'body'), (('recipients_min', 'recipients_max', 'is_reply'), 'conditional')]
-                         if any(any(k in r for k in keys) and any(a in r.get('accounts', [a]) for a in manual) for r in rules + holds)]
-                raise ValueError('listing: ' + ', '.join(k + ' entries' for k in kinds) + ' require --manual-part: ' + ', '.join(manual))
-            part = parse_json(read_text(manual_part), manual_part)
-            validate_inputs(part, config, {})
-            if set(part['accounts']) != set(manual) or any(m['account'] not in manual for m in part['messages']) or set(part.get('folders', {})) - set(manual):
-                raise ValueError('listing: manual part must contain exactly: ' + ', '.join(manual))
-            build_plan(part, rules, holds, config, {}, month=run_month(store, config))
-        elif manual_part is not None:
-            raise ValueError('listing: no manual accounts expected')
-        names = [a for a in names if a not in manual and a not in quiet_names]
+        names = [a for a in names if a not in quiet_names]
         fingerprint = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
         if state.get('token') != token:
             if results is not None: raise ValueError('listing: no pending batch')
@@ -4142,8 +4095,7 @@ def listing_exchange(store, token, results=None, *, ids_only=False, accounts=Non
             return dict(round=state['round'], batches_remaining=(len(state['queue'])+LISTING_BATCH-1)//LISTING_BATCH,
                         calls=[listing_call(config, j, ids_only, store) for j in jobs], failed=state['failed'] | state.get('retry_errors', {}),
                         retries={a: 'retried once, retry pending' for a in state.get('retry_errors', {})})
-        listing = part or dict(accounts={},messages=[],folders={})
-        listing.setdefault('folders', {})
+        listing = dict(accounts={},messages=[],folders={})
         listing['skipped'] = dict(state['failed'])
         if quiet_names: listing['quiet'] = quiet_names
         for a,d in state['data'].items():
@@ -4433,7 +4385,6 @@ def _main(argv=None, *, now=None):
     listing = sub.add_parser('listing', allow_abbrev=False)
     listing.add_argument('--token', required=True)
     listing.add_argument('--results', help='Gateway array: docs/quickstart.md#gateway-results')
-    listing.add_argument('--manual-part')
     listing.add_argument('--skip', action='append', default=[])
     listing.add_argument('--ids-only', action='store_true')
     listing.add_argument('--dry-run', action='store_true')
@@ -4518,8 +4469,7 @@ def _main(argv=None, *, now=None):
         print(f'version: {config.get("version", FORMAT_VERSION)}')
         for account, fields in config['accounts'].items():
             available = all(fields.get(k) for k in ('provider', 'executor_app', 'executor_account'))
-            manual = any(any(k in r for k in ('body', 'recipients_min', 'recipients_max', 'is_reply')) and account in r.get('accounts', [account]) for r in rules + holds)
-            print(account + ': scripted listing ' + ('manual part required' if manual else 'available' if available else 'unavailable'))
+            print(account + ': scripted listing ' + ('available' if available else 'unavailable'))
         print(f'ok: {len(config["accounts"])} accounts, {len({r["id"] for r in rules})} rules, {len(holds)} never-touch entries')
         failures, count = rule_cases(store, config, rules, holds)
         for failure in failures: print(failure)
@@ -4565,7 +4515,7 @@ def _main(argv=None, *, now=None):
         with lock_gate(store):
             print(render_message(store, args.token, args.plan, args.results, now=now), end='')
     elif args.command == 'listing':
-        print(json.dumps(listing_exchange(store, args.token, args.results, ids_only=args.ids_only, manual_part=args.manual_part, skip=args.skip, dry_run=args.dry_run), ensure_ascii=True))
+        print(json.dumps(listing_exchange(store, args.token, args.results, ids_only=args.ids_only, skip=args.skip, dry_run=args.dry_run), ensure_ascii=True))
     elif args.command == 'quiet-check':
         with lock_gate(store):
             require_lock(store, args.token)
