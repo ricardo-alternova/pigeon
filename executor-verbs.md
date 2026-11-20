@@ -41,6 +41,8 @@ const u = await ok(tools['outlook-mail-api'].meUser.meUserGetUser({ accountId:'<
 // (u.mail || u.userPrincipalName).toLowerCase() === '<email>'
 ```
 
+Some Outlook accounts ignore `$select` here and return the full user profile. That is harmless: read only `mail` and `userPrincipalName`, and never put the other fields in the report or in `local/`.
+
 Outlook Calendar has the same call: `tools['outlook-calendar-api'].meUser.meUserGetUser`.
 
 Wrong address, `AccountSelectionInvalid`, or `OAuthReconnectRequired`: report `<handle> ?`, skip that account, and run `search` to see the current accounts. Tell the user to reconnect it in Executor.
@@ -72,13 +74,23 @@ return msgs;
 ### Outlook Inbox
 
 ```js
-const r = await ok(tools['outlook-mail-api'].meMessage.meListMessages({ accountId:'<accountId>', input:{ query:{
-  $top:50, $skip:0, $filter:"parentFolderId eq 'inbox'",
-  $select:['id','conversationId','subject','from','toRecipients','ccRecipients','receivedDateTime','isRead','hasAttachments','bodyPreview','webLink'],
-  $orderby:['receivedDateTime desc'] } } }));
+const A = '<accountId>', M = tools['outlook-mail-api'].meMessage;
+const msgs = [];
+let skip = 0, page;
+do {
+  page = await ok(M.meListMessages({ accountId:A, input:{ query:{
+    $top:50, $skip:skip, $filter:"parentFolderId eq 'inbox'",
+    $select:['id','conversationId','subject','from','toRecipients','ccRecipients','receivedDateTime','isRead','hasAttachments','bodyPreview','webLink'],
+    $orderby:['receivedDateTime desc'] } } }));
+  for (const m of (page.value || [])) msgs.push({ id:m.id, conversationId:m.conversationId, from:m.from?.emailAddress?.address,
+    to:(m.toRecipients || []).map(x => x.emailAddress?.address), cc:(m.ccRecipients || []).map(x => x.emailAddress?.address),
+    subject:m.subject, date:m.receivedDateTime, preview:(m.bodyPreview || '').slice(0, 200), webLink:m.webLink });
+  skip += 50;
+} while (page['@odata.nextLink']);
+return msgs;
 ```
 
-Repeat with `$skip` 50, 100, ... while `@odata.nextLink` is present. The Inbox includes Focused and Other.
+The Inbox includes Focused and Other. Unsubscribe headers are not in this list: read them per message with `meGetMessages` (below) when a rule needs them.
 
 ### Body, headers, thread
 
@@ -90,7 +102,23 @@ Repeat with `$skip` 50, 100, ... while `@odata.nextLink` is present. The Inbox i
 ### Drafts
 
 - Gmail: `G.drafts.list` with `path:{ userId:'me' }`, then `G.drafts.get`.
-- Outlook: `meListMessages` with `$filter:'isDraft eq true'`, `$top:50`, and `$select:['id','parentFolderId','subject','toRecipients','ccRecipients','body','createdDateTime','webLink']`. Repeat with `$skip` 50, 100, ... while `@odata.nextLink` is present. Without `$top` it stops at 10. Drafts can sit in any folder, not only Drafts.
+- Outlook (without `$top` it stops at 10; drafts can sit in any folder, not only Drafts):
+
+```js
+const A = '<accountId>', M = tools['outlook-mail-api'].meMessage;
+const drafts = [];
+let skip = 0, page;
+do {
+  page = await ok(M.meListMessages({ accountId:A, input:{ query:{
+    $top:50, $skip:skip, $filter:'isDraft eq true',
+    $select:['id','parentFolderId','subject','toRecipients','ccRecipients','createdDateTime','webLink'] } } }));
+  for (const m of (page.value || [])) drafts.push({ id:m.id, subject:m.subject, created:m.createdDateTime, webLink:m.webLink });
+  skip += 50;
+} while (page['@odata.nextLink']);
+return drafts;
+```
+
+Read a draft's full body with `meGetMessages` only for drafts listed in `pigeonDrafts`.
 - The report lists only drafts pigeon created (their IDs are in `local/state.json` under `pigeonDrafts`). Drafts the user made are never listed and never touched.
 
 ### Read-only search
@@ -106,7 +134,7 @@ Repeat with `$skip` 50, 100, ... while `@odata.nextLink` is present. The Inbox i
 
 ## Quick check (no new mail?)
 
-Run once per run, read only. `S` is the `accounts` object from `local/state.json`. For each account it saves the Inbox message count `n` (for the 0-messages brake in `guardrails.md`) and the count `d` of all unsent drafts in the mailbox, in any folder (a change signal only; the report lists only drafts pigeon created).
+Run once per run, read only. `S` is the `accounts` object from `local/state.json`. For each account it saves `{ n, d, total }` plus a cursor (`historyId` for Gmail, `ids` for Outlook): the Inbox message count `n` (for the 0-messages brake in `guardrails.md`) and the count `d` of all unsent drafts in the mailbox, in any folder (a change signal only; the report lists only drafts pigeon created), and the whole-mailbox count `total` (for the 20% brake).
 
 ```js
 const S = /* accounts from local/state.json */;
@@ -128,14 +156,15 @@ for (const [h, a] of Object.entries(GA)) { try {
   now[h] = { historyId:p.historyId, n:inbox.messagesTotal, d, total:p.messagesTotal };
   if (added !== 0 || now[h].n !== S[h]?.n || d !== S[h]?.d) changed.push(h);
 } catch (e) { now[h] = { err:String(e.message).slice(0,120) }; changed.push(h + '?'); } }
-const pages = async (a, query) => { const out = []; let skip = 0, r;
-  do { r = await ok(O.meMessage.meListMessages({ accountId:a, input:{ query:{ ...query, $top:100, $skip:skip } } }));
-    out.push(...(r.value || [])); skip += 100; } while (r['@odata.nextLink']);
+const pages = async (a, query) => { const out = []; let skip = 0, page;
+  do { page = await ok(O.meMessage.meListMessages({ accountId:a, input:{ query:{ ...query, $top:100, $skip:skip } } }));
+    out.push(...(page.value || [])); skip += 100; } while (page['@odata.nextLink']);
   return out; };
 for (const [h, a] of Object.entries(OA)) { try {
   const v = await pages(a, { $filter:"parentFolderId eq 'inbox'", $select:['id'], $orderby:['receivedDateTime desc'] });
   const dr = await pages(a, { $filter:'isDraft eq true', $select:['id'] });
-  now[h] = { ids:hash(v.map(x => x.id.slice(-24)).join(',')), n:v.length, d:dr.length };
+  const all = await ok(O.meMessage.meListMessages({ accountId:a, input:{ query:{ $count:true, $top:1, $select:['id'] } } }));
+  now[h] = { ids:hash(v.map(x => x.id.slice(-24)).join(',')), n:v.length, d:dr.length, total:all['@odata.count'] };
   if (now[h].ids !== S[h]?.ids || now[h].d !== S[h]?.d) changed.push(h);
 } catch (e) { now[h] = { err:String(e.message).slice(0,120) }; changed.push(h + '?'); } }
 return { changed, now };
@@ -145,7 +174,8 @@ return { changed, now };
 - Anything in `changed`, or a `?` (failed or expired cursor): full run.
 - At the end of a full run, run it again after acting and save `now` to `local/state.json` as `accounts`, so this run's own moves do not trigger the next run.
 - Outlook does not take `$deltatoken` in Executor (422). The Inbox ID hash plus the draft count is the cursor.
-- `total` (Gmail) is the whole mailbox count, used by the 20% brake. For Outlook, get it with `meListMessages` and `query:{ $count:true, $top:1, $select:['id'] }`, then read `@odata.count`.
+- `total` is the whole mailbox count for both providers (Gmail `messagesTotal` from `getProfile`, Outlook `@odata.count`), used by the 20% brake.
+- The block returns only counts and hashes, so it stays small. Do not add message lists to it.
 
 ## Write
 
