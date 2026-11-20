@@ -51,12 +51,12 @@ Wrong address, `AccountSelectionInvalid`, or `OAuthReconnectRequired`: report `<
 
 ### Result size
 
-Each message in these read results is about 0.4 KB (previews are cut to 120 characters, and no links, unsubscribe URLs, or thread IDs are returned). One result therefore holds about 10 messages in 4 KB. Both Inbox reads take `SKIP` and `MAX`: run them with `MAX = 10`, then again with `SKIP` set to the returned `next`, one `execute` call per page, until `next` is `null`. Merge the pages into `local/inbox.json`.
+Each message in these read results is about 0.4 to 0.45 KB (previews are cut to 120 characters, and no links, unsubscribe URLs, or thread IDs are returned), and more when the To or Cc lists are long. Read 8 messages per call, so a page stays near 3.6 KB, clearly under the 4 KB the host allows. Both Inbox reads take `SKIP` and `MAX`: run them with `MAX = 8`, then again with `SKIP` set to the returned `next`, one `execute` call per page, until `next` is `null`. If a page still comes back cut or close to 4 KB, read that page again as two pages of `MAX = 4`. Merge the pages into `local/inbox.json`.
 
 ### Gmail Inbox
 
 ```js
-const A = '<accountId>', G = tools['gmail-api'].gmail.users, SKIP = 0, MAX = 10;
+const A = '<accountId>', G = tools['gmail-api'].gmail.users, SKIP = 0, MAX = 8;
 let ids = [], pageToken;
 do {
   const list = await ok(G.messages.list({ accountId:A, input:{ path:{ userId:'me' }, query:{ q:'in:inbox', maxResults:100, pageToken } } }));
@@ -81,7 +81,7 @@ Gmail IDs are short, so `id` is the full ID used to act. `in:inbox` includes the
 Outlook IDs are about 150 characters, so the read returns only a short key `k` (the last 20 characters of the ID). The write call resolves each `k` back to the full ID (see "Write").
 
 ```js
-const A = '<accountId>', M = tools['outlook-mail-api'].meMessage, SKIP = 0, MAX = 10;
+const A = '<accountId>', M = tools['outlook-mail-api'].meMessage, SKIP = 0, MAX = 8;
 const page = await ok(M.meListMessages({ accountId:A, input:{ query:{
   $top:MAX, $skip:SKIP, $filter:"parentFolderId eq 'inbox'",
   $select:['id','subject','from','toRecipients','ccRecipients','receivedDateTime','bodyPreview'],
@@ -130,19 +130,20 @@ Read a pigeon draft's full body with `meGetMessages` only when you show it in th
 
 - Outlook: `meMailFolder.meListMailFolders` with `$top:250`, then `meMailFolder.meMailFoldersListChildFolders` with `path:{ 'mailFolder-id':id }` for each level. Match on `displayName`.
 - Gmail: `G.labels.list`. A nested label `Clients/Acme` matches `Acme`.
-- Zero or several matches: do not move. Report it. Resolve each folder once per run and reuse the ID.
+- Zero matches or more than one match: do not move. Report it. Resolve each folder once per run and reuse the ID.
 
 ## Quick check (no new mail?)
 
-Run once per run, read only. `S` is the `accounts` object from `local/state.json`. For each account it saves `{ n, d, total }` plus a cursor (`historyId` for Gmail, `ids` for Outlook): the Inbox message count `n` (for the 0-messages brake in `guardrails.md`) and the count `d` of all unsent drafts in the mailbox, in any folder (a change signal only; the report lists only drafts pigeon created), and the whole-mailbox count `total` (for the 20% brake).
+Run it twice per run, read only: once at the start (the start check, before any Inbox read) and once at the end, after acting (the end check). `S` is the `accounts` object from `local/state.json`. For each account it saves `{ n, d, total }` plus a cursor (`historyId` for Gmail, `ids` for Outlook): the Inbox message count `n` (for the 0-messages brake in `guardrails.md`) and the count `d` of all unsent drafts in the mailbox, in any folder (a change signal only; the report lists only drafts pigeon created), and the whole-mailbox count `total` (for the 20% brake).
 
 ```js
 const S = /* accounts from local/state.json */;
+const SEEN = null;   // start check: null. End check: { '<handle>':[Gmail IDs or Outlook short keys k read this run] }, from local/inbox.json
 const GA = { '<handle>':'<accountId>' };   // Gmail accounts
 const OA = { '<handle>':'<accountId>' };   // Outlook accounts
 const G = tools['gmail-api'].gmail.users, O = tools['outlook-mail-api'];
 const hash = s => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(16); };
-const now = {}, changed = [];
+const now = {}, changed = [], fresh = {};
 for (const [h, a] of Object.entries(GA)) { try {
   const p = await ok(G.getProfile({ accountId:a, input:{ path:{ userId:'me' } } }));
   const inbox = await ok(G.labels.get({ accountId:a, input:{ path:{ userId:'me', id:'INBOX' } } }));
@@ -154,6 +155,10 @@ for (const [h, a] of Object.entries(GA)) { try {
   do { const dr = await ok(G.drafts.list({ accountId:a, input:{ path:{ userId:'me' }, query:{ maxResults:100, pageToken } } }));
     d += (dr.drafts || []).length; pageToken = dr.nextPageToken; } while (pageToken);
   now[h] = { historyId:p.historyId, n:inbox.messagesTotal, d, total:p.messagesTotal };
+  if (SEEN) { const ids = []; let pt;
+    do { const l = await ok(G.messages.list({ accountId:a, input:{ path:{ userId:'me' }, query:{ q:'in:inbox', maxResults:100, pageToken:pt } } }));
+      ids.push(...(l.messages || []).map(m => m.id)); pt = l.nextPageToken; } while (pt);
+    fresh[h] = ids.filter(id => !(SEEN[h] || []).includes(id)).length; }
   if (added !== 0 || now[h].n !== S[h]?.n || d !== S[h]?.d) changed.push(h);
 } catch (e) { now[h] = { err:String(e.message).slice(0,120) }; changed.push(h + '?'); } }
 const pages = async (a, query) => { const out = []; let skip = 0, page;
@@ -165,14 +170,19 @@ for (const [h, a] of Object.entries(OA)) { try {
   const dr = await pages(a, { $filter:'isDraft eq true', $select:['id'] });
   const all = await ok(O.meMessage.meListMessages({ accountId:a, input:{ query:{ $count:true, $top:1, $select:['id'] } } }));
   now[h] = { ids:hash(v.map(x => x.id.slice(-24)).join(',')), n:v.length, d:dr.length, total:all['@odata.count'] };
+  if (SEEN) fresh[h] = v.filter(x => !(SEEN[h] || []).includes(x.id.slice(-20))).length;
   if (now[h].ids !== S[h]?.ids || now[h].d !== S[h]?.d) changed.push(h);
 } catch (e) { now[h] = { err:String(e.message).slice(0,120) }; changed.push(h + '?'); } }
-return { changed, now };
+return SEEN ? { now, fresh } : { changed, now };
 ```
 
-- `changed` empty: no new mail and no draft changes.
-- Anything in `changed`, or a `?` (failed or expired cursor): full run.
-- At the end of a full run, run it again after acting and save `now` to `local/state.json` as `accounts`, so this run's own moves do not trigger the next run.
+- Start check (`SEEN = null`): `changed` empty means no new mail and no draft changes. Anything in `changed`, or a `?` (failed or expired cursor), means a full run. Keep the start check's `now` until the end of the run.
+- End check (`SEEN` set to the IDs or keys this run read): `fresh[h]` is the number of messages now in that account's Inbox that this run never read (they arrived during the run).
+- Save to `local/state.json` as `accounts`, per account:
+  - `fresh[h]` is 0: save the end check's `now[h]`, so this run's own moves do not trigger the next run.
+  - `fresh[h]` is more than 0: save the end check's `now[h]`, but with the cursor (`historyId` for Gmail, `ids` for Outlook) taken from the start check's `now[h]`. The counts `n`, `d`, `total` stay from the end check, so the brakes compare against the real Inbox. The next quick check then sees a change and runs in full, so the mail that arrived during this run is triaged then.
+  - The end check failed for that account (`err`): save the start check's `now[h]`.
+- Never save a cursor taken after the Inbox read unless `fresh[h]` is 0 for that account. State must never absorb mail the run did not read.
 - Outlook does not take `$deltatoken` in Executor (422). The Inbox ID hash plus the draft count is the cursor.
 - `total` is the whole mailbox count for both providers (Gmail `messagesTotal` from `getProfile`, Outlook `@odata.count`), used by the 20% brake.
 - The block returns only counts and hashes, so it stays small. Do not add message lists to it.
@@ -185,7 +195,7 @@ return { changed, now };
 | archive | `messages.modify`, `body:{ removeLabelIds:['INBOX'] }` | `meMessagesMessageMove`, `DestinationId:'archive'` |
 | move to folder | `messages.modify`, `body:{ addLabelIds:[labelId], removeLabelIds:['INBOX'] }` | `meMessagesMessageMove`, `DestinationId:<folderId>` |
 | spam | `messages.modify`, `body:{ addLabelIds:['SPAM'], removeLabelIds:['INBOX'] }` | `meMessagesMessageMove`, `DestinationId:'junkemail'` |
-| several at once | `messages.batchModify`, `body:{ ids:[...], addLabelIds, removeLabelIds }`, only with explicit IDs read and evaluated in this run | one move per ID |
+| more than one message at once | `messages.batchModify`, `body:{ ids:[...], addLabelIds, removeLabelIds }`, only with explicit IDs read and evaluated in this run | one move per ID |
 
 - Outlook: resolve each short key `k` to its full ID inside the same write call, then act:
 
@@ -213,15 +223,15 @@ for (const k of K) { const hits = full.filter(id => id.endsWith(k)); resolved[k]
 Executor has no unsubscribe call. Make the HTTPS request yourself, outside the Executor sandbox, with your own HTTP tool or browser.
 
 1. **Header with an HTTPS URL** (`List-Unsubscribe`): send a one-click POST (form body `List-Unsubscribe=One-Click`) when `List-Unsubscribe-Post` says `One-Click`, otherwise a GET of the URL.
-2. **Header with only `mailto:`:** do not send it. Log `mailto only`.
-3. **No header:** look in that one message's body for an HTTPS link whose URL or link text says unsubscribe or opt out, in any language (`unsubscribe`, `opt out`, `opt-out`, `darse de baja`, `desuscribirse`, `cancelar suscripción`). If there is one, open it with a single GET. If there is none, log `no link`.
+2. **Header with only `mailto:`:** do not send it. Log `mailto only`, even when `List-Unsubscribe-Post` is present (the one-click flag is `false` without an HTTPS URL).
+3. **No header:** look in that one message's body for an HTTPS link whose URL or link text says unsubscribe or opt out, in any language (`unsubscribe`, `opt out`, `opt-out`, `darse de baja`, `desuscribirse`, `cancelar suscripción`). If there is one, open it with a single GET and log `no header, body link: OK` or `no header, body link: failed: <reason>`. If there is none, log `no header, no link`. The body link can be a click-tracking redirect (a tracker domain wrapping the real unsubscribe URL). That is allowed: it is still one HTTPS GET, and nothing else is opened.
 4. If the page asks for a login, a captcha, personal details, or more than one confirm click, stop and log `failed: <reason>`.
 
 In every case, do the rest of the rule's action (trash or move) in the same run. Never unsubscribe from phishing or spam.
 
 #### Unsubscribe link for one message
 
-Run this only for messages a rule will unsubscribe. It returns only the unsubscribe header, the one-click flag, and at most one body link.
+Run this only for messages a rule will unsubscribe. It returns only the unsubscribe header, the one-click flag (`true` only when the header has an HTTPS URL and `List-Unsubscribe-Post` says `One-Click`), and at most one body link.
 
 ```js
 const WORDS = /unsubscribe|opt[\s-]?out|darse de baja|desuscrib|cancelar (la )?suscripci/i;
@@ -231,7 +241,7 @@ const firstLink = (html) => { const re = /<a\b[^>]*href=["'](https:[^"']+)["'][^
 // Outlook: <fullId> is the full ID, resolved from the short key k as in "Write"
 const om = await ok(tools['outlook-mail-api'].meMessage.meGetMessages({ accountId:'<accountId>', input:{ path:{ 'message-id':'<fullId>' }, query:{ $select:['body','internetMessageHeaders'] } } }));
 const hd = n => ((om.internetMessageHeaders || []).find(x => x.name.toLowerCase() === n) || {}).value || null;
-const outlook = { unsub:hd('list-unsubscribe'), oneClick:/One-Click/i.test(hd('list-unsubscribe-post') || ''), bodyLink:firstLink(om.body?.content || '') };
+const outlook = { unsub:hd('list-unsubscribe'), oneClick:/https:/i.test(hd('list-unsubscribe') || '') && /One-Click/i.test(hd('list-unsubscribe-post') || ''), bodyLink:firstLink(om.body?.content || '') };
 // Gmail: the body parts are base64url; the sandbox has no atob, so decode in plain JS
 const b64urlToText = (s) => { const T = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'; const bytes = []; let buf = 0, bits = 0;
   for (const ch of s.replace(/[=\s]/g, '').replace(/\+/g, '-').replace(/\//g, '_')) { const v = T.indexOf(ch); if (v < 0) continue;
@@ -247,7 +257,7 @@ const gm = await ok(tools['gmail-api'].gmail.users.messages.get({ accountId:'<ac
 const gh = n => ((gm.payload?.headers || []).find(x => x.name.toLowerCase() === n) || {}).value || null;
 const parts = []; const walk = p => { if (!p) return; if (p.mimeType === 'text/html' && p.body?.data) parts.push(b64urlToText(p.body.data)); (p.parts || []).forEach(walk); };
 walk(gm.payload);
-const gmail = { unsub:gh('list-unsubscribe'), oneClick:/One-Click/i.test(gh('list-unsubscribe-post') || ''), bodyLink:firstLink(parts.join('\n')) };
+const gmail = { unsub:gh('list-unsubscribe'), oneClick:/https:/i.test(gh('list-unsubscribe') || '') && /One-Click/i.test(gh('list-unsubscribe-post') || ''), bodyLink:firstLink(parts.join('\n')) };
 // For an Outlook message run only the Outlook lines and return { outlook }; for a Gmail message run only the Gmail lines and return { gmail }.
 ```
 

@@ -46,7 +46,7 @@ Do not read `local/decisions.md` in full. Search it only for the senders and sub
 
 ## 4. Quick check
 
-Run the quick-check call in `executor-verbs.md`. It compares each account with the cursors saved in `local/state.json` (Gmail history ID, Outlook Inbox ID hash, draft counts) and returns `changed`.
+Run the quick-check call in `executor-verbs.md` (the start check, before any Inbox read). Keep its `now` for §9. It compares each account with the cursors saved in `local/state.json` (Gmail history ID, Outlook Inbox ID hash, draft counts) and returns `changed`.
 
 A run sends a full report when any of these is true:
 
@@ -62,7 +62,7 @@ Otherwise, append `quick check: no changes` to the history file, release the loc
 
 For every account in `local/accounts.md`:
 
-1. Check its identity, then read the whole Inbox (follow pagination to the end) with the calls in `executor-verbs.md`. Keep each `execute` result under about 4 KB, because the host may cut longer results. The Inbox reads return about 0.4 KB per message, so read 10 messages per `execute` call (`MAX = 10`) and page with `next` until it is `null`, as `executor-verbs.md` "Result size" shows. Never return raw API payloads. Save the merged list to `local/inbox.json` for this run. For each message keep: ID (Gmail) or short key `k` (Outlook), from, to, cc, subject, date, and a preview of up to 120 characters. Gmail messages also say which kind of unsubscribe header they have. The unsubscribe URLs (Gmail and Outlook) and Outlook's headers are fetched on demand, only for messages a rule will unsubscribe.
+1. Check its identity, then read the whole Inbox (follow pagination to the end) with the calls in `executor-verbs.md`. Keep each `execute` result under about 4 KB, because the host may cut longer results. The Inbox reads return about 0.4 to 0.45 KB per message, so read 8 messages per `execute` call (`MAX = 8`, about 3.6 KB) and page with `next` until it is `null`, as `executor-verbs.md` "Result size" shows. Never return raw API payloads. Save the merged list to `local/inbox.json` for this run. For each message keep: ID (Gmail) or short key `k` (Outlook), from, to, cc, subject, date, and a preview of up to 120 characters. Gmail messages also say which kind of unsubscribe header they have. The unsubscribe URLs (Gmail and Outlook) and Outlook's headers are fetched on demand, only for messages a rule will unsubscribe.
 2. Read the account's unsent drafts.
 3. If the account fails, retry once. If it still fails, show it as `<handle> ?` with the reason in the report and continue with the other accounts.
 4. If `execute` does not respond at all, act on no mail and send the report with `Executor not responding`.
@@ -123,7 +123,7 @@ Rules:
 - Unsubscribe (Gmail and Outlook alike; the calls are under "Unsubscribe" in `executor-verbs.md`). Never unsubscribe from phishing or spam. In every case below, still do the rest of the rule's action (trash or move) in the same run, and log the attempt in `local/unsubscribe.md`:
   - `List-Unsubscribe` header with an HTTPS URL: if `List-Unsubscribe-Post: List-Unsubscribe=One-Click` is present, send the one-click POST to that URL; otherwise open it with a GET. Log `OK` or `failed: <reason>`.
   - Header with only a `mailto:` link: do not send it. Log `mailto only`. In "What I did": `unsubscribe skipped (mailto only)`.
-  - No header: look in that message's body for one HTTPS link whose URL or link text says unsubscribe or opt out (in any language). If there is one, open it with a single GET and log `no header, body link: OK` or `no header, body link: failed: <reason>`. If there is none, log `no header, no link`. In "What I did": `unsubscribe skipped (no header, no link)`.
+  - No header: look in that message's body for one HTTPS link whose URL or link text says unsubscribe or opt out (in any language). If there is one, open it with a single GET and log `no header, body link: OK` or `no header, body link: failed: <reason>`. The link can be a click-tracking redirect; that is allowed, as long as it is one HTTPS GET. If there is none, log `no header, no link`. In "What I did": `unsubscribe skipped (no header, no link)`.
   - If an unsubscribe page asks for a login, a captcha, personal details, or more than one confirm click, stop there and log `failed: <reason>`.
 - After acting, check that the message left the Inbox. If it did not, report it as not done.
 - Each draft pigeon creates is saved in `local/state.json` under `pigeonDrafts` (account, draft ID, original message ID, after-send action, created time). These drafts are listed in full at the top of every full report until the user sends or discards them. Drafts the user made are not pigeon's: never list, send, or change them.
@@ -140,7 +140,7 @@ Only when the calendar summary is on in `local/accounts.md`. Read only.
 
 ## 9. Write the user's files
 
-- `local/state.json`: after acting, run the quick-check call again and save its `now` object as `accounts`, with the run time as `updated`.
+- `local/state.json`: after acting, run the quick-check call again as the end check, with `SEEN` set to the IDs or short keys in `local/inbox.json`. Save `accounts` per account as `executor-verbs.md` "Quick check" says: the end check's `now` when `fresh` is 0; when `fresh` is more than 0 (mail arrived during the run), the start check's cursor with the end check's counts, so the next run picks that mail up. Never save a cursor that covers mail this run did not read. Set `updated` to the run time.
 - `local/decisions.md`: append one row per user decision. Never edit or remove a row. On the first run of a new month, move last month's rows to `local/decisions-YYYY-MM.md` and start the live file with the header again.
 - `local/history/YYYY-MM.md` (create `local/history/` when missing): append one line per run: time, per-account Inbox counts, actions taken, errors. Never rewrite the file.
 - `local/unsubscribe.md`: append one row per unsubscribe attempt.
@@ -165,7 +165,7 @@ When the calendar summary is on, third line: `Calendar: invitations N · conflic
 Then these sections, in this order. Leave out a section that has nothing in it.
 
 1. **Drafts awaiting approval.** Only drafts pigeon created (`pigeonDrafts` in `local/state.json`). Each one numbered: account, to, cc, bcc, subject, attachments, full text, and how long it has been waiting.
-2. **Needs you.** Each message numbered: account handle, sender, subject, why it needs the user, and a suggested reply (`archive`, `trash`, `keep`). The same message in several accounts is one item that lists each account.
+2. **Needs you.** Each message numbered: account handle, sender, subject, why it needs the user, and a suggested reply (`archive`, `trash`, `keep`). The same message in more than one account is one item that lists each account.
 3. **Held.** What a brake stopped, with counts and the planned actions. Ends with: reply `proceed` to run it this time only.
 4. **What I did.** Not numbered. Grouped by rule: rule ID, action, count, and senders (`R12 trash 4: news@example.com`). Then any failures.
 5. **Calendar.** Events and numbered invitations and conflicts.
