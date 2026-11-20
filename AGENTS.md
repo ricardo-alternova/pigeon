@@ -62,7 +62,7 @@ Otherwise, append `quick check: no changes` to the history file, release the loc
 
 For every account in `local/accounts.md`:
 
-1. Check its identity, then read the whole Inbox (follow pagination to the end) with the calls in `executor-verbs.md`. Keep each `execute` result small: return only the fields listed here, with previews cut to 200 characters, never raw API payloads. Read all accounts in one `execute` call when the result stays under about 4 KB. If it would be larger (the host may cut long results), read one account per `execute` call and save the merged list to `local/inbox.json` for this run. For each message keep: ID, thread ID, from, to, cc, subject, date, a short preview, and the unsubscribe headers.
+1. Check its identity, then read the whole Inbox (follow pagination to the end) with the calls in `executor-verbs.md`. Keep each `execute` result under about 4 KB, because the host may cut longer results. The Inbox reads return about 0.4 KB per message, so read 10 messages per `execute` call (`MAX = 10`) and page with `next` until it is `null`, as `executor-verbs.md` "Result size" shows. Never return raw API payloads. Save the merged list to `local/inbox.json` for this run. For each message keep: ID (Gmail) or short key `k` (Outlook), from, to, cc, subject, date, and a preview of up to 120 characters. Gmail messages also say which kind of unsubscribe header they have. The unsubscribe URLs (Gmail and Outlook) and Outlook's headers are fetched on demand, only for messages a rule will unsubscribe.
 2. Read the account's unsent drafts.
 3. If the account fails, retry once. If it still fails, show it as `<handle> ?` with the reason in the report and continue with the other accounts.
 4. If `execute` does not respond at all, act on no mail and send the report with `Executor not responding`.
@@ -120,7 +120,11 @@ Rules:
 - Use the write calls in `executor-verbs.md`, in a separate `execute` call after all reads. One message ID per action, counted against the caps before you act.
 - If Executor pauses a write for approval, follow "Approval pauses" in `executor-verbs.md`: `accept` only that one request, only for what this run decided within the guardrails; `decline` anything else.
 - If a rule's folder does not exist, or more than one folder matches, do not move. Put it in "Needs you".
-- Unsubscribe: use the `List-Unsubscribe` header. If `List-Unsubscribe-Post: List-Unsubscribe=One-Click` is present, send the one-click POST to the HTTPS URL. Otherwise open the HTTPS URL. If there is only a `mailto:` link, do not send it: log `mailto only` and still trash. Never unsubscribe from phishing or spam. Log every attempt in `local/unsubscribe.md`.
+- Unsubscribe (Gmail and Outlook alike; the calls are under "Unsubscribe" in `executor-verbs.md`). Never unsubscribe from phishing or spam. In every case below, still do the rest of the rule's action (trash or move) in the same run, and log the attempt in `local/unsubscribe.md`:
+  - `List-Unsubscribe` header with an HTTPS URL: if `List-Unsubscribe-Post: List-Unsubscribe=One-Click` is present, send the one-click POST to that URL; otherwise open it with a GET. Log `OK` or `failed: <reason>`.
+  - Header with only a `mailto:` link: do not send it. Log `mailto only`. In "What I did": `unsubscribe skipped (mailto only)`.
+  - No header: look in that message's body for one HTTPS link whose URL or link text says unsubscribe or opt out (in any language). If there is one, open it with a single GET and log `no header, body link: OK` or `no header, body link: failed: <reason>`. If there is none, log `no header, no link`. In "What I did": `unsubscribe skipped (no header, no link)`.
+  - If an unsubscribe page asks for a login, a captcha, personal details, or more than one confirm click, stop there and log `failed: <reason>`.
 - After acting, check that the message left the Inbox. If it did not, report it as not done.
 - Each draft pigeon creates is saved in `local/state.json` under `pigeonDrafts` (account, draft ID, original message ID, after-send action, created time). These drafts are listed in full at the top of every full report until the user sends or discards them. Drafts the user made are not pigeon's: never list, send, or change them.
 
@@ -140,7 +144,12 @@ Only when the calendar summary is on in `local/accounts.md`. Read only.
 - `local/decisions.md`: append one row per user decision. Never edit or remove a row. On the first run of a new month, move last month's rows to `local/decisions-YYYY-MM.md` and start the live file with the header again.
 - `local/history/YYYY-MM.md` (create `local/history/` when missing): append one line per run: time, per-account Inbox counts, actions taken, errors. Never rewrite the file.
 - `local/unsubscribe.md`: append one row per unsubscribe attempt.
-- `local/rules.md`: put a new row in the section of the table where it belongs and give it the next free number in that section's ID prefix. Tables group IDs either by account (one prefix per account) or by kind of rule (for example generic rules for all accounts, one account's rules, folder routing, rules added from chat). Pick the section whose existing rows have the same Scope and the same kind of action (folder moves go with folder moves; trash, spam, and unsubscribe go with those). If several sections fit, use the one with the most rows of that Scope. If the table has no sections or prefixes, use `R1`, `R2`, .... Never reuse an ID that already appears anywhere in the table, and say the new ID in the reply. Add rows only when the user says `and rule` or asks for a rule. Never change or delete existing rows unless the user asks.
+- `local/rules.md`: put a new row in the section of the table where it belongs and give it the next free number in that section's ID prefix. Tables group IDs either by account (one prefix per account) or by kind of rule (for example generic rules for all accounts, one account's rules, folder routing, rules added from chat). Pick the section with these steps, in order, and stop at the first step that gives exactly one section:
+  1. A folder move goes to the section whose heading says it is for folder routing, when one exists.
+  2. A rule whose Scope is exactly one account goes to the section whose heading names that account (handle, address, or domain).
+  3. Otherwise, the section with the most rows that have both the same Scope and the same kind of action (folder moves; or trash, spam, and unsubscribe).
+  4. If that is still a tie, the tied section whose ID prefix comes first in the alphabet.
+  A rule added from a reply is placed by these steps like any other, never in a section just because its heading says it holds rules added from chat. Never invent a new prefix when an existing section fits. If the table has no sections or prefixes, use `R1`, `R2`, .... Never reuse an ID that already appears anywhere in the table, and say the new ID in the reply. Add rows only when the user says `and rule` or asks for a rule. Never change or delete existing rows unless the user asks.
 - Never write `guardrails.md`, `AGENTS.md`, or anything outside `local/`.
 
 ## 10. Report

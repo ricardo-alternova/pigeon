@@ -44,7 +44,7 @@ Caps count actions that take a message out of the Inbox (trash, archive, move, s
 - Stop and execute nothing for the run, then report the counts, when any of these happens:
   - The total Inbox across all accounts is above the big-inbox limit in `local/accounts.md` (default 100).
   - An account's Inbox shows 0 messages when the previous run showed several.
-  - One rule matches more than 20% of all mail in an account, and that rule acts on more than 5 messages in that account this run. Measure against the whole mailbox, not the Inbox: an empty Inbox is the goal, and measuring against it would punish exactly that. The floor of more than 5 messages keeps tiny mailboxes (a 2-message mailbox would hit 50% with one action) from tripping it. If the mailbox total cannot be read, say so in the report and do not use this brake for that account.
+  - One rule acts on more than 20% of all mail in an account, and on more than 5 messages in that account, this run. Measure against the whole mailbox, not the Inbox: an empty Inbox is the goal, and measuring against it would punish exactly that. The floor of more than 5 messages keeps tiny mailboxes (a 2-message mailbox would hit 50% with one action) from tripping it. If the mailbox total cannot be read, say so in the report and do not use this brake for that account.
   - A rule would go over its cap, or the run would go over the global cap.
 - The report asks the user to reply `proceed`. `proceed` lifts the brake for that run only.
 
