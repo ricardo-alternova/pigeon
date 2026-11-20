@@ -15,7 +15,10 @@ All access goes through Executor. Find each `accountId` with Executor `search` (
 
 - Timezone:
 - Full-report times:
+  - Weekdays:
+  - Weekends:
 - Report language:
+- Scope aliases (other words in the rules table that mean `all`):
 
 ## Safety limits
 

@@ -2,7 +2,7 @@
 
 pigeon is an email triage kit for our team. It is plain Markdown that any AI agent can follow: Claude Code, Codex, Cursor, or any agent with MCP.
 
-pigeon is opinionated: all mail and calendar access goes through **Executor** (executor.sh) and its MCP tools (`search`, `execute`, `resume`). There is no code to install and no engine to run. The agent reads the instructions, reads your rules table, looks at your Inbox through Executor, does the safe actions your rules cover, and sends you a short numbered report for everything else.
+pigeon is opinionated: all mail and calendar access goes through **Executor** (executor.sh) and its MCP tools (`search`, `describe`, `execute`, `resume`). There is no code to install and no engine to run. The agent reads the instructions, reads your rules table, looks at your Inbox through Executor, does the safe actions your rules cover, and sends you a short numbered report for everything else.
 
 ## Before you start
 
@@ -33,7 +33,7 @@ Runs at your full-report times always send a report. Other scheduled runs stay q
 
 ## Already have a rules table?
 
-Copy it to `local/rules.md`. The agent reads the table directly, so your own column names, notes, and exceptions work as written. The only requirement is a pattern, an action, and a scope on each row.
+Copy it to `local/rules.md`. The agent reads the table directly, so your own column names, notes, exceptions, and action words in another language work as written. Each row needs a pattern, an action, and a scope. A row whose action the agent cannot map, or whose full-rule file is missing from `local/`, goes to "Needs you" instead of acting. Copy any files your rows point to into `local/` too.
 
 ## Files
 

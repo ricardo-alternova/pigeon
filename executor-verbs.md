@@ -1,6 +1,6 @@
 # Executor calls for pigeon
 
-pigeon reaches mail and calendars only through Executor (executor.sh), over its MCP server. The MCP tools you use are `search`, `describe`, `execute`, and `resume`. Every mail and calendar call below runs inside one `execute` call (a TypeScript sandbox).
+pigeon reaches mail and calendars only through Executor (executor.sh), over its MCP server. The MCP tools you use are `search`, `describe`, `execute`, and `resume`. Every mail and calendar call below runs inside an `execute` call (a JavaScript sandbox).
 
 Replace `<accountId>`, `<email>`, and the other `<...>` values with the user's values from `local/accounts.md`.
 
@@ -8,10 +8,10 @@ Replace `<accountId>`, `<email>`, and the other `<...>` values with the user's v
 
 - Call form: `tools['<app>'].<api path>({ accountId, input:{ path, query, body } })`. Path parameters (`userId`, `id`, `'message-id'`, `'mailFolder-id'`, `calendarId`) go in `path`; filters and paging (`q`, `maxResults`, `$filter`, `$top`) go in `query`; payloads go in `body`.
 - Apps: `gmail-api`, `outlook-mail-api`, `google-calendar-api`, `outlook-calendar-api`.
-- A tool can return `{ ok:false, error }`. Always check before using the result. Unwrap like this:
+- On success a tool returns the raw API payload (no wrapper). On failure it throws an `Error` (for example `InputInvalid` 422, `AccountSelectionInvalid`, `OAuthReconnectRequired`). Wrap each account's calls in `try`/`catch` so one failure does not stop the others. The helper below gives every failure a short, readable message for the report:
 
-```ts
-const ok = async (p) => { const r = await p; if (r && r.ok === false) throw new Error(JSON.stringify(r.error)); return r && r.data !== undefined ? r.data : r; };
+```js
+const ok = async (p) => { try { return await p; } catch (e) { throw new Error(String(e && e.message || e).slice(0, 200)); } };
 ```
 
 - The sandbox has no `fetch`, `Buffer`, `atob`, `btoa`, or `TextEncoder`. Do not enumerate `tools`.
@@ -21,7 +21,7 @@ const ok = async (p) => { const r = await p; if (r && r.ok === false) throw new 
 
 ## Find the user's accounts
 
-Run `search` with a query like `gmail getProfile` or `outlook mail list messages`. The results list the connected accounts for each app with their `accountId` and the account's email label. Save each `accountId` in `local/accounts.md`.
+Run `search` with a query like `gmail getProfile` or `outlook mail list messages`. The results list the connected accounts for each app with their `accountId`. Gmail and Google Calendar accounts show their email address. Outlook mail and Outlook Calendar accounts show only generic names (`personalOutlookMailApi`, `personalOutlookMailApi2`, ...) with no address, so you must run the identity call below on each Outlook `accountId` to learn which address it is. Save each `accountId` with its verified address in `local/accounts.md`.
 
 If an account the user wants is missing, ask them to connect it in Executor (Gmail, Outlook mail, Google Calendar, Outlook Calendar), then run `search` again.
 
@@ -29,16 +29,19 @@ If an account the user wants is missing, ask them to connect it in Executor (Gma
 
 Gmail: the address must match `local/accounts.md`.
 
-```ts
+```js
 const p = await ok(tools['gmail-api'].gmail.users.getProfile({ accountId:'<accountId>', input:{ path:{ userId:'me' } } }));
 // p.emailAddress === '<email>'
 ```
 
-Outlook: a successful Inbox read on the listed `accountId` confirms the account.
+Outlook: the address must match `local/accounts.md`.
 
-```ts
-await ok(tools['outlook-mail-api'].meMailFolder.meGetMailFolders({ accountId:'<accountId>', input:{ path:{ 'mailFolder-id':'inbox' } } }));
+```js
+const u = await ok(tools['outlook-mail-api'].meUser.meUserGetUser({ accountId:'<accountId>', input:{ query:{ $select:['mail','userPrincipalName'] } } }));
+// (u.mail || u.userPrincipalName).toLowerCase() === '<email>'
 ```
+
+Outlook Calendar has the same call: `tools['outlook-calendar-api'].meUser.meUserGetUser`.
 
 Wrong address, `AccountSelectionInvalid`, or `OAuthReconnectRequired`: report `<handle> ?`, skip that account, and run `search` to see the current accounts. Tell the user to reconnect it in Executor.
 
@@ -46,7 +49,7 @@ Wrong address, `AccountSelectionInvalid`, or `OAuthReconnectRequired`: report `<
 
 ### Gmail Inbox
 
-```ts
+```js
 const A = '<accountId>', G = tools['gmail-api'].gmail.users;
 let ids = [], pageToken;
 do {
@@ -68,7 +71,7 @@ return msgs;
 
 ### Outlook Inbox
 
-```ts
+```js
 const r = await ok(tools['outlook-mail-api'].meMessage.meListMessages({ accountId:'<accountId>', input:{ query:{
   $top:50, $skip:0, $filter:"parentFolderId eq 'inbox'",
   $select:['id','conversationId','subject','from','toRecipients','ccRecipients','receivedDateTime','isRead','hasAttachments','bodyPreview','webLink'],
@@ -87,7 +90,8 @@ Repeat with `$skip` 50, 100, ... while `@odata.nextLink` is present. The Inbox i
 ### Drafts
 
 - Gmail: `G.drafts.list` with `path:{ userId:'me' }`, then `G.drafts.get`.
-- Outlook: `meListMessages` with `$filter:'isDraft eq true'` and `$select:['id','subject','toRecipients','ccRecipients','body','createdDateTime','webLink']`.
+- Outlook: `meListMessages` with `$filter:'isDraft eq true'`, `$top:50`, and `$select:['id','parentFolderId','subject','toRecipients','ccRecipients','body','createdDateTime','webLink']`. Repeat with `$skip` 50, 100, ... while `@odata.nextLink` is present. Without `$top` it stops at 10. Drafts can sit in any folder, not only Drafts.
+- The report lists only drafts pigeon created (their IDs are in `local/state.json` under `pigeonDrafts`). Drafts the user made are never listed and never touched.
 
 ### Read-only search
 
@@ -102,9 +106,9 @@ Repeat with `$skip` 50, 100, ... while `@odata.nextLink` is present. The Inbox i
 
 ## Quick check (no new mail?)
 
-Run once per run, read only. `S` is the `accounts` object from `local/state.json`.
+Run once per run, read only. `S` is the `accounts` object from `local/state.json`. For each account it saves the Inbox message count `n` (for the 0-messages brake in `guardrails.md`) and the count `d` of all unsent drafts in the mailbox, in any folder (a change signal only; the report lists only drafts pigeon created).
 
-```ts
+```js
 const S = /* accounts from local/state.json */;
 const GA = { '<handle>':'<accountId>' };   // Gmail accounts
 const OA = { '<handle>':'<accountId>' };   // Outlook accounts
@@ -113,29 +117,35 @@ const hash = s => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h * 3
 const now = {}, changed = [];
 for (const [h, a] of Object.entries(GA)) { try {
   const p = await ok(G.getProfile({ accountId:a, input:{ path:{ userId:'me' } } }));
-  let n = -1;
+  const inbox = await ok(G.labels.get({ accountId:a, input:{ path:{ userId:'me', id:'INBOX' } } }));
+  let added = -1;
   if (S[h]?.historyId) { try {
     const hl = await ok(G.history.list({ accountId:a, input:{ path:{ userId:'me' }, query:{ startHistoryId:S[h].historyId, labelId:'INBOX', historyTypes:['messageAdded','labelAdded'], maxResults:50 } } }));
-    n = (hl.history || []).length; } catch (e) { n = -1; } }
-  const dr = await ok(G.drafts.list({ accountId:a, input:{ path:{ userId:'me' }, query:{ maxResults:50 } } }));
-  const d = (dr.drafts || []).length;
-  now[h] = { historyId:p.historyId, drafts:d };
-  if (n !== 0 || d !== S[h]?.drafts) changed.push(h);
-} catch (e) { now[h] = { err:String(e).slice(0,120) }; changed.push(h + '?'); } }
+    added = (hl.history || []).length; } catch (e) { added = -1; } }
+  let d = 0, pageToken;
+  do { const dr = await ok(G.drafts.list({ accountId:a, input:{ path:{ userId:'me' }, query:{ maxResults:100, pageToken } } }));
+    d += (dr.drafts || []).length; pageToken = dr.nextPageToken; } while (pageToken);
+  now[h] = { historyId:p.historyId, n:inbox.messagesTotal, d, total:p.messagesTotal };
+  if (added !== 0 || now[h].n !== S[h]?.n || d !== S[h]?.d) changed.push(h);
+} catch (e) { now[h] = { err:String(e.message).slice(0,120) }; changed.push(h + '?'); } }
+const pages = async (a, query) => { const out = []; let skip = 0, r;
+  do { r = await ok(O.meMessage.meListMessages({ accountId:a, input:{ query:{ ...query, $top:100, $skip:skip } } }));
+    out.push(...(r.value || [])); skip += 100; } while (r['@odata.nextLink']);
+  return out; };
 for (const [h, a] of Object.entries(OA)) { try {
-  const l = await ok(O.meMessage.meListMessages({ accountId:a, input:{ query:{ $filter:"parentFolderId eq 'inbox'", $top:100, $select:['id','receivedDateTime'], $orderby:['receivedDateTime desc'] } } }));
-  const v = l.value || [];
-  const df = await ok(O.meMailFolder.meGetMailFolders({ accountId:a, input:{ path:{ 'mailFolder-id':'drafts' }, query:{ $select:['totalItemCount'] } } }));
-  now[h] = { n:v.length, ids:hash(v.map(x => x.id.slice(-24)).join(',')), drafts:df.totalItemCount };
-  if (now[h].ids !== S[h]?.ids || now[h].drafts !== S[h]?.drafts) changed.push(h);
-} catch (e) { now[h] = { err:String(e).slice(0,120) }; changed.push(h + '?'); } }
+  const v = await pages(a, { $filter:"parentFolderId eq 'inbox'", $select:['id'], $orderby:['receivedDateTime desc'] });
+  const dr = await pages(a, { $filter:'isDraft eq true', $select:['id'] });
+  now[h] = { ids:hash(v.map(x => x.id.slice(-24)).join(',')), n:v.length, d:dr.length };
+  if (now[h].ids !== S[h]?.ids || now[h].d !== S[h]?.d) changed.push(h);
+} catch (e) { now[h] = { err:String(e.message).slice(0,120) }; changed.push(h + '?'); } }
 return { changed, now };
 ```
 
-- `changed` empty: no new mail and no new drafts.
+- `changed` empty: no new mail and no draft changes.
 - Anything in `changed`, or a `?` (failed or expired cursor): full run.
-- At the end of a full run, run it again after acting and save `now` to `local/state.json`, so this run's own moves do not trigger the next run.
+- At the end of a full run, run it again after acting and save `now` to `local/state.json` as `accounts`, so this run's own moves do not trigger the next run.
 - Outlook does not take `$deltatoken` in Executor (422). The Inbox ID hash plus the draft count is the cursor.
+- `total` (Gmail) is the whole mailbox count, used by the 20% brake. For Outlook, get it with `meListMessages` and `query:{ $count:true, $top:1, $select:['id'] }`, then read `@odata.count`.
 
 ## Write
 
@@ -159,7 +169,7 @@ Executor has no unsubscribe call. Read `List-Unsubscribe` and `List-Unsubscribe-
 
 ### Outlook
 
-```ts
+```js
 const M = tools['outlook-mail-api'].meMessage;
 // reply draft to the last message of the thread
 await ok(M.meMessagesMessageCreateReply({ accountId:'<accountId>', input:{ path:{ 'message-id':'<lastId>' }, body:{ Comment:'<text>' } } }));
@@ -174,7 +184,7 @@ Both return the draft with its `id` and `webLink`. Edit a draft with `meUpdateMe
 
 `drafts.create` takes the RFC 822 message encoded as base64url. The sandbox has no `btoa`, so encode in plain JS:
 
-```ts
+```js
 function b64url(s) {
   const bytes = [];
   for (const ch of s) { const c = ch.codePointAt(0);
@@ -211,7 +221,7 @@ Edit link for the report: Outlook `webLink`; Gmail `https://mail.google.com/mail
 
 ### Outlook calendar
 
-```ts
+```js
 await ok(tools['outlook-calendar-api'].meEvent.meListCalendarView({ accountId:'<accountId>', input:{ query:{
   startDateTime:'<ISO start>', endDateTime:'<ISO end>',
   $select:['id','subject','start','end','isAllDay','location','organizer','isOrganizer','responseStatus','showAs','isCancelled','webLink'],
@@ -222,7 +232,7 @@ await ok(tools['outlook-calendar-api'].meEvent.meListCalendarView({ accountId:'<
 
 ### Google Calendar
 
-```ts
+```js
 await ok(tools['google-calendar-api'].calendar.events.list({ accountId:'<accountId>', input:{ path:{ calendarId:'primary' },
   query:{ timeMin:'<ISO start>', timeMax:'<ISO end>', singleEvents:true, orderBy:'startTime', timeZone:'<timezone>' } } }));
 ```
@@ -235,11 +245,11 @@ Outlook `meEvent` accept, decline, tentativelyAccept; Google `events.patch` on t
 
 ## Approval pauses (`resume`)
 
-A write can come back paused with an `executionId`, waiting for approval.
+A write can come back paused with a `requestId` (`apr_...` or `elc_...`), waiting for approval. Answer it with `resume`, passing that `requestId` and a `response`. Accept only that one request; never accept a standing or persistent permission.
 
-- Pause on a trash, archive, move, spam, or draft creation that this run decided within `guardrails.md`: `resume` with `accept`, without `persist` (that call only).
-- Pause on a send that the user approved by number in this conversation: `resume` with `accept`, without `persist`.
-- Pause on anything else (a send nobody approved, a permanent delete, a folder or label change, anything this run did not ask for): `resume` with `decline`, and report it.
+- Pause on a trash, archive, move, spam, or draft creation that this run decided within `guardrails.md`: `resume` with `{ action:'accept' }`.
+- Pause on a send that the user approved by number in this conversation: `resume` with `{ action:'accept' }`.
+- Pause on anything else (a send nobody approved, a permanent delete, a folder or label change, anything this run did not ask for): `resume` with `{ action:'decline' }`, and report it.
 - If a pause cannot be resolved, report it. Never look for another way to do what was declined.
 
 ## Failures

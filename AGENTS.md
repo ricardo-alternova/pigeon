@@ -14,6 +14,7 @@ If `local/` does not exist:
 4. Ask the user:
    - For each account: a short handle (`work`, `personal`) and whether it is included in `all`.
    - Their timezone, their full-report times (for example weekdays 7:00, weekends 9:00), and their report language. Default language: the language the user writes in.
+   - If they bring an existing rules table: which words in its Scope column mean `all` (scope aliases).
    - Whether to include a calendar summary, and for which accounts. The calendar summary is off until the user turns it on. When it is on, also ask their working hours and lunch break.
 5. Write the answers, with each account's Executor app and `accountId`, into `local/accounts.md` and `local/calendar.md`.
 6. Tell the user how to schedule runs in their own host with the prompt `Follow AGENTS.md for one triage run.`
@@ -78,9 +79,9 @@ Each message gets exactly one outcome.
 
 **Matched.** A row in `local/rules.md` covers it:
 
-1. Read the table as written. Columns can be named in any language. Each row has a pattern, an action, and a scope. Any other text on the row (a notes column, text after the pattern, a line marked ⚠) is a note or exception. If the row points to another file for the full rule, open that file before acting.
-2. Pattern: a full address matches that sender only. A domain (`example.com`, `@example.com`, or `*@example.com`) matches that exact domain. It does not match `sub.example.com` unless the row says `*.example.com`. A quoted subject matches messages whose subject contains that text.
-3. Scope: the message's account must be named in the Scope (by handle, address, or domain), or be in `all`.
+1. Read the table as written. Columns can be named in any language. Each row has a pattern, an action, and a scope. Any other text on the row (a notes column, text after the pattern, a line marked ⚠) is a note or exception. `\|` inside a cell is a literal `|`, not a column break. If the row points to another file for the full rule, open that file before acting. If that file is missing or unreadable, or the pointer is not a file in `local/` (for example a chat reference or an archive), do not act: put the message in "Needs you" and name the missing source in the report.
+2. Pattern: a full address matches that sender only. A domain (`example.com`, `@example.com`, or `*@example.com`) matches that exact domain. It does not match `sub.example.com` unless the row says `*.example.com`. `news@*.example.com` matches the local part `news` at any subdomain of `example.com`. A quoted subject matches messages whose subject contains that text.
+3. Scope: the message's account must be named in the Scope (by handle, address, or domain), or be in `all`. The scope aliases in `local/accounts.md` (for example `todas`) mean `all`.
 4. Only after pattern and scope match, read that row's notes and exceptions. If an exception applies, or leaves any doubt, do not act. The message goes to "Needs you" with the reason.
 5. If two rows match with different actions, do not act. Put it in "Needs you".
 
@@ -94,20 +95,23 @@ Allowed actions:
 |---|---|
 | `trash` | Move to Trash |
 | `archive` | Remove from Inbox into the account's archive |
-| `move <folder>` | Move to that existing folder or label. `<YYYY.MM>` in the name means the message's month (`Invoices/<YYYY.MM>` becomes `Invoices/2026.11`) |
+| `move <folder>` | Move to that existing folder or label. `<YYYY.MM>` (or `<AAAA.MM>`) in the name means the message's month (`Invoices/<YYYY.MM>` becomes `Invoices/2026.11`) |
 | `spam` | Mark as spam / move to Junk |
 | `unsubscribe+trash` | Unsubscribe, then trash |
 | `draft` | Create a reply draft and show it in full. Never send it |
 | `forward <address>` | Create a forward draft to that address and show it in full. Never send it |
+| `after send: <action>` | Added to `draft` or `forward`. Do that action to the original message only after `N send` succeeds. Until then the original stays in the Inbox |
+
+Rows can word actions in plain language or another language. Map them to the table above by meaning: `mover X` is `move X`, `action moveToTrash` is `trash`, `spam (Junk)` is `spam`, `baja HTTPS + trash` is `unsubscribe+trash`, and `(tras el envío) trash` is `after send: trash`. Text in parentheses or after `·` that only describes the rule (`· filter active`, `(already unsubscribed)`) is a note, not an extra action. A row whose action says no action leaves the message in the Inbox and lists it in "Needs you" with the rule ID. If an action cannot be mapped to exactly one entry in the table, or leaves any doubt, do not act: put the message in "Needs you" with the rule ID and the action text.
 
 Rules:
 
 - Use the write calls in `executor-verbs.md`, in a separate `execute` call after all reads. One message ID per action, counted against the caps before you act.
-- If Executor pauses a write for approval, follow "Approval pauses" in `executor-verbs.md`: `accept` without `persist` only for what this run decided within the guardrails, `decline` for anything else.
+- If Executor pauses a write for approval, follow "Approval pauses" in `executor-verbs.md`: `accept` only that one request, only for what this run decided within the guardrails; `decline` anything else.
 - If a rule's folder does not exist, or more than one folder matches, do not move. Put it in "Needs you".
 - Unsubscribe: use the `List-Unsubscribe` header. If `List-Unsubscribe-Post: List-Unsubscribe=One-Click` is present, send the one-click POST to the HTTPS URL. Otherwise open the HTTPS URL. If there is only a `mailto:` link, do not send it: log `mailto only` and still trash. Never unsubscribe from phishing or spam. Log every attempt in `local/unsubscribe.md`.
 - After acting, check that the message left the Inbox. If it did not, report it as not done.
-- Drafts are listed in full at the top of the report in every full report until the user approves or discards them.
+- Each draft pigeon creates is saved in `local/state.json` under `pigeonDrafts` (account, draft ID, original message ID, after-send action, created time). These drafts are listed in full at the top of every full report until the user sends or discards them. Drafts the user made are not pigeon's: never list, send, or change them.
 
 ## 8. Calendar
 
@@ -125,7 +129,7 @@ Only when the calendar summary is on in `local/accounts.md`. Read only.
 - `local/decisions.md`: append one row per user decision. Never edit or remove a row. On the first run of a new month, move last month's rows to `local/decisions-YYYY-MM.md` and start the live file with the header again.
 - `local/history/YYYY-MM.md` (create `local/history/` when missing): append one line per run: time, per-account Inbox counts, actions taken, errors. Never rewrite the file.
 - `local/unsubscribe.md`: append one row per unsubscribe attempt.
-- `local/rules.md`: give new rows the next free ID (`R1`, `R2`, ...). Add rows only when the user says `and rule` or asks for a rule. Never change or delete existing rows unless the user asks.
+- `local/rules.md`: give a new row the next free number in the ID family the table already uses for that account (for example the next `B` number when that account's rows are `B1`, `B2`, ...). If the table has no families, use `R1`, `R2`, .... Never reuse an ID that already appears anywhere in the table. Add rows only when the user says `and rule` or asks for a rule. Never change or delete existing rows unless the user asks.
 - Never write `guardrails.md`, `AGENTS.md`, or anything outside `local/`.
 
 ## 10. Report
@@ -140,7 +144,7 @@ When the calendar summary is on, third line: `Calendar: invitations N · conflic
 
 Then these sections, in this order. Leave out a section that has nothing in it.
 
-1. **Drafts awaiting approval.** Each one numbered: account, to, cc, bcc, subject, attachments, full text, and how long it has been waiting.
+1. **Drafts awaiting approval.** Only drafts pigeon created (`pigeonDrafts` in `local/state.json`). Each one numbered: account, to, cc, bcc, subject, attachments, full text, and how long it has been waiting.
 2. **Needs you.** Each message numbered: account handle, sender, subject, why it needs the user, and a suggested reply (`archive`, `trash`, `keep`). The same message in several accounts is one item that lists each account.
 3. **Held.** What a brake stopped, with counts and the planned actions. Ends with: reply `proceed` to run it this time only.
 4. **What I did.** Not numbered. Grouped by rule: rule ID, action, count, and senders (`R12 trash 4: news@example.com`). Then any failures.
@@ -163,7 +167,8 @@ The user replies with numbers and actions. Ignore extra spaces, commas, and line
 | `4, 7 archive` | Same action for each number |
 | `3 trash and rule` | Do it, add a row to `local/rules.md` for that sender with that action and that account as scope, and say the new rule ID |
 | `2 keep` | Leave it in the Inbox and record the decision |
-| `1 send` | Send draft 1 exactly as shown |
+| `1 send` | Send draft 1 exactly as shown. When it succeeds, do its `after send` action and remove it from `pigeonDrafts` |
+| `1 discard` | Stop listing draft 1: remove it from `pigeonDrafts` and leave the original in the Inbox. Do not delete the draft; the user deletes it in their mail app |
 | `2 forward a@example.com` | Create a forward draft and show it. It goes out only after `2 send` |
 | `6 accept`, `6 decline`, `6 tentative` | Answer that invitation |
 | `proceed` | Run the held actions, this run only |
