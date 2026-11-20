@@ -1,47 +1,46 @@
 # pigeon
 
-pigeon never sends without your numbered approval.
+pigeon is an email triage kit for our team. It is plain Markdown that any AI agent can follow: Claude Code, Codex, Cursor, or any agent with MCP.
 
-It never deletes mail permanently; the calendar stays read-only.
+pigeon is opinionated: all mail and calendar access goes through **Executor** (executor.sh) and its MCP tools (`search`, `execute`, `resume`). There is no code to install and no engine to run. The agent reads the instructions, reads your rules table, looks at your Inbox through Executor, does the safe actions your rules cover, and sends you a short numbered report for everything else.
 
-pigeon is an MIT-licensed email triage kit. An AI assistant carries calls through an MCP mail gateway such as [Executor](https://executor.sh). The Python planner matches Inbox messages against a private Markdown rules table; the execution step machine issues actions in batches per account.
+## Before you start
 
-## Quick start
+- An Executor account with your Gmail or Outlook mailboxes connected (and Google or Outlook calendars, if you want a calendar summary).
+- The Executor MCP server added to your agent.
 
-Give your hosted assistant this repository and the instruction: "Follow AGENTS.md for one scheduled Inbox triage and send the standard run message." Use [the routine quick start](docs/quickstart.md). Complete [hosted setup](docs/hosted-setup.md#hosted-setup), including the [host requirements](docs/hosted-setup.md#host-requirements) and [storage choice](docs/hosted-setup.md#storage-choice).
+## Start
 
-### Developer machine
+1. Clone this repo.
+2. Open it in your agent.
+3. Say: **"Start triaging my email with this repo."**
 
-Clone https://github.com/ricardo-alternova/pigeon and enter the checkout. Run this Bash demo with Python 3.11+ and git. It uses sample mail, creates private/demo settings and enables commit hooks.
+## What happens on the first run
 
-<!-- quick-start -->
-```bash
-(
-set -eu
-umask 077
-git config core.hooksPath hooks
-export PIGEON_HOME="$PWD/private/demo"
-python3 scripts/triage.py setup
-printf '[accounts.home]\n[accounts.work]\n' > "$PIGEON_HOME/config.toml"
-touch "$PIGEON_HOME/never-touch.md" "$PIGEON_HOME/unsubscribe.md"
-cp tests/fixtures/rules.md "$PIGEON_HOME/rules.md"
-python3 scripts/triage.py validate
-token=$(python3 scripts/triage.py lock)
-trap 'python3 scripts/triage.py release --token "$token" 2>/dev/null || true' EXIT
-python3 scripts/triage.py plan --token "$token" --inbox tests/fixtures/inbox.json --plan-out "$PIGEON_HOME/plan.json" --report-out "$PIGEON_HOME/report.md"
-printf '{"run":"%s","answers":[{"account":"home","id":"7","proceed":true,"note":"is an order confirmation"},{"account":"home","id":"12","proceed":false,"note":"needs a human"}]}\n' "$token" > "$PIGEON_HOME/answers.json"
-python3 scripts/triage.py plan --token "$token" --inbox tests/fixtures/inbox.json --plan-out "$PIGEON_HOME/plan.json" --report-out "$PIGEON_HOME/report.md" --answers "$PIGEON_HOME/answers.json"
-cat "$PIGEON_HOME/report.md"
-python3 scripts/triage.py release --token "$token"
-trap - EXIT
-)
-```
-<!-- /quick-start -->
+1. The agent copies `templates/` into `local/`. `local/` is gitignored, so your accounts, rules, and history never go into the repo.
+2. It lists the mail and calendar accounts connected in your Executor and asks which ones to triage. If one is missing, it walks you through connecting it in Executor. It saves each account's Executor `accountId` in `local/accounts.md`.
+3. It asks for your timezone, the times you want a full report, your report language (default: the language you write in), and whether to include a calendar summary.
+4. It sweeps your Inbox. With zero rules it acts on nothing: every message goes into the report, numbered.
+5. You reply to the report (`3 archive`, `5 trash and rule`). Each `and rule` reply adds a row to `local/rules.md`, so the agent handles more on its own every run.
 
-Compare the plain-text report with tests/fixtures/expected-report.md. The demo prints addresses unchanged and uses plain section titles. The final command prints "released". For real mail, follow [hosted setup](docs/hosted-setup.md).
+## Running it on a schedule
 
-## Contributions
+pigeon has no scheduler of its own. Schedule runs in whatever runs your agent (its routines or automations feature, cron, a CI job) with this prompt:
 
-Enable hooks with `git config core.hooksPath hooks`. Use invented examples on example.com, example.org, example.net or .invalid. Inspect the staged diff. Run `python3 -m unittest discover -s tests` and `bash tests/e2e.sh`. Follow [maintainer checks](docs/setup.md#maintainer-publication-checks) for leak scans. Do not attach real mail or reports to issues.
+> Follow AGENTS.md for one triage run.
 
-See [CHANGELOG](CHANGELOG.md) and the [MIT license](LICENSE).
+Runs at your full-report times always send a report. Other scheduled runs stay quiet when no new mail arrived and nothing failed.
+
+## Already have a rules table?
+
+Copy it to `local/rules.md`. The agent reads the table directly, so your own column names, notes, and exceptions work as written. The only requirement is a pattern, an action, and a scope on each row.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `AGENTS.md` | What the agent does on every run |
+| `guardrails.md` | Hard safety limits. They override everything else |
+| `executor-verbs.md` | The Executor calls for Gmail, Outlook, and calendars |
+| `templates/` | Empty starter files, copied into `local/` on the first run |
+| `local/` | Your files (gitignored) |

@@ -1,68 +1,11 @@
-# Public files are explicitly un-ignored below. Everything else stays ignored.
-# Un-ignore each parent directory before its contents.
-# Private kit data belongs in ~/.config/pigeon/ or the folder PIGEON_HOME names,
-# outside the checkout; private/demo is for fictional data only.
-*
-!.agents/
-.agents/*
-!.claude/
-.claude/*
-!.github/
-.github/*
-!config/
-config/*
-!docs/
-docs/*
-!hooks/
-hooks/*
-!rules/
-rules/*
-!scripts/
-scripts/*
-!tests/
-tests/*
-!.agents/skills/
-.agents/skills/*
-!.github/workflows/
-.github/workflows/*
-!tests/fixtures/
-tests/fixtures/*
-!.agents/skills/email-triage/
-.agents/skills/email-triage/*
-!README.md
-!LICENSE
-!AGENTS.md
-!CLAUDE.md
-!.gitignore
-!.agents/skills/email-triage/SKILL.md
-!.claude/skills
-!docs/setup.md
-!docs/hosted-setup.md
-!docs/quickstart.md
-!docs/sending.md
-!config/config.example.toml
-!config/guardrails.example.md
-!rules/rules.example.md
-!rules/never-touch.example.md
-!rules/unsubscribe.example.md
-!scripts/triage.py
-!scripts/leak_check.py
-!hooks/pre-commit
-!hooks/pre-push
-!.github/workflows/check.yml
-!tests/test_leak_check.py
-!tests/test_matcher.py
-!tests/test_lock.py
-!tests/test_kit_text.py
-!tests/test_rules_table.py
-!tests/test_lists.py
-!tests/e2e.sh
-!tests/fixtures/inbox.json
-!tests/fixtures/rules.md
-!tests/fixtures/expected-report.md
-!scripts/execute.py
-!tests/mock_provider.py
-!tests/test_execute.py
-!scripts/unsubscribe.py
-!tests/test_unsubscribe.py
-!CHANGELOG.md
+# Everything about one user lives in local/ and never leaves their machine:
+# accounts, rules, never-touch, unsubscribe log, decisions, history, state, lock.
+local/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
